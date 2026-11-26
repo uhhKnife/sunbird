@@ -1,10 +1,24 @@
-// @description Sends custom and animated emojis and stickers as links, renders fake emojis, stickers, and GIFs as real ones, and unlocks client themes
-// @version 0.5.0
+// @description Unlocks Nitro stream quality and client themes, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones
+// @version 0.6.0
 // @author mantikafasi
 
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({
+  enableStreamQualityBypass: {
+    type: "switch",
+    title: "Unlock Nitro stream quality",
+    description: "Allow streaming in 1080p, 1440p, Source, and 60 FPS without Nitro (Desktop)",
+    default: true,
+    onChange: () => syncStreamUnlock(),
+  },
+  enableEmojiBypass: {
+    type: "switch",
+    title: "Bypass emoji restrictions",
+    description: "Send external and animated emojis as links when you don't have Nitro",
+    default: true,
+    onChange: () => syncEmojiPick(),
+  },
   emojiSize: {
     type: "select",
     title: "Emoji size",
@@ -26,7 +40,7 @@ const settings = phoenix.settings.define({
   hyperLinkText: {
     type: "text",
     title: "Link text",
-    description: "{{NAME}} is replaced with the emoji's name",
+    description: "{{NAME}} is replaced with the emoji or sticker name",
     default: "{{NAME}}",
   },
   renderFakeEmojis: {
@@ -55,8 +69,8 @@ const settings = phoenix.settings.define({
   },
   forceFake: {
     type: "switch",
-    title: "Always spoof emojis",
-    description: "Send external and animated emojis as links even when you have Nitro (useful when external emojis are blocked)",
+    title: "Always spoof emojis and stickers",
+    description: "Send external and animated emojis and stickers as links even when you have Nitro (useful when external emojis are blocked)",
     default: false,
   },
   sendStickers: {
@@ -65,6 +79,11 @@ const settings = phoenix.settings.define({
     description: "Lets you pick stickers that need Nitro and sends them as links. Desktop only for now",
     default: true,
     onChange: () => applyStickers(),
+  },
+  stickerSize: {
+    type: "select",
+    title: "Sticker size",
+    options: [{ value: "160" }, { value: "128" }, { value: "96" }, { value: "64" }, { value: "320" }],
   },
   unlockThemes: {
     type: "switch",
@@ -522,19 +541,40 @@ const guildOf = (ctx: Phoenix.UiContext) => (ctx.channelId ? channelGuild.get(ct
 // Phoenix answers a press on a locked emoji with a Nitro ad. Put `:name:` in
 // the message box instead, like an unlocked pick, and remember which emoji it
 // was, since several servers can have one by that name.
-phoenix.messages.onEmojiPick((id, ctx) => {
-  const emoji = emojis.get(id);
-  if (!emoji || usable(emoji, guildOf(ctx))) return;
-  picked.set(emoji.name, emoji);
-  return `:${emoji.name}: `;
-});
+let releaseEmojiPick: Phoenix.Remover | undefined;
+function syncEmojiPick() {
+  if (settings.enableEmojiBypass && !releaseEmojiPick) {
+    releaseEmojiPick = phoenix.messages.onEmojiPick((id, ctx) => {
+      const emoji = emojis.get(id);
+      if (!emoji || usable(emoji, guildOf(ctx))) return;
+      picked.set(emoji.name, emoji);
+      return `:${emoji.name}: `;
+    });
+  } else if (!settings.enableEmojiBypass && releaseEmojiPick) {
+    releaseEmojiPick();
+    releaseEmojiPick = undefined;
+  }
+}
+syncEmojiPick();
+
+// Go Live's resolutions and frame rates are a Desktop leaf the runtime unlocks.
+let releaseStream: Phoenix.Remover | undefined;
+function syncStreamUnlock() {
+  if (settings.enableStreamQualityBypass && !releaseStream) {
+    releaseStream = phoenix.stream?.unlockQuality();
+  } else if (!settings.enableStreamQualityBypass && releaseStream) {
+    releaseStream();
+    releaseStream = undefined;
+  }
+}
+syncStreamUnlock();
 
 // ponytail: the tier and account are re-read for the next send, so the first
 // send after an account switch still uses the last one's.
 phoenix.messages.onSend((text, ctx) => {
   readTier();
   refresh();
-  if (!text.includes(":")) return;
+  if (!settings.enableEmojiBypass || !text.includes(":")) return;
   const result = rewrite(text, guildOf(ctx));
   return result === text ? undefined : result;
 });
@@ -542,9 +582,9 @@ phoenix.messages.onSend((text, ctx) => {
 // --- Stickers ---
 
 // Sticker format types: 1 PNG, 2 APNG, 3 Lottie, 4 GIF. Lottie has no image to link.
+const APNG = 2;
 const LOTTIE = 3;
 const GIF = 4;
-const STICKER_SIZE = 160;
 
 // Discord's own stickers and a server's stickers inside it need no Nitro.
 const stickerUsable = (sticker: CachedSticker, guild: string | undefined) =>
@@ -552,7 +592,8 @@ const stickerUsable = (sticker: CachedSticker, guild: string | undefined) =>
 
 const stickerLink = (sticker: CachedSticker) => {
   const ext = sticker.format_type === GIF ? "gif" : "png";
-  const url = `https://media.discordapp.net/stickers/${sticker.id}.${ext}?size=${STICKER_SIZE}&name=${encodeURIComponent(sticker.name)}`;
+  const animated = sticker.format_type === APNG || sticker.format_type === GIF ? "&animated=true" : "";
+  const url = `https://media.discordapp.net/stickers/${sticker.id}.${ext}?size=${settings.stickerSize}&name=${encodeURIComponent(sticker.name)}${animated}`;
   if (!settings.useHyperLinks) return url;
   return `[${settings.hyperLinkText.replaceAll("{{NAME}}", sticker.name)}](${url})`;
 };

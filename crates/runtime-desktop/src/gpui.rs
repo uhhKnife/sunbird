@@ -77,7 +77,7 @@ impl SharedString {
       }
       // SAFETY: `inner` holds `16 + s.len()` bytes, aligned to 8.
       unsafe {
-         inner.cast::<[usize; 2]>().write([1, 1]);
+         inner.cast::<[usize; 2]>().write_unaligned([1, 1]);
          ptr::copy_nonoverlapping(s.as_ptr(), inner.add(16), s.len());
       }
       Self {

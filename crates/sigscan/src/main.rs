@@ -39,6 +39,7 @@ use phoenix_sigs::{
       BinaryFile,
       Machine,
    },
+   gateway_send::DesktopGatewaySend,
    http::DesktopHttpTransport,
    ios,
    macos,
@@ -150,6 +151,17 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   .response
                   .clone()
                   .map(|layout| format!("{} {layout:x?}", at(http.poll_fn)))
+            }),
+         );
+         report(
+            "gateway send",
+            DesktopGatewaySend::locate(image).map(|gw| {
+               format!(
+                  "{} ({} slots, ok {:#x})",
+                  at(gw.start_send_fn),
+                  gw.start_send_slots.len(),
+                  gw.ok_tag
+               )
             }),
          );
          report(

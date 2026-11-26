@@ -894,11 +894,45 @@ declare namespace Phoenix {
     guildEmojisUpdate: GuildEmojisUpdate;
   }
 
+  /// Outgoing Voice State Update payload (gateway op 4).
+  interface VoiceStateUpdate {
+    guild_id: string | null;
+    channel_id: string | null;
+    self_mute: boolean;
+    self_deaf: boolean;
+    self_video?: boolean;
+    flags?: number;
+    preferred_region?: string | null;
+    preferred_regions?: string[];
+    [key: string]: unknown;
+  }
+
+  /// Outgoing gateway `d` payload types by opcode, for `phoenix.gateway.onSend`.
+  interface GatewaySendPayloads {
+    3: Record<string, unknown>;
+    4: VoiceStateUpdate;
+  }
+
+  interface GatewaySendApi {
+    /// Intercepts outgoing gateway frames for numeric opcode `op` (desktop only).
+    /// Receives the frame's `d` payload; return a replacement payload, `false` to
+    /// drop the frame, or nothing to pass the (possibly mutated) payload on.
+    /// Identify (2) and Resume (6) carry credentials and cannot be hooked.
+    onSend<Op extends keyof GatewaySendPayloads>(
+      op: Op,
+      handler: (payload: GatewaySendPayloads[Op]) => GatewaySendPayloads[Op] | false | void
+    ): Remover;
+    onSend<P = unknown>(
+      op: number,
+      handler: (payload: P) => P | false | void
+    ): Remover;
+  }
+
   /// One handle per entry in the client's gateway registry, read from the
   /// running binary. Events without a payload type here are `Sig<unknown>`, and
   /// any event can be missing from a given build.
-  type Gateway = { readonly [E in keyof GatewayPayloads]: Sig<GatewayPayloads[E]> } & {
-    readonly [event: string]: Sig<unknown> | undefined;
+  type Gateway = GatewaySendApi & { readonly [E in keyof GatewayPayloads]: Sig<GatewayPayloads[E]> } & {
+    readonly [event: string]: Sig<unknown> | GatewaySendApi["onSend"] | undefined;
   };
 
   interface Hooks<P> {

@@ -1,19 +1,15 @@
 name: site
 on:
-  push:
-    branches: [main]
-    paths: ['web/**', 'plugins/**', 'crates/**', 'frida/**', 'Cargo.*', 'flake.*', 'nix/**', 'scripts/site.nu', 'scripts/sunbird-linux.sh', 'scripts/sunbird-macos.sh', '.github/workflows/site.yml']
+  workflow_call:
   workflow_dispatch:
 permissions:
   contents: read
-  pages: write
-  id-token: write
 concurrency:
   group: site
   cancel-in-progress: false
 jobs:
   ios:
-    uses: ./.github/workflows/ios.yml
+    uses: ./.github/workflows/ios.yml # zizmor: ignore[self-repository]
   # The desktop launchers and loaders. Ubuntu 22.04 links the Linux loader
   # against an older glibc than Discord's AppImage needs, so it loads anywhere
   # Discord runs.
@@ -37,10 +33,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal
       - run: cargo +${{ matrix.toolchain }} build --locked --release -p phoenix-loader ${{ runner.os == 'Windows' && '-p phoenix-inject' || '' }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: desktop-${{ runner.os }}
           path: ${{ matrix.files }}
@@ -49,15 +47,17 @@ jobs:
     needs: [ios, desktop]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix develop --command nu scripts/site.nu web
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: libphoenix-ios
           path: ios
       - run: mv ios/libphoenix.dylib web/plugins/libphoenix-ios.dylib
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: desktop-*
           path: desktop
@@ -68,11 +68,11 @@ jobs:
           cp scripts/sunbird-linux.sh web/plugins/sunbird-linux.sh
           mv desktop/desktop-macOS/libphoenix.dylib web/plugins/libphoenix-macos-arm64.dylib
           cp scripts/sunbird-macos.sh web/plugins/sunbird-macos.sh
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 24
       # The plugins stay TypeScript in plugins/*/src; assets.sunbird.tools serves them bundled.
-      - run: npm install --no-save --no-package-lock esbuild@0.25.12
+      - run: npm install --no-save --no-package-lock esbuild@0.25.12 # zizmor: ignore[adhoc-packages]
       - run: node web/tools/bundle-plugins.ts
         env:
           ESBUILD: node_modules/.bin/esbuild
@@ -81,15 +81,18 @@ jobs:
           touch dist/.nojekyll
           cp -r web/pkg web/plugins web/version.json dist/
           tar czf dist/site.tar.gz -C web pkg plugins version.json
-      - uses: actions/upload-pages-artifact@v5
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - id: deploy
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

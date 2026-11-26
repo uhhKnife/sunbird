@@ -50,7 +50,7 @@ const ICON_SIZE: f32 = 24.0;
 /// One detour per header builder.
 const SITES: usize = desktop::MAX_HEADER_BUILDERS;
 
-pub(crate) struct Symbols {
+pub struct Symbols {
    child_node: ChildNodeFn,
    svg_new:    SvgNewFn,
    push_svg:   PushSvgFn,

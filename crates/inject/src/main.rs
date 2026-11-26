@@ -585,11 +585,25 @@ mod windows {
       }
       // Per process, so a second launch mid-download writes its own file.
       let fresh = home.join(format!("phoenix.dll.{}.new", std::process::id()));
-      curl(&site, 60, &[
+      // Discord waits on this download. With a DLL to fall back on, a slow one
+      // gives up sooner; a first install has nothing else, so it keeps trying.
+      let (max_secs, retries) = if dll.is_file() { (60, "0") } else { (180, "2") };
+      if let Err(err) = curl(&site, max_secs, &[
+         "--retry",
+         retries,
+         "--retry-delay",
+         "2",
+         "--speed-limit",
+         "1024",
+         "--speed-time",
+         "30",
          "-o",
          &fresh.to_string_lossy(),
          &format!("{site}/plugins/phoenix-windows-x86_64.dll"),
-      ])?;
+      ]) {
+         let _ = fs::remove_file(&fresh);
+         return Err(err);
+      }
       // `curl -f` only rejects an HTTP error, so a captive portal or a wrong
       // deploy still writes its body here; swapping that in would leave
       // Discord without a working DLL.
@@ -623,7 +637,10 @@ mod windows {
    /// loader is built with (`crates/runtime/src/update.rs`).
    fn is_loader(path: &Path) -> bool {
       fs::read(path).is_ok_and(|bytes| {
-         bytes.starts_with(b"MZ") && bytes.windows(16).any(|window| window == b"phoenix-version:")
+         bytes.starts_with(b"MZ")
+            && bytes
+               .windows(16)
+               .any(|window| window == b"phoenix-version:")
       })
    }
 
@@ -635,10 +652,19 @@ mod windows {
       } else {
          "=http"
       };
+      let connect_secs = max_secs.min(15).to_string();
       let max_secs = max_secs.to_string();
       let run = |revoke: &[&str]| {
          Command::new(system32("curl.exe"))
-            .args(["-fsSL", "--proto", proto, "--proto-redir", "=https"])
+            .args([
+               "-fsSL",
+               "--proto",
+               proto,
+               "--proto-redir",
+               "=https",
+               "--connect-timeout",
+               &connect_secs,
+            ])
             .args(revoke)
             .args(["--max-time", &max_secs])
             .args(args)
@@ -655,7 +681,10 @@ mod windows {
          out = run(&[])?;
       }
       if !out.status.success() {
-         misstep::bail!("curl: {}", String::from_utf8_lossy(&out.stderr).trim());
+         let stderr = String::from_utf8_lossy(&out.stderr);
+         let detail = stderr.trim();
+         let detail = detail.strip_prefix("curl:").map_or(detail, str::trim_start);
+         misstep::bail!("curl: {detail}");
       }
       Ok(String::from_utf8_lossy(&out.stdout).into_owned())
    }

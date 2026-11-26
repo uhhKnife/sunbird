@@ -5,7 +5,7 @@ name: check
 # Desktop Phoenix sits behind Discord's tester access, so it is checked only when
 # the DISCORD_EXE_URL repository variable points at a copy of its Discord.exe.
 on:
-  push:
+  pull_request:
     paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
   schedule:
     - cron: '17 6 * * *'
@@ -18,8 +18,10 @@ jobs:
   locators:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: cachix/install-nix-action@v31
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
       - run: nix develop --command cargo test --release -p phoenix-hook -p phoenix-sigs
       - run: nix develop --command cargo build --release -p sigscan
       - name: sigscan check
@@ -50,6 +52,8 @@ jobs:
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-loader
       - run: cargo build --locked --release -p phoenix-loader

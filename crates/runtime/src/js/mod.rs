@@ -56,6 +56,7 @@ use crate::{
       hooks::{
          Hook,
          add_gateway_api,
+         gateway_object,
       },
       http::{
          discord_object,
@@ -144,9 +145,10 @@ pub struct Registry<'js> {
    /// `phoenix.discord.onRequest` interceptors, by id.
    request_hooks:    RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
-   response_hooks:   RefCell<HashMap<u64, (String, Function<'js>)>>,
+   response_hooks:     RefCell<HashMap<u64, (String, Function<'js>)>>,
+   gateway_send_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
-   pub interceptors: RefCell<Vec<(u64, String, Function<'js>)>>,
+   pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
 
 // SAFETY: every field is bound to 'js, and Changed swaps exactly that lifetime.
@@ -274,7 +276,7 @@ impl Engine {
 
    /// Drops every hook `name` registered, and turns off events nobody else
    /// listens to.
-   fn unload(&self, name: &str) {
+   pub(super) fn unload(&self, name: &str) {
       self.context.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return;
@@ -300,6 +302,11 @@ impl Engine {
             .borrow_mut()
             .retain(|_, (plugin, _)| plugin != name);
          discord::forget_response_hooks(name);
+         registry
+            .gateway_send_hooks
+            .borrow_mut()
+            .retain(|_, (plugin, _)| plugin != name);
+         gateway::forget_send_hooks(name);
          registry
             .interceptors
             .borrow_mut()
@@ -488,6 +495,7 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
       pending: RefCell::default(),
       request_hooks: RefCell::default(),
       response_hooks: RefCell::default(),
+      gateway_send_hooks: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }
@@ -511,11 +519,7 @@ fn camel_case(name: &str) -> String {
 /// The `phoenix` object one plugin receives.
 fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let api = Object::new(ctx.clone())?;
-   let gateway = ctx
-      .userdata::<Registry<'js>>()
-      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
-   api.set("gateway", gateway.gateway.clone())?;
-   drop(gateway);
+   api.set("gateway", gateway_object(ctx, plugin)?)?;
 
    add_gateway_api(ctx, plugin, &api)?;
 

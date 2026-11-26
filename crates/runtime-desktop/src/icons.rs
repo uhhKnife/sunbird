@@ -64,6 +64,7 @@ pub fn register(svg: &str) -> Option<&'static str> {
    }
    let path = gpui::intern_str(&path);
    icons.insert(path, svg.as_bytes().into());
+   drop(icons);
    Some(path)
 }
 

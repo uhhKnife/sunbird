@@ -2,8 +2,6 @@ name: ios
 # Builds the iOS loader, `libphoenix.dylib`, for injecting into a decrypted
 # Discord IPA. iOS's SDK only ships with Xcode, so this runs on macOS.
 on:
-  push:
-    paths: ['crates/**', 'Cargo.*', '.github/workflows/ios.yml']
   workflow_dispatch:
   workflow_call:
 permissions:
@@ -17,15 +15,17 @@ jobs:
     env:
       IPHONEOS_DEPLOYMENT_TARGET: '18.0'
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-apple-ios
           components: clippy
       - run: cargo clippy --release --target aarch64-apple-ios -p phoenix-loader
       - run: cargo build --release --target aarch64-apple-ios -p phoenix-loader
       - run: codesign --force --sign - target/aarch64-apple-ios/release/libphoenix.dylib
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: libphoenix-ios
           path: target/aarch64-apple-ios/release/libphoenix.dylib

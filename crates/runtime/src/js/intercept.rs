@@ -157,8 +157,7 @@ fn extract_hook_body<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<Vec<u8>>
 /// `onResponse`: lets a hook turn a Discord 404 into a 200 with a body of its
 /// own. Out-of-range values leave the reply's status alone.
 fn extract_hook_status(value: &Value<'_>) -> Option<i32> {
-   let status = value.as_object()?.get::<_, Value<'_>>("status").ok()?;
-   let status = i32::try_from(status.as_int()?).ok()?;
+   let status = value.as_object()?.get::<_, Value<'_>>("status").ok()?.as_int()?;
    (100..=599).contains(&status).then_some(status)
 }
 

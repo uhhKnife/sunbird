@@ -1,5 +1,5 @@
 // @description Unlocks Nitro stream quality and client themes, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.6.0
+// @version 0.6.1
 // @author mantikafasi
 
 const { gateway } = phoenix;
@@ -161,16 +161,34 @@ let loadedGuilds = -1;
 let loadedAt = 0;
 let growing = true;
 const load = async () => {
-  const guilds = await phoenix.stores.sql<{ g: string; e: string | null; s: string | null }>(
-    "SELECT k AS g, json_extract(CAST(v AS TEXT), '$.emojis') AS e," +
-      " json_extract(CAST(v AS TEXT), '$.stickers') AS s FROM guilds",
-  );
-  growing = guilds.length > loadedGuilds;
-  loadedGuilds = guilds.length;
-  for (const { g, e, s } of guilds) {
-    if (e) addEmojis(unpad(g), JSON.parse(e));
-    if (s) addStickers(JSON.parse(s), unpad(g));
+  let guildCount = 0;
+  try {
+    const guilds = await phoenix.stores.sql<{ g: string; e: string | null; s: string | null }>(
+      "SELECT k AS g, json_extract(CAST(v AS TEXT), '$.emojis') AS e," +
+        " json_extract(CAST(v AS TEXT), '$.stickers') AS s FROM guilds",
+    );
+    guildCount = guilds.length;
+    for (const { g, e, s } of guilds) {
+      if (e) addEmojis(unpad(g), JSON.parse(e));
+      if (s) addStickers(JSON.parse(s), unpad(g));
+    }
+  } catch {
+    // Older Android SQLite builds lack json_extract, so parse the rows in JS.
+    const guilds = await phoenix.stores
+      .sql<{ g: string; v: string | null }>("SELECT k AS g, CAST(v AS TEXT) AS v FROM guilds")
+      .catch(() => []);
+    guildCount = guilds.length;
+    for (const { g, v } of guilds) {
+      if (!v) continue;
+      try {
+        const parsed = JSON.parse(v) as { emojis?: Phoenix.Emoji[]; stickers?: Phoenix.Sticker[] };
+        addEmojis(unpad(g), parsed.emojis);
+        addStickers(parsed.stickers, unpad(g));
+      } catch {}
+    }
   }
+  growing = guildCount > loadedGuilds;
+  loadedGuilds = guildCount;
   // `guild:channel` keys: Android keeps them in `channel_stubs`, Desktop in
   // `channels`. One row per guild keeps this under the 10000-row limit.
   for (const table of ["channel_stubs", "channels"]) {
@@ -183,7 +201,7 @@ const load = async () => {
     for (const { g, c } of channels) for (const id of c.split(",")) channelGuild.set(unpad(id), unpad(g));
   }
   if (growing) phoenix.log.info(
-    `${emojis.size} emojis, ${stickers.size} stickers in ${guilds.length} servers, ${channelGuild.size} channels`,
+    `${emojis.size} emojis, ${stickers.size} stickers in ${guildCount} servers, ${channelGuild.size} channels`,
   );
 };
 const reload = () => {
@@ -201,6 +219,12 @@ if (gateway.guildCreate) {
     addEmojis(guild.id, guild.emojis);
     addStickers((guild as Phoenix.GatewayGuild & { stickers?: Phoenix.Sticker[] }).stickers, guild.id);
     for (const channel of guild.channels ?? []) channelGuild.set(channel.id, guild.id);
+  });
+}
+if (gateway.channelCreate) {
+  phoenix.on(gateway.channelCreate, (channel) => {
+    const c = channel as Phoenix.Channel;
+    if (c?.id && c.guild_id) channelGuild.set(c.id, c.guild_id);
   });
 }
 if (gateway.guildEmojisUpdate) {
@@ -221,7 +245,10 @@ const readRealTier = () =>
     .get("/users/@me")
     .then((res) => {
       if (!res.ok) return;
-      premiumType = res.json<Phoenix.CurrentUser>().premium_type ?? 0;
+      const user = res.json<Phoenix.CurrentUser>();
+      premiumType = user.premium_type ?? 0;
+      // A login that has not reached the cache yet has no user there.
+      currentUserId ??= user.id;
       applyTier();
     })
     .catch(() => {});
@@ -230,7 +257,10 @@ const readTier = () =>
   phoenix.discord
     .me()
     .then((user) => {
-      if (!user) return;
+      if (!user) {
+        if (premiumType === null) readRealTier();
+        return;
+      }
       // Desktop switches accounts without reloading plugins.
       if (currentUserId !== null && currentUserId !== user.id) {
         for (const map of [emojis, byName, stickers, channelGuild, picked] as Map<string, unknown>[]) map.clear();
@@ -245,7 +275,10 @@ const readTier = () =>
         readRealTier();
       }
     })
-    .catch((err) => phoenix.log.warn(`reading the account: ${err}`));
+    .catch((err) => {
+      phoenix.log.warn(`reading the account: ${err}`);
+      if (premiumType === null) readRealTier();
+    });
 readTier();
 // A first login fills the cache by now, and a reconnect's READY reset the tier.
 if (gateway.readySupplemental) {
@@ -609,13 +642,12 @@ const applyStickers = () => {
 };
 applyStickers();
 
+type OutgoingMessage = { content?: unknown; sticker_ids?: string[] };
+
 // The unlocked picker sends stickers as `sticker_ids`, which Discord refuses
 // without Nitro, so those go out as links in the text instead.
-phoenix.discord.onRequest({ method: "POST", pathPrefix: "/channels/", pathSuffix: "/messages" }, (req) => {
-  if (!settings.sendStickers) return;
-  const body = req.json<{ content?: string; sticker_ids?: string[] }>();
-  if (!body?.sticker_ids?.length) return;
-  const guild = channelGuild.get(/^\/channels\/(\d+)\//.exec(req.path)?.[1] ?? "");
+const withStickerLinks = (body: OutgoingMessage, guild: string | undefined): OutgoingMessage | undefined => {
+  if (!settings.sendStickers || !body.sticker_ids?.length) return;
   const kept: string[] = [];
   const links: string[] = [];
   for (const id of body.sticker_ids) {
@@ -624,10 +656,37 @@ phoenix.discord.onRequest({ method: "POST", pathPrefix: "/channels/", pathSuffix
     else links.push(stickerLink(sticker));
   }
   if (!links.length) return;
-  const content = [body.content?.trim(), ...links].filter(Boolean).join(" ");
+  const text = typeof body.content === "string" ? body.content.trim() : "";
+  const content = [text, ...links].filter(Boolean).join(" ");
   const { sticker_ids: _, ...rest } = body;
-  return { body: kept.length ? { ...rest, content, sticker_ids: kept } : { ...rest, content } };
-});
+  return kept.length ? { ...rest, content, sticker_ids: kept } : { ...rest, content };
+};
+
+const sendChannelId = (path: string) => {
+  const clean = path.split(/[?#]/, 1)[0];
+  const match = /^\/channels\/(\d+)\/messages(?:\/\d+)?$/.exec(clean);
+  return match ? match[1] : undefined;
+};
+
+// Sends and edits the composer hook missed, like a picked emoji the mirror
+// didn't see. Text onSend already rewrote comes through unchanged. Stickers
+// are rewritten first, in the same hook, so neither change hides the other.
+const rewriteRequest = (req: Phoenix.InterceptedRequest): Phoenix.RequestHookResult => {
+  if (!req.body.includes(":") && !req.body.includes("sticker_ids")) return;
+  const original = req.json<OutgoingMessage>();
+  if (!original) return;
+  const channelId = sendChannelId(req.path);
+  const guild = channelId ? channelGuild.get(channelId) : undefined;
+  let body = withStickerLinks(original, guild) ?? original;
+  if (settings.enableEmojiBypass && typeof body.content === "string" && body.content.includes(":")) {
+    const content = rewrite(body.content, guild);
+    if (content !== body.content) body = { ...body, content };
+  }
+  return body === original ? undefined : { body };
+};
+
+phoenix.discord.onRequest({ method: "POST", pathPrefix: "/channels/", pathSuffix: "/messages" }, rewriteRequest);
+phoenix.discord.onRequest({ method: "PATCH", pathPrefix: "/channels/", pathIncludes: "/messages/" }, rewriteRequest);
 
 // --- Incoming rendering: turn fake Nitro emojis, stickers, and GIFs into real ones ---
 

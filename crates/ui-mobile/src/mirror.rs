@@ -17,6 +17,19 @@ use crate::{
 };
 
 const FIRST: Prop = Prop::named("first");
+const FORCE_VALUE: Prop = Prop::named("forceValue");
+
+fn composer_text(props: &Props) -> Option<&str> {
+   if let Some(Value::Obj(fields)) = get_prop(props, FORCE_VALUE)
+      && let Some((_, Value::Str(text))) = fields.iter().find(|(key, _)| *key == Prop::TEXT.key())
+   {
+      return Some(text);
+   }
+   match get_prop(props, Prop::VALUE) {
+      Some(Value::Str(text)) => Some(text),
+      _ => None,
+   }
+}
 
 /// Rust's view tree as its batches describe it: who holds whom, and the
 /// accessibility id each node carries.
@@ -107,6 +120,9 @@ impl Mirror {
       if let Some(Value::Str(aid)) = get_prop(props, Prop::ACCESSIBILITY_ID) {
          self.name(id, aid);
       }
+      if let Some(text) = composer_text(props) {
+         self.set_composer_text(id, text.to_owned());
+      }
       if *kind == ViewKind::Sheet {
          self.sheets.insert(id);
       }
@@ -140,8 +156,8 @@ impl Mirror {
       {
          self.list_on.insert(id, on.clone());
       }
-      if let Some(Value::Str(text)) = get_prop(props, Prop::VALUE) {
-         self.set_composer_text(id, text.clone());
+      if let Some(text) = composer_text(props) {
+         self.set_composer_text(id, text.to_owned());
       }
    }
 
@@ -429,6 +445,20 @@ mod tests {
       assert_eq!(mirror.parent(2), Some(1));
       assert_eq!(mirror.accessibility_id(2), Some("composer"));
       assert_eq!(mirror.composer(), Some((2, "")));
+      mirror.apply(
+         &[Op::Update {
+            id:    2,
+            props: vec![(
+               FORCE_VALUE,
+               Value::Obj(vec![
+                  (Prop::named("seq").key(), Value::I64(1)),
+                  (Prop::TEXT.key(), Value::Str(":artiwail: ".to_owned())),
+               ]),
+            )],
+         }],
+         false,
+      );
+      assert_eq!(mirror.composer(), Some((2, ":artiwail: ")));
 
       mirror.apply(
          &[

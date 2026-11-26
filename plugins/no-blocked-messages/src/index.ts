@@ -1,5 +1,5 @@
 // @description Hides messages from blocked (and optionally ignored) users completely
-// @version 1.0.0
+// @version 1.0.1
 // @author Nachtasyl
 
 const { gateway } = phoenix;
@@ -80,23 +80,24 @@ const readCache = () => {
 };
 
 const loadRelationships = async () => {
-  try {
-    const res = await phoenix.discord.get("/users/@me/relationships");
-    if (!res.ok) {
-      phoenix.log.warn("no-blocked-messages: relationships HTTP", res.status);
-      return;
-    }
-    const data = res.json<unknown>();
-    if (!Array.isArray(data)) return;
-    replaceFromList(data as Relationship[]);
-  } catch (e) {
-    phoenix.log.error("no-blocked-messages: failed to load relationships", e);
-  }
+  const res = await phoenix.discord.get("/users/@me/relationships");
+  if (!res.ok) throw new Error(`relationships HTTP ${res.status}`);
+  const data = res.json<unknown>();
+  if (Array.isArray(data)) replaceFromList(data as Relationship[]);
 };
 
 // Warm from disk so the first messages after start are filtered before the GET returns.
 readCache();
-void loadRelationships();
+// Desktop has no session until its own first API request, so a load at
+// startup fails there. Try again after the first response.
+loadRelationships().catch(() => {
+  const stop = phoenix.discord.onResponse({ method: "GET" }, () => {
+    stop();
+    loadRelationships().catch((e) =>
+      phoenix.log.error("no-blocked-messages: failed to load relationships", e),
+    );
+  });
+});
 
 // Keep sets in sync when Discord returns the full list again.
 phoenix.discord.onResponse(

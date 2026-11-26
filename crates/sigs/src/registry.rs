@@ -55,6 +55,7 @@ pub struct GatewayEntry {
 /// The walk crosses either a flat `{name_ptr, name_len, handler}` table
 /// (Android) or `libdiscord`'s 40-byte per-domain descriptor table (Desktop),
 /// plus any separate [`DOMAIN_SEED`] slice (`READY_SUPPLEMENTAL`, etc.).
+#[derive(Default)]
 pub struct GatewayRegistry {
    entries: Vec<GatewayEntry>,
    by_name: HashMap<String, EventId>,

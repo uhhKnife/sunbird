@@ -21,11 +21,10 @@ use crate::{
    DesktopHost,
    Error,
    TrayAction,
-   config,
 };
 
-/// The tray icon as an AppIndicator (`StatusNotifierItem`, which KDE shows
-/// natively and GNOME with its AppIndicator extension), run by the system
+/// The tray icon as an `AppIndicator` (`StatusNotifierItem`, which KDE shows
+/// natively and GNOME with its `AppIndicator` extension), run by the system
 /// Python's GTK bindings so Discord's process loads no GTK. Takes the icon,
 /// then one label per [`TrayAction::MENU`] entry, empty for a separator.
 /// Prints the index of each clicked entry and exits when its stdin closes,
@@ -154,7 +153,7 @@ impl DesktopHost for Host {
    }
 }
 
-/// Discord's own icon from its AppImage or package, else its icon name.
+/// Discord's own icon from its `AppImage` or package, else its icon name.
 fn icon() -> String {
    env::current_exe()
       .ok()

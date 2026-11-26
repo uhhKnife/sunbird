@@ -165,10 +165,10 @@ const STANDARD_METHODS: [&str; 10] = [
 // ---------------------------------------------------------------------------
 
 #[repr(C)]
-struct RawVec {
-   cap: usize,
-   ptr: *mut u8,
-   len: usize,
+pub struct RawVec {
+   pub cap: usize,
+   pub ptr: *mut u8,
+   pub len: usize,
 }
 
 #[repr(C)]
@@ -306,8 +306,14 @@ const _: () = assert!(
 type SendFn = unsafe fn(*const c_void, *mut c_void) -> RawPinnedFuture;
 type BufferedPollFn = unsafe fn(*mut c_void, *mut c_void) -> BufferedResult;
 type StreamedPollFn = unsafe fn(*mut c_void, *mut c_void) -> StreamedResult;
-type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
-type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
+pub type HostAllocFn = unsafe extern "C" fn(usize, usize) -> *mut u8;
+pub type HostDeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
+
+pub fn host_allocator() -> (Option<HostAllocFn>, Option<HostDeallocFn>) {
+   INSTALLED
+      .get()
+      .map_or((None, None), |i| (i.host_alloc, i.host_dealloc))
+}
 
 /// The original `poll`, by how it returns the response.
 #[derive(Clone, Copy)]

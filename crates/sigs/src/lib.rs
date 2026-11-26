@@ -10,6 +10,7 @@ use std::ffi::c_void;
 
 #[cfg(target_arch = "x86_64")] pub mod desktop;
 #[cfg(feature = "file")] pub mod file;
+#[cfg(target_arch = "x86_64")] pub mod gateway_send;
 #[cfg(target_arch = "x86_64")] pub mod http;
 pub mod ios;
 pub mod macos;

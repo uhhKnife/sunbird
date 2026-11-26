@@ -8,11 +8,14 @@ use std::{
    slice,
    str,
    sync::{
+      LazyLock,
       Mutex,
       OnceLock,
       PoisonError,
       atomic::{
          AtomicBool,
+         AtomicU64,
+         AtomicUsize,
          Ordering,
       },
    },
@@ -53,6 +56,90 @@ static GATEWAY: OnceLock<Gateway> = OnceLock::new();
 /// carries the store.
 static QUEUE: Mutex<Vec<(EventId, String)>> = Mutex::new(Vec::new());
 static QUEUED: AtomicBool = AtomicBool::new(false);
+
+// identify (2) and resume (6) carry session creds, never expose them to plugins
+pub const BLOCKED_SEND_OPS: [u32; 2] = [2, 6];
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SendAction {
+   Pass,
+   Drop,
+   Replace(String),
+}
+
+struct SendHook {
+   id:     u64,
+   plugin: String,
+   op:     u32,
+}
+
+static SEND_HOOKS: LazyLock<Mutex<Vec<SendHook>>> = LazyLock::new(Mutex::default);
+static SEND_HOOK_COUNT: AtomicUsize = AtomicUsize::new(0);
+static NEXT_SEND_HOOK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[must_use]
+pub fn register_send_hook(plugin: &str, op: u32) -> u64 {
+   let id = NEXT_SEND_HOOK_ID.fetch_add(1, Ordering::Relaxed);
+   let mut list = SEND_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   list.push(SendHook {
+      id,
+      plugin: plugin.to_owned(),
+      op,
+   });
+   SEND_HOOK_COUNT.store(list.len(), Ordering::Release);
+   id
+}
+
+pub fn unregister_send_hook(id: u64) {
+   let mut list = SEND_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   list.retain(|hook| hook.id != id);
+   SEND_HOOK_COUNT.store(list.len(), Ordering::Release);
+}
+
+pub fn forget_send_hooks(plugin: &str) {
+   let mut list = SEND_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   list.retain(|hook| hook.plugin != plugin);
+   SEND_HOOK_COUNT.store(list.len(), Ordering::Release);
+}
+
+#[must_use]
+pub(crate) fn matching_send_hooks(op: u32) -> Vec<u64> {
+   if BLOCKED_SEND_OPS.contains(&op) || SEND_HOOK_COUNT.load(Ordering::Acquire) == 0 {
+      return Vec::new();
+   }
+   let list = SEND_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
+   list
+      .iter()
+      .filter(|hook| hook.op == op)
+      .map(|hook| hook.id)
+      .collect()
+}
+
+#[derive(serde::Deserialize)]
+struct FrameOp {
+   op: u32,
+}
+
+#[must_use]
+pub fn observe_send(frame_json: &str) -> SendAction {
+   if SEND_HOOK_COUNT.load(Ordering::Acquire) == 0 || IN_JS.get() {
+      return SendAction::Pass;
+   }
+   let Ok(FrameOp { op }) = serde_json::from_str::<FrameOp>(frame_json) else {
+      return SendAction::Pass;
+   };
+   let matched = matching_send_hooks(op);
+   if matched.is_empty() {
+      return SendAction::Pass;
+   }
+   let Some(state) = STATE.get() else {
+      return SendAction::Pass;
+   };
+   run_js(state, |engine| {
+      Ok(engine.intercept_gateway_send(&matched, op, frame_json))
+   })
+   .unwrap_or(SendAction::Pass)
+}
 
 thread_local! {
    #[allow(

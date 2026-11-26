@@ -125,6 +125,12 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
    match machine {
       Machine::X86_64 => {
          let abi = x86::Abi::of(image);
+         if abi == x86::Abi::Win64 {
+            report(
+               "Windows restart",
+               desktop::windows_restart_script(image).map(at),
+            );
+         }
          let prologues = desktop::Prologues::of(abi);
          let http = DesktopHttpTransport::locate(image);
          report(

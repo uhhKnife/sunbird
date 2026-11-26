@@ -52,6 +52,37 @@ const FRAME_PROLOGUE_LEN: usize = 19;
 const MEDIA_FETCH_PROLOGUE: Pattern = Pattern::new("55 41 57 41 56 56 57 53 48 81 EC ?? ?? ?? ??");
 const MEDIA_FETCH_PROLOGUE_LEN: usize = 15;
 
+/// GPUI's Windows restart script.
+pub const WINDOWS_RESTART_SCRIPT: &str = r#"
+            $pidToWaitFor = $env:ZED_RESTART_PID
+            $exePath = $env:ZED_RESTART_EXECUTABLE
+            $argumentList = $env:ZED_RESTART_ARGUMENTS
+
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_PID", $null)
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_EXECUTABLE", $null)
+            [Environment]::SetEnvironmentVariable("ZED_RESTART_ARGUMENTS", $null)
+
+            while ($true) {
+                $process = Get-Process -Id $pidToWaitFor -ErrorAction SilentlyContinue
+                if (-not $process) {
+                    if ([string]::IsNullOrEmpty($argumentList)) {
+                        Start-Process -FilePath $exePath
+                    } else {
+                        Start-Process -FilePath $exePath -ArgumentList $argumentList
+                    }
+                    break
+                }
+                Start-Sleep -Seconds 0.1
+            }
+            "#;
+
+pub fn windows_restart_script(image: &Image<'_>) -> Found<usize> {
+   one(
+      "Windows restart script",
+      &image.find_bytes(WINDOWS_RESTART_SCRIPT.as_bytes()),
+   )
+}
+
 /// A function entry [`Image::hook_entry`] can displace: whole instructions
 /// with no RIP-relative operand, at least 14 bytes.
 #[derive(Clone, Copy)]

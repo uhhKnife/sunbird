@@ -1,5 +1,5 @@
 // @description Searches the web for an image in a message, from the message menu
-// @version 1.0.0
+// @version 1.1.0
 // @author Lil Poop
 
 const ENGINES = [
@@ -38,20 +38,28 @@ const open = (url: string) => {
   }
 };
 
+// Which image, when a message has several.
+const pick = async (list: Image[]) => {
+  if (list.length < 2) return list[0];
+  const picked = await phoenix.ui.choose({ title: "Which image?", options: list.map((item) => item.label) });
+  return picked < 0 ? undefined : list[picked];
+};
+
 phoenix.ui.addMessageAction({
   label: "Reverse image search",
   icon: "M15.5 14h-.79l-.28-.27A6.47 6.47 0 0 0 16 9.5 6.5 6.5 0 1 0 9.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5Zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14Z",
   visible: (ctx) => images(ctx.message).length > 0,
+  // Phones have no submenus yet, so there the engine is a dialog.
   async onPress(ctx) {
-    const list = images(ctx.message);
-    let image = list[0];
-    if (list.length > 1) {
-      const picked = await phoenix.ui.choose({ title: "Which image?", options: list.map((item) => item.label) });
-      if (picked < 0) return;
-      image = list[picked];
-    }
-    const engine = await phoenix.ui.choose({ title: "Search with", options: ENGINES.map((item) => item.label) });
-    if (engine < 0 || !image) return;
-    open(ENGINES[engine].url + encodeURIComponent(image.url));
+    const image = await pick(images(ctx.message));
+    const engine = image ? await phoenix.ui.choose({ title: "Search with", options: ENGINES.map((item) => item.label) }) : -1;
+    if (image && engine >= 0) open(ENGINES[engine].url + encodeURIComponent(image.url));
   },
+  children: ENGINES.map((engine) => ({
+    label: engine.label,
+    async onPress(ctx: Phoenix.MessageContext) {
+      const image = await pick(images(ctx.message));
+      if (image) open(engine.url + encodeURIComponent(image.url));
+    },
+  })),
 });

@@ -28,6 +28,7 @@ use crate::{
    },
    members::Place,
    sticker,
+   stream,
 };
 
 /// What plugins registered with the desktop UI, kept in the runtime's userdata
@@ -53,6 +54,8 @@ pub struct Desktop<'js> {
    pub hides:           RefCell<Vec<(u64, String)>>,
    /// `phoenix.messages.unlockStickers` holds by id and plugin.
    pub sticker_unlocks: RefCell<Vec<(u64, String)>>,
+   /// `phoenix.stream.unlockQuality` handles by id and plugin.
+   pub stream_unlocks:  RefCell<Vec<(u64, String)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -133,4 +136,8 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let mut unlocks = registry.sticker_unlocks.borrow_mut();
    unlocks.retain(|(_, plugin)| plugin != name);
    sticker::unlock(!unlocks.is_empty());
+
+   let mut stream_unlocks = registry.stream_unlocks.borrow_mut();
+   stream_unlocks.retain(|(_, plugin)| plugin != name);
+   stream::unlock(!stream_unlocks.is_empty());
 }

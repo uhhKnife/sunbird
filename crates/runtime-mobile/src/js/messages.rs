@@ -167,6 +167,12 @@ pub fn patch_api<'js>(
          move |ctx: Ctx<'js>, function: Function<'js>| on_emoji_pick(&ctx, &name, function),
       )?,
    )?;
+   let stream = Object::new(ctx.clone())?;
+   stream.set(
+      "unlockQuality",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>| Function::new(ctx, || {}))?,
+   )?;
+   api.set("stream", stream)?;
    api.set("ui", ui_object(ctx, plugin)?)?;
    api.set("commands", commands_object(ctx, plugin)?)
 }

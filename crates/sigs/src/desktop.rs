@@ -3028,6 +3028,59 @@ pub struct MenuLayout {
    pub on_click_tag: usize,
 }
 
+/// `MenuItem::Submenu`, from the constructor Discord's own submenus ("Create
+/// Reminder", "Apps") go through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmenuLayout {
+   pub tag:        u64,
+   /// The `Rc<dyn Fn() -> Vec<MenuItem>>` that builds the items on opening,
+   /// its vtable in the next word.
+   pub builder:    usize,
+   /// A word the constructor sets to `kind_value` before the props.
+   pub kind:       usize,
+   pub kind_value: u64,
+   /// `MenuItemProps`, `props_size` bytes.
+   pub props:      usize,
+   pub props_size: usize,
+}
+
+/// Every copy of `MenuItem::submenu(label, builder)` ends:
+///
+/// ```text
+/// lea rdi, [rbx + props]; lea rsi, [rbp + ..]; mov ecx, props_size; rep movsb
+/// mov qword ptr [rbx], tag
+/// mov [rbx + builder], rax
+/// lea rax, [rip + vtable]; mov [rbx + builder + 8], rax
+/// mov qword ptr [rbx + kind], kind_value
+/// ```
+pub fn submenu_layout(image: &Image<'_>) -> Found<SubmenuLayout> {
+   const TAIL: Pattern = Pattern::new(
+      "48 8D 7B ?? 48 8D 75 ?? B9 ?? ?? 00 00 F3 A4 48 C7 03 ?? 00 00 00 48 89 43 ?? 48 8D 05 ?? ?? ?? ?? 48 89 43 ?? 48 C7 43 ?? ?? 00 00 00",
+   );
+   let mut found: Vec<SubmenuLayout> = image
+      .scan(TAIL)
+      .into_iter()
+      .filter_map(|at| {
+         let b = image.read(at, 45)?;
+         let builder = usize::from(b[25]);
+         (usize::from(b[36]) == builder + 8).then(|| SubmenuLayout {
+            tag: u64::from(b[18]),
+            builder,
+            kind: usize::from(b[40]),
+            kind_value: u64::from(b[41]),
+            props: usize::from(b[3]),
+            props_size: usize::from(u16::from_le_bytes([b[9], b[10]])),
+         })
+      })
+      .collect();
+   found.dedup();
+   match found.as_slice() {
+      [layout] => Ok(*layout),
+      [] => Err("no MenuItem::submenu constructor".to_owned()),
+      layouts => Err(format!("MenuItem::submenu constructors disagree: {layouts:x?}")),
+   }
+}
+
 /// `(reg, base, disp)` of `op r64, [base + disp]` (`REX.W op /r` with a
 /// `disp8` or `disp32`) at each offset of `bytes`, register numbers 0 to 15.
 fn mem_operands(bytes: &[u8], op: u8) -> impl Iterator<Item = (u8, u8, usize)> + '_ {
@@ -3475,15 +3528,14 @@ pub fn modal(image: &Image<'_>, div_into_any: usize, div: &DivLayout) -> Found<M
 
    // `Div::id` is the first call after `lea` of `"game-server-shop-carousel"`,
    // checking `ElementId::None` in `Interactivity` (`cmp byte ptr [rcx +
-   // disp32], 0xff`).
-   let carousel = one(
-      "game-server-shop-carousel",
-      &image.find_bytes(b"game-server-shop-carousel"),
-   )?;
+   // disp32], 0xff`). Builds from 2026-11 keep a second copy of the string
+   // that other code loads as a first argument.
    // `Div::id(div, id)` takes the id string as its third argument.
    let abi = Abi::of(image);
-   let carousel_leas: Vec<usize> = leas_of(carousel)
+   let carousel_leas: Vec<usize> = image
+      .find_bytes(b"game-server-shop-carousel")
       .into_iter()
+      .flat_map(&leas_of)
       .filter(|&lea| image.read(lea, 3) == Some(&lea_rip(abi.arg(2))[..]))
       .collect();
    let carousel_lea = one("game-server-shop-carousel load", &carousel_leas)?;

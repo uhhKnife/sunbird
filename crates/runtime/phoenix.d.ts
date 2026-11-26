@@ -1385,7 +1385,11 @@ declare namespace Phoenix {
       danger?: boolean;
       priority?: number;
       visible?(ctx: MessageContext): boolean | Promise<boolean>;
-      onPress(ctx: MessageContext): void;
+      /// Required unless `children` is given.
+      onPress?(ctx: MessageContext): void;
+      /// Makes the row a submenu of these. Desktop shows a native submenu, or the rows inline on a
+      /// build without one to copy; phones ignore it for now and need `onPress`.
+      children?: { label: string; icon?: Icon; danger?: boolean; onPress(ctx: MessageContext): void }[];
     }): Remover;
     /// A section at the end of a profile's main tab.
     addProfileSection(options: {

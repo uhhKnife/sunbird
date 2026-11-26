@@ -33,6 +33,7 @@ use phoenix_hook::image::Image;
 use phoenix_sigs::desktop::{
    self,
    MenuLayout,
+   SubmenuLayout,
    layout,
 };
 
@@ -87,6 +88,8 @@ struct MenuSymbols {
    layout:            MenuLayout,
    /// Where `with_id` keeps a short id inline, its length byte first.
    id_offset:         Option<usize>,
+   /// Without it, plugin submenus show their items inline.
+   submenu:           Option<SubmenuLayout>,
 }
 
 // SAFETY: function pointers and plain struct offsets into `Discord.exe`.
@@ -105,6 +108,8 @@ pub struct ActionMeta {
    pub danger:      bool,
    pub priority:    i32,
    pub has_visible: bool,
+   /// The action whose submenu this one sits in.
+   pub parent:      Option<u64>,
 }
 
 static ACTIVE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -121,9 +126,25 @@ struct PendingClick {
 
 const MAX_PENDING_CLICKS: usize = 512;
 
-struct ClickTable {
+struct ClickTable<T = PendingClick> {
    order: VecDeque<u64>,
-   map:   HashMap<u64, PendingClick>,
+   map:   HashMap<u64, T>,
+}
+
+impl<T> ClickTable<T> {
+   /// Keeps `value` under a fresh token, forgetting the oldest past
+   /// [`MAX_PENDING_CLICKS`].
+   fn insert(&mut self, value: T) -> u64 {
+      let token = NEXT_CLICK_TOKEN.fetch_add(1, Ordering::Relaxed);
+      while self.order.len() >= MAX_PENDING_CLICKS {
+         if let Some(old) = self.order.pop_front() {
+            self.map.remove(&old);
+         }
+      }
+      self.order.push_back(token);
+      self.map.insert(token, value);
+      token
+   }
 }
 
 static NEXT_CLICK_TOKEN: AtomicU64 = AtomicU64::new(1);
@@ -134,6 +155,31 @@ static CLICKS: LazyLock<Mutex<ClickTable>> = LazyLock::new(|| {
    })
 });
 static WORKER_TX: OnceLock<mpsc::Sender<PendingClick>> = OnceLock::new();
+
+/// A plugin submenu's children, found again when its builder runs.
+#[derive(Clone, Copy)]
+struct PendingSubmenu {
+   parent:  u64,
+   message: u64,
+   channel: u64,
+}
+
+static SUBMENUS: LazyLock<Mutex<ClickTable<PendingSubmenu>>> = LazyLock::new(|| {
+   Mutex::new(ClickTable {
+      order: VecDeque::new(),
+      map:   HashMap::new(),
+   })
+});
+
+static SUBMENU_VTBL: RcFnVtbl = RcFnVtbl {
+   drop_in_place: ptr::null(),
+   size:          size_of::<u64>(),
+   align:         align_of::<u64>(),
+   call_once:     build_submenu as *const c_void,
+   call_mut:      build_submenu as *const c_void,
+   call:          build_submenu as *const c_void,
+   extra:         ptr::null(),
+};
 
 static MENU_ACTION_VTBL: RcFnVtbl = RcFnVtbl {
    drop_in_place: ptr::null(),
@@ -180,16 +226,10 @@ fn ensure_worker() -> &'static mpsc::Sender<PendingClick> {
 }
 
 fn register_click(click: PendingClick) -> u64 {
-   let token = NEXT_CLICK_TOKEN.fetch_add(1, Ordering::Relaxed);
-   let mut table = CLICKS.lock().unwrap_or_else(PoisonError::into_inner);
-   while table.order.len() >= MAX_PENDING_CLICKS {
-      if let Some(old) = table.order.pop_front() {
-         table.map.remove(&old);
-      }
-   }
-   table.order.push_back(token);
-   table.map.insert(token, click);
-   token
+   CLICKS
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .insert(click)
 }
 
 unsafe extern "C" fn menu_action_callback(
@@ -273,6 +313,9 @@ pub fn install(image: &Image<'static>) {
          vec_push:          std::mem::transmute::<usize, VecPushFn>(menu.vec_push),
          layout:            menu.layout,
          id_offset:         None,
+         submenu:           desktop::submenu_layout(image)
+            .inspect_err(|err| log::warn!("desktop context menu: {err}, submenus show inline"))
+            .ok(),
       }
    };
    let syms = MenuSymbols {
@@ -407,8 +450,9 @@ fn append_plugin_actions(
       return;
    }
 
-   let visible: Vec<ActionMeta> = actions
-      .into_iter()
+   let visible: Vec<&ActionMeta> = actions
+      .iter()
+      .filter(|action| action.parent.is_none())
       .filter(|action| {
          if !action.has_visible {
             return true;
@@ -431,53 +475,167 @@ fn append_plugin_actions(
       // SAFETY: `vec_push` copies one `MenuItem`, which fits `sep`.
       unsafe { (syms.vec_push)(vec, &raw mut sep) };
    }
-   let at = &syms.layout;
 
    for action in visible {
-      let token = register_click(PendingClick {
-         action:  action.id,
-         message: message_id,
-         channel: channel_id,
-      });
-      let Some(rc_ptr) = gpui::alloc_rc_u64(token) else {
-         continue;
+      let mut children = actions
+         .iter()
+         .filter(|child| child.parent == Some(action.id))
+         .peekable();
+      let items: Vec<RawMenuItem> = match (children.peek().is_some(), syms.submenu) {
+         (true, Some(submenu)) => {
+            submenu_item(syms, &submenu, action, message_id, channel_id)
+               .into_iter()
+               .collect()
+         },
+         // Without one of Discord's submenus to copy, the children go flat.
+         (true, None) => {
+            children
+               .filter_map(|child| action_item(syms, child, message_id, channel_id))
+               .collect()
+         },
+         (false, _) => {
+            action_item(syms, action, message_id, channel_id)
+               .into_iter()
+               .collect()
+         },
       };
-      let label_ss = SharedString::from_str(&action.label);
-      let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
-
-      // A native `MenuItem::Action` with our `Rc<dyn Fn>` click handler, then
-      // Discord's `MenuItemProps`, id, optional icon and optional danger color
-      // (`2`), at the offsets `sigs` decoded.
-      let mut item = RawMenuItem::zeroed();
-      item.put(0, at.action_tag);
-      item.put(at.on_click_tag, 0u64);
-      item.put(at.on_click, rc_ptr);
-      item.put(at.on_click + 8, &raw const MENU_ACTION_VTBL);
-      // SAFETY: `props_new` fills `props_size` bytes at `props`, inside the
-      // item; the builders take the item by value and return it through
-      // buffers that fit it.
-      unsafe {
-         (syms.props_new)(item.as_mut_ptr().add(at.props), &raw const label_ss, 0, 0);
-
-         let mut next = RawMenuItem::zeroed();
-         (syms.with_id)(&raw mut next, &raw mut item, id_str.as_ptr(), id_str.len());
-         let mut item = next;
-
-         if let Some(icon_id) = map_icon(action.icon.as_deref()) {
-            let mut next = RawMenuItem::zeroed();
-            (syms.with_icon)(&raw mut next, &raw mut item, icon_id);
-            item = next;
-         }
-
-         if action.danger {
-            let mut next = RawMenuItem::zeroed();
-            (syms.with_color)(&raw mut next, &raw mut item, 2);
-            item = next;
-         }
-
-         (syms.vec_push)(vec, &raw mut item);
+      for mut item in items {
+         // SAFETY: `vec_push` copies one `MenuItem`, which fits `item`.
+         unsafe { (syms.vec_push)(vec, &raw mut item) };
       }
    }
+}
+
+/// Fills in the props, id, icon and danger color of `item`, whose variant
+/// fields are set.
+fn finish_item(
+   syms: &MenuSymbols,
+   mut item: RawMenuItem,
+   props: usize,
+   action: &ActionMeta,
+) -> RawMenuItem {
+   let label_ss = SharedString::from_str(&action.label);
+   let id_str = gpui::intern_str(&format!("sunbird-msg-action-{}", action.id));
+   // SAFETY: `props_new` fills `props_size` bytes at `props`, inside the item;
+   // the builders take the item by value and return it through buffers that
+   // fit it.
+   unsafe {
+      (syms.props_new)(item.as_mut_ptr().add(props), &raw const label_ss, 0, 0);
+
+      let mut next = RawMenuItem::zeroed();
+      (syms.with_id)(&raw mut next, &raw mut item, id_str.as_ptr(), id_str.len());
+      let mut item = next;
+
+      if let Some(icon_id) = map_icon(action.icon.as_deref()) {
+         let mut next = RawMenuItem::zeroed();
+         (syms.with_icon)(&raw mut next, &raw mut item, icon_id);
+         item = next;
+      }
+
+      if action.danger {
+         let mut next = RawMenuItem::zeroed();
+         (syms.with_color)(&raw mut next, &raw mut item, 2);
+         item = next;
+      }
+      item
+   }
+}
+
+/// A native `MenuItem::Action` with our `Rc<dyn Fn>` click handler, at the
+/// offsets `sigs` decoded.
+fn action_item(
+   syms: &MenuSymbols,
+   action: &ActionMeta,
+   message: u64,
+   channel: u64,
+) -> Option<RawMenuItem> {
+   let token = register_click(PendingClick {
+      action: action.id,
+      message,
+      channel,
+   });
+   let rc_ptr = gpui::alloc_rc_u64(token)?;
+   let at = &syms.layout;
+   let mut item = RawMenuItem::zeroed();
+   item.put(0, at.action_tag);
+   item.put(at.on_click_tag, 0u64);
+   item.put(at.on_click, rc_ptr);
+   item.put(at.on_click + 8, &raw const MENU_ACTION_VTBL);
+   Some(finish_item(syms, item, at.props, action))
+}
+
+/// A native submenu whose builder lists `action`'s children when it opens.
+fn submenu_item(
+   syms: &MenuSymbols,
+   submenu: &SubmenuLayout,
+   action: &ActionMeta,
+   message: u64,
+   channel: u64,
+) -> Option<RawMenuItem> {
+   if submenu.props_size != syms.layout.props_size {
+      return None;
+   }
+   let token = SUBMENUS
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .insert(PendingSubmenu {
+         parent: action.id,
+         message,
+         channel,
+      });
+   let rc_ptr = gpui::alloc_rc_u64(token)?;
+   let mut item = RawMenuItem::zeroed();
+   item.put(0, submenu.tag);
+   item.put(submenu.builder, rc_ptr);
+   item.put(submenu.builder + 8, &raw const SUBMENU_VTBL);
+   item.put(submenu.kind, submenu.kind_value);
+   Some(finish_item(syms, item, submenu.props, action))
+}
+
+/// A plugin submenu's builder, `fn(&self) -> Vec<MenuItem>`, which Discord
+/// runs when the submenu opens.
+unsafe extern "C" fn build_submenu(out: *mut RawMenuVec, data: *const u64) -> *mut RawMenuVec {
+   if out.is_null() {
+      return out;
+   }
+   // SAFETY: Discord passes the return slot, written before anything else.
+   unsafe {
+      out.write(RawMenuVec {
+         cap: 0,
+         ptr: ptr::without_provenance_mut(align_of::<u64>()),
+         len: 0,
+      });
+   }
+   let _ = std::panic::catch_unwind(|| {
+      let (Some(syms), false) = (MENU_SYMS.get(), data.is_null()) else {
+         return;
+      };
+      // SAFETY: `data` points to the token `alloc_rc_u64` stored.
+      let token = unsafe { ptr::read_unaligned(data) };
+      let Some(pending) = SUBMENUS
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .map
+         .get(&token)
+         .copied()
+      else {
+         return;
+      };
+      let actions: Vec<ActionMeta> = ACTIONS
+         .read()
+         .map_or_else(|_| Vec::new(), |guard| guard.clone());
+      for child in actions
+         .iter()
+         .filter(|child| child.parent == Some(pending.parent))
+      {
+         if let Some(mut item) = action_item(syms, child, pending.message, pending.channel) {
+            // SAFETY: `out` is the empty `Vec<MenuItem>` written above, grown
+            // by Discord's own push.
+            unsafe { (syms.vec_push)(out, &raw mut item) };
+         }
+      }
+   });
+   out
 }
 
 /// Finds where `with_id` stores a short id by giving one to a blank action

@@ -309,6 +309,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(at),
          );
          report(
+            "menu submenu",
+            desktop::submenu_layout(image).map(|layout| format!("{layout:x?}")),
+         );
+         report(
             "sticker check",
             desktop::sticker_check(image).map(at),
          );

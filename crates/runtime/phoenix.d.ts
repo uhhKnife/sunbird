@@ -1465,6 +1465,9 @@ declare namespace Phoenix {
     notify(options: NotifyOptions): () => void;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
+    /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
+    /// anything else. Desktop only for now.
+    openUrl?(url: string): void;
     /// A short message at the bottom of the screen, or in a banner at the top on iOS.
     toast(text: string): void;
   }

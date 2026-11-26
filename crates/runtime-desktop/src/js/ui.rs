@@ -1244,6 +1244,13 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
       })?,
    )?;
    ui.set(
+      "openUrl",
+      Function::new(ctx.clone(), |ctx: Ctx<'js>, url: String| {
+         phoenix_ui_desktop::open_url(&url)
+            .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
+      })?,
+   )?;
+   ui.set(
       "notify",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
          let title = options

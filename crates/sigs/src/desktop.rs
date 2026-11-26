@@ -104,26 +104,29 @@ impl Prologue {
 #[derive(Clone, Copy)]
 pub struct Prologues {
    /// `MessageRow::render`, `build_message_body` and `MessageContextMenu`.
-   pub row:            Prologue,
+   pub row:             Prologue,
    /// `host::section`, `Workspace::render_overlays`, `Store::delete_message`
    /// and `ReqwestTransport::send`.
-   pub frame:          Prologue,
-   pub media_fetch:    Prologue,
+   pub frame:           Prologue,
+   pub media_fetch:     Prologue,
    /// The asset loader, [`asset_load`].
-   pub asset_load:     Prologue,
+   pub asset_load:      Prologue,
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
-   pub emoji_check:    Prologue,
+   pub emoji_check:     Prologue,
    /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
-   pub ready_parse:    Option<Prologue>,
+   pub ready_parse:     Option<Prologue>,
    /// [`ready_text`], Win64 only.
-   pub ready_text:     Option<Prologue>,
+   pub ready_text:      Option<Prologue>,
    /// [`sticker_check`], Win64 only: 8 pushes and `sub rsp, imm32`.
-   pub sticker_check:  Option<Prologue>,
+   pub sticker_check:   Option<Prologue>,
    /// `meetsApplicationStreamRequirements`, a leaf checking stream resolution
    /// and FPS against Nitro and boost tiers. Its System V entry has not been
    /// measured, and the hook stays off where there is no prologue.
-   pub stream_quality: Option<Prologue>,
+   pub stream_quality:  Option<Prologue>,
+   /// `canUsePremiumFeature`, a leaf: up to the first `jne`. Its System V
+   /// entry has not been measured either.
+   pub premium_feature: Option<Prologue>,
 }
 
 impl Prologues {
@@ -138,65 +141,70 @@ impl Prologues {
       match abi {
          Abi::Win64 => {
             Self {
-               row:            Prologue {
+               row:             Prologue {
                   pattern: ROW_PROLOGUE,
                   len:     ROW_PROLOGUE_LEN,
                },
-               frame:          Prologue {
+               frame:           Prologue {
                   pattern: FRAME_PROLOGUE,
                   len:     FRAME_PROLOGUE_LEN,
                },
-               media_fetch:    Prologue {
+               media_fetch:     Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               asset_load:     Prologue {
+               asset_load:      Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               emoji_check:    Prologue {
+               emoji_check:     Prologue {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
                },
                // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
-               ready_parse:    Some(Prologue {
+               ready_parse:     Some(Prologue {
                   pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
                   len:     17,
                }),
-               ready_text:     Some(Prologue {
+               ready_text:      Some(Prologue {
                   pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
                   len:     15,
                }),
-               sticker_check:  Some(Prologue {
+               sticker_check:   Some(Prologue {
                   pattern: Pattern::new(
                      "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ?? ?? ?? ??",
                   ),
                   len:     19,
                }),
-               stream_quality: Some(Prologue {
+               stream_quality:  Some(Prologue {
                   pattern: Pattern::new("56 57 55 53 44 8B 54 24 ?? 44 8B 5C 24 ??"),
                   len:     14,
+               }),
+               premium_feature: Some(Prologue {
+                  pattern: Pattern::new("80 FA ?? 0F 95 C0 4D 85 C0 41 0F 94 C2 41 08 C2"),
+                  len:     16,
                }),
             }
          },
          Abi::SysV => {
             Self {
-               row:            SYSV_FRAME,
-               frame:          SYSV_FRAME,
-               media_fetch:    SYSV_FRAME,
+               row:             SYSV_FRAME,
+               frame:           SYSV_FRAME,
+               media_fetch:     SYSV_FRAME,
                // Four pushes and `sub rsp, imm32`.
-               asset_load:     Prologue {
+               asset_load:      Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
                   len:     14,
                },
-               emoji_check:    Prologue {
+               emoji_check:     Prologue {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
                },
-               ready_parse:    None,
-               ready_text:     None,
-               sticker_check:  None,
-               stream_quality: None,
+               ready_parse:     None,
+               ready_text:      None,
+               sticker_check:   None,
+               stream_quality:  None,
+               premium_feature: None,
             }
          },
       }
@@ -902,6 +910,72 @@ pub fn stream_quality(image: &Image<'_>) -> Found<usize> {
       .map(|(func, _)| func)
       .collect();
    one("stream quality check", &candidates)
+}
+
+/// Phoenix's `canUsePremiumFeature(feature, tier, ..) -> bool`, and the
+/// feature the Go Live picker asks it for before HD.
+#[derive(Clone, Copy, Debug)]
+pub struct PremiumFeature {
+   pub func:        usize,
+   /// `STREAM_HIGH_QUALITY`: the HD preset, its upsell and the picker's Nitro
+   /// banner all ask for it.
+   pub stream_high: u8,
+}
+
+/// The premium feature check and its stream feature.
+///
+/// The check keeps a static list of features per tier, Nitro's being every
+/// feature in order, `00 01 .. 1B`, and loads it in one place. The stream
+/// feature comes from the picker's "Stream in HD resolution" banner, which
+/// opens with a call to a gate doing `mov dl, feature; call`.
+pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
+   const BACK: usize = 0x100;
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the stream feature gate is only decoded on Win64".to_owned());
+   }
+   // A leaf has no unwind entry, so its start is the prologue closest before
+   // the load, after `int3` padding. Other enums list `00 .. 1B` too, in
+   // functions that open differently.
+   let prologue = prologues(image)
+      .premium_feature
+      .ok_or("no premium feature prologue")?;
+   let every: Vec<u8> = (0..0x1C).collect();
+   let lists = image.find_bytes(&every);
+   let funcs: HashSet<usize> = lea_refs_many(image, &lists)
+      .into_values()
+      .flatten()
+      .filter_map(|site| {
+         let start = site.checked_sub(BACK)?;
+         let at = *prologue.pattern.find_in(image.read(start, BACK)?).last()?;
+         let func = start + at;
+         (image.read(func - 1, 1)? == [0xCC]).then_some(func)
+      })
+      .collect();
+   let func = one(
+      "premium feature check",
+      &funcs.into_iter().collect::<Vec<_>>(),
+   )?;
+
+   let banners: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Stream in HD resolution"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let banner = one("HD stream banner", &banners.into_iter().collect::<Vec<_>>())?;
+   let gate = Pattern::new("B2 ?? E8");
+   let features: Vec<u8> = calls_in(image, banner, 0x60)
+      .into_iter()
+      .filter_map(|(_, callee)| {
+         let body = image.read(callee, 0x30)?;
+         let at = *gate.find_in(body).first()?;
+         Some(body[at + 1])
+      })
+      .collect();
+   let stream_high = *features
+      .first()
+      .ok_or("the HD stream banner opens with no feature gate")?;
+   Ok(PremiumFeature { func, stream_high })
 }
 
 /// Settings page 24's sidebar name, `Phoenix`, and its id,

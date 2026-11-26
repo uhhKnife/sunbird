@@ -425,6 +425,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
          report(
+            "premium feature",
+            desktop::premium_feature(image).and_then(|found| {
+               prologues
+                  .premium_feature
+                  .is_none_or(|prologue| prologue.at(image, found.func))
+                  .then(|| format!("{} stream_high={:#x}", at(found.func), found.stream_high))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         report(
             "message json",
             json
                .as_ref()

@@ -1,5 +1,5 @@
-// @description Sends custom and animated emojis as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.4.2
+// @description Sends custom and animated emojis as links, renders fake emojis, stickers, and GIFs as real ones, and unlocks client themes
+// @version 0.5.0
 // @author mantikafasi
 
 const { gateway } = phoenix;
@@ -58,6 +58,14 @@ const settings = phoenix.settings.define({
     title: "Always spoof emojis",
     description: "Send external and animated emojis as links even when you have Nitro (useful when external emojis are blocked)",
     default: false,
+  },
+  unlockThemes: {
+    type: "switch",
+    title: "Unlock client themes",
+    description:
+      "Pick Nitro color themes, kept on this device only. The app then shows other Nitro features as unlocked too, but only themes work",
+    default: true,
+    onChange: () => applyTier(),
   },
 });
 
@@ -170,30 +178,283 @@ if (gateway.guildStickersUpdate) {
   });
 }
 
+// Client themes need Nitro in the app, so while they are unlocked the app's
+// copy of the account says Nitro and the cache stops telling the real tier.
+// It comes from the API instead, and from real USER_UPDATEs.
+const readRealTier = () =>
+  phoenix.discord
+    .get("/users/@me")
+    .then((res) => {
+      if (!res.ok) return;
+      premiumType = res.json<Phoenix.CurrentUser>().premium_type ?? 0;
+      applyTier();
+    })
+    .catch(() => {});
+
 const readTier = () =>
   phoenix.discord
     .me()
     .then((user) => {
       if (!user) return;
-      premiumType = user.premium_type ?? 0;
       // Desktop switches accounts without reloading plugins.
       if (currentUserId !== null && currentUserId !== user.id) {
         for (const map of [emojis, byName, stickers, channelGuild, picked] as Map<string, unknown>[]) map.clear();
         loadedGuilds = -1;
         settleBy = Date.now() + SETTLE_MS;
+        premiumType = null;
         reload();
       }
       currentUserId = user.id;
+      if (premiumType === null) {
+        if (user.premium_type !== TIER_2) premiumType = user.premium_type ?? 0;
+        readRealTier();
+      }
     })
     .catch((err) => phoenix.log.warn(`reading the account: ${err}`));
 readTier();
-// A first login fills the cache by now.
-// ponytail: a tier bought or lost mid-session shows on the next sync.
+// A first login fills the cache by now, and a reconnect's READY reset the tier.
 if (gateway.readySupplemental) {
   phoenix.on(gateway.readySupplemental, () => {
     settleBy = Date.now() + SETTLE_MS;
     readTier();
+    readRealTier();
     reload();
+  });
+}
+
+// --- Client themes ---
+
+const TIER_2 = 2;
+const themesUnlocked = () => settings.unlockThemes && premiumType !== null && premiumType < TIER_2;
+
+// Tells the app the account has Nitro, or its real tier back. Only the app's
+// copy of the account changes: enqueued events skip plugins and never reach Discord.
+// The cache lags the queue, so a reload's restore would win over a check of it.
+const applyTier = () => {
+  if (premiumType === null || premiumType >= TIER_2) return;
+  const shown = themesUnlocked() ? TIER_2 : premiumType;
+  phoenix.discord
+    .me()
+    .then((user) => {
+      if (user) phoenix.enqueue(gateway.userUpdate, { ...user, premium_type: shown });
+    })
+    .catch((err) => phoenix.log.warn(`reading the account: ${err}`));
+};
+phoenix.onUnload(() => {
+  if (premiumType === null || premiumType >= TIER_2) return;
+  const real = premiumType;
+  phoenix.discord.me().then((user) => {
+    if (user) phoenix.enqueue(gateway.userUpdate, { ...user, premium_type: real });
+  });
+});
+
+// A real USER_UPDATE carries the real tier, and would take the unlock away.
+phoenix.hook(gateway.userUpdate, {
+  before(user) {
+    if (user.id !== currentUserId || user.premium_type === undefined) return;
+    premiumType = user.premium_type;
+    if (themesUnlocked()) user.premium_type = TIER_2;
+  },
+});
+
+// Protobuf, enough to find and replace length-delimited fields of the settings.
+type Field = { field: number; wire: number; start: number; data: number; end: number };
+
+const varint = (bytes: Uint8Array, at: number): [number, number] => {
+  let value = 0;
+  let scale = 1;
+  let byte: number;
+  do {
+    if (at >= bytes.length) throw new Error("truncated varint");
+    byte = bytes[at++];
+    value += (byte & 0x7f) * scale;
+    scale *= 128;
+  } while (byte & 0x80);
+  return [value, at];
+};
+
+const putVarint = (value: number) => {
+  const out: number[] = [];
+  while (value > 0x7f) {
+    out.push((value % 128) | 0x80);
+    value = Math.floor(value / 128);
+  }
+  out.push(value);
+  return Uint8Array.from(out);
+};
+
+const fields = (bytes: Uint8Array) => {
+  const out: Field[] = [];
+  let at = 0;
+  while (at < bytes.length) {
+    const start = at;
+    const [key, next] = varint(bytes, at);
+    const wire = key & 7;
+    let data = next;
+    if (wire === 0) at = varint(bytes, next)[1];
+    else if (wire === 1) at = next + 8;
+    else if (wire === 5) at = next + 4;
+    else if (wire === 2) {
+      const [length, body] = varint(bytes, next);
+      data = body;
+      at = body + length;
+    } else throw new Error(`wire type ${wire}`);
+    if (at > bytes.length) throw new Error("truncated field");
+    out.push({ field: Math.floor(key / 8), wire, start, data, end: at });
+  }
+  return out;
+};
+
+const concat = (parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, part) => n + part.length, 0));
+  let at = 0;
+  for (const part of parts) {
+    out.set(part, at);
+    at += part.length;
+  }
+  return out;
+};
+
+/// The last `field` of `message` holding bytes, as protobuf merges them.
+const child = (message: Uint8Array, field: number) => {
+  const found = fields(message).filter((f) => f.field === field && f.wire === 2).pop();
+  return found && message.subarray(found.data, found.end);
+};
+
+/// `message` with every `field` replaced by one holding `body`.
+const replaced = (message: Uint8Array, field: number, body: Uint8Array) =>
+  concat([
+    ...fields(message)
+      .filter((f) => f.field !== field)
+      .map((f) => message.subarray(f.start, f.end)),
+    putVarint(field * 8 + 2),
+    putVarint(body.length),
+    body,
+  ]);
+
+const BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+const fromBase64 = (text: string) => {
+  const clean = text.replace(/=+$/, "");
+  const out = new Uint8Array(Math.floor((clean.length * 3) / 4));
+  let bits = 0;
+  let count = 0;
+  let at = 0;
+  for (const char of clean) {
+    const digit = BASE64.indexOf(char);
+    if (digit < 0) throw new Error("bad base64");
+    bits = ((bits << 6) | digit) & 0xffffff;
+    count += 6;
+    if (count >= 8) {
+      count -= 8;
+      out[at++] = (bits >> count) & 0xff;
+    }
+  }
+  return out;
+};
+
+const toBase64 = (bytes: Uint8Array) => {
+  let out = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const n = (bytes[i] << 16) | ((bytes[i + 1] ?? 0) << 8) | (bytes[i + 2] ?? 0);
+    out += BASE64[n >> 18] + BASE64[(n >> 12) & 63];
+    out += i + 1 < bytes.length ? BASE64[(n >> 6) & 63] : "=";
+    out += i + 2 < bytes.length ? BASE64[n & 63] : "=";
+  }
+  return out;
+};
+
+// PreloadedUserSettings: versions 1 { data_version 3 }, appearance 13 { client_theme_settings 3 }.
+const VERSIONS = 1;
+const DATA_VERSION = 3;
+const APPEARANCE = 13;
+const CLIENT_THEME = 3;
+const SETTINGS_PATH = "/users/@me/settings-proto/1";
+const THEMES_KEY = "themes";
+
+const savedThemes = () => phoenix.storage.get<Record<string, string>>(THEMES_KEY) ?? {};
+
+// The app sends the whole appearance message, so one without a theme clears it.
+phoenix.discord.onRequest({ method: "PATCH", pathPrefix: SETTINGS_PATH }, (req) => {
+  if (!themesUnlocked() || !currentUserId) return;
+  try {
+    const settings = req.json<{ settings?: string }>()?.settings;
+    const appearance = settings && child(fromBase64(settings), APPEARANCE);
+    if (!appearance) return;
+    const theme = child(appearance, CLIENT_THEME);
+    const themes = savedThemes();
+    if (theme) themes[currentUserId] = toBase64(theme);
+    else delete themes[currentUserId];
+    phoenix.storage.set(THEMES_KEY, themes);
+  } catch (err) {
+    phoenix.log.warn(`reading a settings change: ${err}`);
+  }
+});
+
+// Discord drops the theme of an account without Nitro and answers with the rest.
+// The answer gets the theme back, and a data version one past Discord's so the
+// app takes the settings Discord then pushes over the gateway, without the
+// theme, as outdated.
+// ponytail: a settings change on another device can still win once.
+const withTheme = (settings: string, theme: string) => {
+  let proto = fromBase64(settings);
+  proto = replaced(proto, APPEARANCE, replaced(child(proto, APPEARANCE) ?? new Uint8Array(), CLIENT_THEME, fromBase64(theme)));
+  const versions = child(proto, VERSIONS);
+  if (versions) {
+    const bumped = concat(
+      fields(versions).map((f) =>
+        f.field === DATA_VERSION && f.wire === 0
+          ? concat([putVarint(DATA_VERSION * 8), putVarint(varint(versions, f.data)[0] + 1)])
+          : versions.subarray(f.start, f.end),
+      ),
+    );
+    proto = replaced(proto, VERSIONS, bumped);
+  }
+  return toBase64(proto);
+};
+
+// The account and its real tier, which right after launch are still on their way.
+const account = async () => {
+  if (currentUserId === null) await readTier();
+  if (premiumType === null) await readRealTier();
+  return currentUserId;
+};
+
+phoenix.discord.onResponse({ pathPrefix: SETTINGS_PATH }, async (res) => {
+  if (!settings.unlockThemes || res.status !== 200) return;
+  const id = await account();
+  const theme = id && savedThemes()[id];
+  if (!theme || !themesUnlocked()) return;
+  try {
+    const body = res.json<{ settings?: string }>();
+    if (!body?.settings) return;
+    phoenix.log.info("restored the theme in a settings reply");
+    return { body: { ...body, settings: withTheme(body.settings, theme) } };
+  } catch (err) {
+    phoenix.log.warn(`restoring the theme: ${err}`);
+  }
+});
+
+// READY brings Discord's settings and real tier at every connect, before the
+// tier is read from the API.
+if (gateway.ready) {
+  phoenix.hook(gateway.ready, {
+    before(ready) {
+      const payload = ready as Phoenix.Ready & { user_settings_proto?: string };
+      const real = payload.user?.premium_type ?? 0;
+      if (!settings.unlockThemes || real >= TIER_2) return;
+      premiumType = real;
+      payload.user.premium_type = TIER_2;
+      const theme = savedThemes()[payload.user.id];
+      if (theme && payload.user_settings_proto) {
+        try {
+          payload.user_settings_proto = withTheme(payload.user_settings_proto, theme);
+          phoenix.log.info("restored the theme in READY");
+        } catch (err) {
+          phoenix.log.warn(`restoring the theme: ${err}`);
+        }
+      }
+    },
   });
 }
 

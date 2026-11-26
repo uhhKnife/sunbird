@@ -113,6 +113,7 @@ pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
    open_access_gate(&image);
+   open_notification_gate(&image);
    staff::prepare(&image);
    settings::install(&image);
    modal::install(&image);
@@ -188,6 +189,33 @@ fn open_access_gate(image: &Image<'static>) {
    match unsafe { image.write_code(access, &ALLOWED) } {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
+   }
+}
+
+/// Desktop Phoenix's `surfaces` notification provider claims every message
+/// alert and returns it empty for a client it reads as gated, so the real alert
+/// is never built and nothing reaches the OS; [`open_access_gate`]'s patch does
+/// not reach this, since it reads the gate state from the store directly. This
+/// forces its predicate to answer 0 ("not mine"), so the provider declines and
+/// the planner's fallback builds the real alert, as it does on the official
+/// app. `xor eax, eax; nop` replaces the `movzx eax, cl` that would otherwise
+/// carry the "mine" answer into the function's return.
+fn open_notification_gate(image: &Image<'static>) {
+   /// `xor eax, eax; nop` in place of `movzx eax, cl`.
+   const DECLINE: [u8; 3] = [0x31, 0xC0, 0x90];
+
+   let gate = match phoenix_sigs::desktop::notification_gate(image) {
+      Ok(gate) => gate,
+      Err(err) => {
+         log::warn!("notification gate: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from `DllMain` or the constructor
+   // before it runs.
+   match unsafe { image.write_code(gate, &DECLINE) } {
+      Ok(()) => log::info!("notification gate: open"),
+      Err(err) => log::error!("notification gate: {err}"),
    }
 }
 

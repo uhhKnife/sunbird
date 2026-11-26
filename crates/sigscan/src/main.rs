@@ -168,6 +168,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
          report("settings layer", desktop::settings_layer(image).map(at));
          report("access gate", desktop::access_gate(image).map(at));
+         report("notification gate", desktop::notification_gate(image).map(at));
          if abi == x86::Abi::SysV {
             report(
                "wayland frame",

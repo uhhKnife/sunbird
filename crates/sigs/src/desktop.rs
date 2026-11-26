@@ -771,6 +771,25 @@ pub fn access_gate(image: &Image<'_>) -> Found<usize> {
    }
 }
 
+/// The `movzx eax, cl` that carries the `surfaces` notification provider's
+/// "mine" answer into its return, which the runtime rewrites so it declines.
+///
+/// For a gated client `surfaces` claims every message alert and hands it back
+/// empty, so the real alert is never built and nothing reaches the OS. The
+/// alert planner walks its providers; for a message only `surfaces` answers,
+/// and its predicate maps an experiment-derived alert kind to 1 or 2 ("mine",
+/// which the planner turns into an empty alert) instead of 0 ("not mine"), which
+/// would let the planner's fallback build the real alert through `libdiscord`'s
+/// notification path. The map is `mov al, [kind]; cmp al, 1; mov cl, 2;
+/// sbb cl, 0; cmp al, 2; movzx eax, cl; cmove eax, esi` with `esi = 0`; the
+/// runtime overwrites the `movzx eax, cl` with `xor eax, eax` so the predicate
+/// always answers 0 and the real builder runs, as it does on the official app.
+pub fn notification_gate(image: &Image<'_>) -> Found<usize> {
+   let map = Pattern::new("3C 01 B1 02 80 D9 00 3C 02 0F B6 C1 0F 44 C6");
+   let at = one("notification gate", &image.scan(map))?;
+   Ok(at + 9)
+}
+
 /// Phoenix's `getEmojiUnavailableReason`, `u8 f(&Emoji, &EmojiContext)`,
 /// where 0xFF is usable and 2 premium locked.
 #[derive(Clone, Copy, Debug)]

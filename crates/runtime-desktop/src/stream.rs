@@ -22,9 +22,6 @@ type CheckFn = unsafe extern "C" fn(*const u8, u8, u8, u8, u32, u32) -> u8;
 
 static UNLOCKED: AtomicBool = AtomicBool::new(false);
 static CHECK: OnceLock<CheckFn> = OnceLock::new();
-/// Dummy user buffer with all flag bytes set to 1 so the leaf check sees both
-/// Nitro Basic and Nitro Full as active without depending on struct offsets.
-static NITRO_USER: [u8; 0x100] = [1; 0x100];
 
 /// Hooks the check from [`crate::prepare`], before Discord's threads run.
 pub fn install(image: &Image<'static>) {
@@ -76,13 +73,14 @@ extern "C" fn can_stream(
    resolution: u32,
    fps: u32,
 ) -> u8 {
+   if UNLOCKED.load(Ordering::Acquire) {
+      // The check decides from the account's own Nitro tier, and the picker
+      // hands it the real user: a copy with every byte set to 1 reads as Nitro
+      // Basic, which still refuses Source and 1080p at 60. Answering true
+      // directly keeps the goods of the table without guessing struct offsets.
+      return 1;
+   }
    let &original = CHECK.wait();
-   let target = if UNLOCKED.load(Ordering::Acquire) {
-      NITRO_USER.as_ptr()
-   } else {
-      user
-   };
-   // SAFETY: the trampoline runs the original leaf check, which only reads two
-   // Nitro flag bytes from `target`.
-   unsafe { original(target, has_guild, guild_tier, preset, resolution, fps) }
+   // SAFETY: the trampoline runs the original leaf check.
+   unsafe { original(user, has_guild, guild_tier, preset, resolution, fps) }
 }

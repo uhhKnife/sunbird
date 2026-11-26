@@ -932,7 +932,7 @@ declare namespace Phoenix {
   /// running binary. Events without a payload type here are `Sig<unknown>`, and
   /// any event can be missing from a given build.
   type Gateway = GatewaySendApi & { readonly [E in keyof GatewayPayloads]: Sig<GatewayPayloads[E]> } & {
-    readonly [event: string]: Sig<unknown> | GatewaySendApi["onSend"] | undefined;
+    readonly [event: string]: Sig<unknown> | undefined;
   };
 
   interface Hooks<P> {

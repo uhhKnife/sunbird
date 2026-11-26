@@ -49,8 +49,7 @@ use phoenix_sigs::{
 };
 
 const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
-                     main.jsbundle> \
-                     [check | strings <text> | refs <addr> | dis <addr> [count]]";
+                     main.jsbundle> [check | strings <text> | refs <addr> | dis <addr> [count]]";
 
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
@@ -534,9 +533,24 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                prologues
                   .premium_feature
                   .is_none_or(|prologue| prologue.at(image, found.func))
-                  .then(|| format!("{} stream_high={:#x}", at(found.func), found.stream_high))
+                  .then(|| {
+                     let appearance = found.app_icons.map_or_else(
+                        || "app_icons=off (tier lists changed)".to_owned(),
+                        |id| format!("app_icons={id:#x}"),
+                     );
+                     format!(
+                        "{} stream_high={:#x} {appearance}",
+                        at(found.func),
+                        found.stream_high
+                     )
+                  })
                   .ok_or_else(|| "prologue changed".to_owned())
             }),
+         );
+         report(
+            "theme perk",
+            desktop::theme_perk(image)
+               .map(|perk| format!("{} field +{:#x}", at(perk.accessor), perk.field)),
          );
          report(
             "message json",

@@ -127,6 +127,9 @@ pub struct Prologues {
    /// `canUsePremiumFeature`, a leaf: up to the first `jne`. Its System V
    /// entry has not been measured either.
    pub premium_feature: Option<Prologue>,
+   /// The premium perks accessor: three pushes, `sub rsp, 50h`, the frame
+   /// pointer and its unwind marker.
+   pub perks:           Option<Prologue>,
 }
 
 impl Prologues {
@@ -184,6 +187,12 @@ impl Prologues {
                   pattern: Pattern::new("80 FA ?? 0F 95 C0 4D 85 C0 41 0F 94 C2 41 08 C2"),
                   len:     16,
                }),
+               perks:           Some(Prologue {
+                  pattern: Pattern::new(
+                     "55 56 57 48 83 EC ?? 48 8D 6C 24 ?? 48 C7 45 F8 FE FF FF FF",
+                  ),
+                  len:     20,
+               }),
             }
          },
          Abi::SysV => {
@@ -205,6 +214,7 @@ impl Prologues {
                sticker_check:   None,
                stream_quality:  None,
                premium_feature: None,
+               perks:           None,
             }
          },
       }
@@ -958,6 +968,37 @@ pub struct PremiumFeature {
    /// `STREAM_HIGH_QUALITY`: the HD preset, its upsell and the picker's Nitro
    /// banner all ask for it.
    pub stream_high: u8,
+   /// The feature User Settings, Appearance, App Icon asks for, when the tier
+   /// lists are the ones it was measured on.
+   pub app_icons:   Option<u8>,
+}
+
+/// Nitro Basic's and Classic's feature lists on the build where unlocking one
+/// feature at a time showed app icons as 0x17. No code passes the id as a
+/// constant, so it is trusted only while the lists around it stay the same: a
+/// new or renumbered feature changes them.
+const BASIC_FEATURES: [u8; 11] = [
+   0x00, 0x01, 0x05, 0x06, 0x08, 0x0B, 0x0D, 0x0F, 0x15, 0x16, 0x17,
+];
+const CLASSIC_FEATURES: [u8; 8] = [0x00, 0x01, 0x02, 0x08, 0x12, 0x15, 0x16, 0x17];
+const MEASURED_APP_ICONS: u8 = 0x17;
+
+/// The tier lists the check loads, each as `mov edx, len; lea r8, [list]`.
+fn tier_lists(image: &Image<'_>, func: usize) -> Vec<Vec<u8>> {
+   const BODY: usize = 0x120;
+   let load = Pattern::new("BA ?? 00 00 00 4C 8D 05 ?? ?? ?? ??");
+   let Some(body) = image.read(func, BODY) else {
+      return Vec::new();
+   };
+   load
+      .find_in(body)
+      .into_iter()
+      .filter_map(|at| {
+         let len = usize::from(body[at + 1]);
+         let list = rel32_target(image, func + at + 8)?;
+         Some(image.read(list, len)?.to_vec())
+      })
+      .collect()
 }
 
 /// The premium feature check and its stream feature.
@@ -1013,7 +1054,60 @@ pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
    let stream_high = *features
       .first()
       .ok_or("the HD stream banner opens with no feature gate")?;
-   Ok(PremiumFeature { func, stream_high })
+
+   let lists = tier_lists(image, func);
+   let measured = lists.len() == 3
+      && lists.contains(&every)
+      && lists.iter().any(|list| list.as_slice() == BASIC_FEATURES)
+      && lists.iter().any(|list| list.as_slice() == CLASSIC_FEATURES);
+   Ok(PremiumFeature {
+      func,
+      stream_high,
+      app_icons: measured.then_some(MEASURED_APP_ICONS),
+   })
+}
+
+/// The accessor that copies the account's premium perks out of Phoenix's
+/// store, `fn(out: &mut Perks, store) -> &mut Perks`, and the perks byte that
+/// unlocks Nitro color themes.
+#[derive(Clone, Copy, Debug)]
+pub struct ThemePerk {
+   pub accessor: usize,
+   pub field:    u8,
+}
+
+/// The premium perks accessor and the byte Appearance, Theme reads from it.
+///
+/// The section opens with `call accessor; mov r14b, [rbx + field]`, and picks
+/// between "Unlock more themes with Nitro" and the Nitro page on that byte.
+/// The perks hold the tier's upload limit and its booleans, built from the
+/// tier, not from `canUsePremiumFeature`.
+pub fn theme_perk(image: &Image<'_>) -> Found<ThemePerk> {
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the theme perk is only decoded on Win64".to_owned());
+   }
+   let sections: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Unlock more themes with"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let load = Pattern::new("E8 ?? ?? ?? ?? 44 8A 73 ??");
+   let found: Vec<(usize, u8)> = sections
+      .into_iter()
+      .filter_map(|section| {
+         let head = image.read(section, 0xC0)?;
+         let at = *load.find_in(head).first()?;
+         let accessor = rel32_target(image, section + at + 1)?;
+         Some((accessor, head[at + 8]))
+      })
+      .collect();
+   let (accessor, field) = one("theme perk load", &found)?;
+   let prologue = prologues(image).perks.ok_or("no perks accessor prologue")?;
+   if !prologue.at(image, accessor) {
+      return Err(format!("perks accessor at {accessor:#x} opens differently"));
+   }
+   Ok(ThemePerk { accessor, field })
 }
 
 /// Settings page 24's sidebar name, `Phoenix`, and its id,

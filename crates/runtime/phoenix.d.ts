@@ -1021,6 +1021,7 @@ declare namespace Phoenix {
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
     readonly messages: Messages;
     readonly stream: Stream;
+    readonly appearance: Appearance;
     readonly ui: Ui;
     readonly commands: Commands;
     readonly log: Log;
@@ -1182,6 +1183,14 @@ declare namespace Phoenix {
     /// tiers (1080p, 1440p, Source, 60 FPS) on Desktop Phoenix while the handle is active.
     /// No-op on mobile.
     unlockQuality(): Remover;
+  }
+
+  interface Appearance {
+    /// Unlocks Nitro color themes and app icons in User Settings, Appearance on Desktop Phoenix
+    /// while the handle is active. They apply on this client only. App icons stay locked when
+    /// Discord's premium feature lists differ from the ones their id was measured on. No-op on
+    /// mobile.
+    unlockNitro(): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.

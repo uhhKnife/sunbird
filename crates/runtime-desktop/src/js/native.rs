@@ -305,6 +305,10 @@ pub fn object<'js>(ctx: &Ctx<'js>) -> rquickjs::Result<Object<'js>> {
       "hooks",
       Function::new(ctx.clone(), |ctx: Ctx<'js>| json(&ctx, &observe::list()))?,
    )?;
+   native.set(
+      "premium",
+      Function::new(ctx.clone(), |mask: u32| crate::stream::force_console(mask))?,
+   )?;
    Ok(native)
 }
 

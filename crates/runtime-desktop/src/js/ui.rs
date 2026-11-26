@@ -69,6 +69,7 @@ use crate::{
       PageModalSpec,
       Prompt,
    },
+   sticker,
 };
 
 #[derive(Clone)]
@@ -1193,6 +1194,11 @@ pub fn desktop_patch_api<'js>(
          move |ctx: Ctx<'js>, _function: Opt<Value<'js>>| on_emoji_pick(&ctx, &name),
       )?,
    )?;
+   let name = plugin.to_owned();
+   messages.set(
+      "unlockStickers",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| unlock_stickers(&ctx, &name))?,
+   )?;
    let commands = Object::new(ctx.clone())?;
    commands.set(
       "register",
@@ -1501,6 +1507,29 @@ fn on_emoji_pick<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function
          let mut pickers = registry.emoji_pickers.borrow_mut();
          pickers.retain(|(existing, _)| *existing != id);
          emoji::unlock(!pickers.is_empty());
+      }
+   })
+}
+
+/// Holds the sticker unlock until the returned remover runs.
+fn unlock_stickers<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+   let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+   let registry = ctx
+      .userdata::<Desktop<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?;
+   registry
+      .sticker_unlocks
+      .borrow_mut()
+      .push((id, plugin.to_owned()));
+   sticker::unlock(true);
+   drop(registry);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      if let Some(registry) = ctx.userdata::<Desktop<'js>>() {
+         let mut unlocks = registry.sticker_unlocks.borrow_mut();
+         unlocks.retain(|(existing, _)| *existing != id);
+         sticker::unlock(!unlocks.is_empty());
       }
    })
 }

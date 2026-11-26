@@ -87,6 +87,8 @@ pub struct Prologues {
    pub ready_parse: Option<Prologue>,
    /// [`ready_text`], Win64 only.
    pub ready_text:  Option<Prologue>,
+   /// [`sticker_check`], Win64 only: 8 pushes and `sub rsp, imm32`.
+   pub sticker_check: Option<Prologue>,
 }
 
 impl Prologues {
@@ -130,6 +132,12 @@ impl Prologues {
                   pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
                   len:     15,
                }),
+               sticker_check: Some(Prologue {
+                  pattern: Pattern::new(
+                     "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ?? ?? ?? ??",
+                  ),
+                  len:     19,
+               }),
             }
          },
          Abi::SysV => {
@@ -148,6 +156,7 @@ impl Prologues {
                },
                ready_parse: None,
                ready_text:  None,
+               sticker_check: None,
             }
          },
       }
@@ -2620,6 +2629,29 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usiz
       }
    }
    one("optimistic delete", &found)
+}
+
+/// Phoenix's `getStickerSendability`, `u8 f(&StickerContext, &Sticker)`: 0
+/// sendable, 1 with Nitro, 2 not at all and 3 with a boosted server.
+///
+/// It opens `mov al, 2; cmp dword ptr [ctx], 1; jne; mov rax, [ctx + 8];
+/// mov [rsp + ..], rax; movzx r8d, byte ptr [sticker + kind]; mov al, 2;
+/// cmp r8d, 1`, after its prologue saves three `xmm` registers.
+pub fn sticker_check(image: &Image<'_>) -> Found<usize> {
+   const BODY: Pattern = Pattern::new(
+      "B0 02 83 39 01 0F 85 ?? ?? ?? ?? 48 8B 41 08 48 89 44 24 ?? 44 0F B6 82 ?? ?? ?? ?? B0 02 41 83 F8 01",
+   );
+   let prologue = prologues(image)
+      .sticker_check
+      .ok_or("the sticker check is only known on Win64")?;
+   let mut found = image
+      .scan(BODY)
+      .into_iter()
+      .filter_map(|at| Some(image.function_bounds(at)?.0))
+      .filter(|&func| prologue.at(image, func))
+      .collect::<Vec<_>>();
+   found.dedup();
+   one("sticker check", &found)
 }
 
 /// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first

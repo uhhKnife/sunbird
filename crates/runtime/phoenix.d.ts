@@ -1135,6 +1135,11 @@ declare namespace Phoenix {
     /// Reactions and the rest keep the lock, and nothing else about Nitro changes. Desktop has no
     /// picker presses to report: the handler is never called there, only the unlock applies.
     onEmojiPick(handler: (emojiId: string, ctx: UiContext) => string | void): Remover;
+    /// Until the remover runs, Phoenix counts stickers that need Nitro as sendable, so its picker
+    /// sends them as `sticker_ids`, which Discord refuses for an account without Nitro: rewrite
+    /// those sends with `phoenix.discord.onRequest`. Stickers Phoenix would not send at all stay
+    /// locked. Desktop only for now.
+    unlockStickers?(): Remover;
   }
 
   /// `channelId` is the open channel, `reply` posts a local message there.

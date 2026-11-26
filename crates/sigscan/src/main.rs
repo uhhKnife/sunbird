@@ -302,6 +302,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(at),
          );
          report(
+            "sticker check",
+            desktop::sticker_check(image).map(at),
+         );
+         report(
             "ready text",
             registry
                .as_ref()

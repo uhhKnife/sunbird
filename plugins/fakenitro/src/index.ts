@@ -1,4 +1,4 @@
-// @description Sends custom and animated emojis as links, renders fake emojis, stickers, and GIFs as real ones, and unlocks client themes
+// @description Sends custom and animated emojis and stickers as links, renders fake emojis, stickers, and GIFs as real ones, and unlocks client themes
 // @version 0.5.0
 // @author mantikafasi
 
@@ -59,6 +59,13 @@ const settings = phoenix.settings.define({
     description: "Send external and animated emojis as links even when you have Nitro (useful when external emojis are blocked)",
     default: false,
   },
+  sendStickers: {
+    type: "switch",
+    title: "Send stickers as links",
+    description: "Lets you pick stickers that need Nitro and sends them as links. Desktop only for now",
+    default: true,
+    onChange: () => applyStickers(),
+  },
   unlockThemes: {
     type: "switch",
     title: "Unlock client themes",
@@ -81,6 +88,9 @@ interface CachedSticker {
   id: string;
   name: string;
   format_type: number;
+  available: boolean;
+  /// The sticker's server, unset for Discord's own stickers.
+  guild?: string;
 }
 
 const emojis = new Map<string, Emoji>();
@@ -107,10 +117,16 @@ const addEmojis = (guild: string, list: Phoenix.Emoji[] | undefined) => {
   }
 };
 
-const addStickers = (list: Phoenix.Sticker[] | undefined) => {
+const addStickers = (list: Phoenix.Sticker[] | undefined, guild?: string) => {
   for (const s of list ?? []) {
     if (!s.id || !s.name) continue;
-    stickers.set(s.id, { id: s.id, name: s.name, format_type: s.format_type });
+    stickers.set(s.id, {
+      id: s.id,
+      name: s.name,
+      format_type: s.format_type,
+      available: s.available !== false,
+      guild: s.guild_id ?? guild,
+    });
   }
 };
 
@@ -134,7 +150,7 @@ const load = async () => {
   loadedGuilds = guilds.length;
   for (const { g, e, s } of guilds) {
     if (e) addEmojis(unpad(g), JSON.parse(e));
-    if (s) addStickers(JSON.parse(s));
+    if (s) addStickers(JSON.parse(s), unpad(g));
   }
   // `guild:channel` keys: Android keeps them in `channel_stubs`, Desktop in
   // `channels`. One row per guild keeps this under the 10000-row limit.
@@ -164,7 +180,7 @@ reload();
 if (gateway.guildCreate) {
   phoenix.on(gateway.guildCreate, (guild) => {
     addEmojis(guild.id, guild.emojis);
-    addStickers((guild as Phoenix.GatewayGuild & { stickers?: Phoenix.Sticker[] }).stickers);
+    addStickers((guild as Phoenix.GatewayGuild & { stickers?: Phoenix.Sticker[] }).stickers, guild.id);
     for (const channel of guild.channels ?? []) channelGuild.set(channel.id, guild.id);
   });
 }
@@ -173,8 +189,8 @@ if (gateway.guildEmojisUpdate) {
 }
 if (gateway.guildStickersUpdate) {
   phoenix.on(gateway.guildStickersUpdate, (update) => {
-    const payload = update as { stickers?: Phoenix.Sticker[] };
-    addStickers(payload.stickers);
+    const payload = update as { guild_id?: string; stickers?: Phoenix.Sticker[] };
+    addStickers(payload.stickers, payload.guild_id);
   });
 }
 
@@ -521,6 +537,55 @@ phoenix.messages.onSend((text, ctx) => {
   if (!text.includes(":")) return;
   const result = rewrite(text, guildOf(ctx));
   return result === text ? undefined : result;
+});
+
+// --- Stickers ---
+
+// Sticker format types: 1 PNG, 2 APNG, 3 Lottie, 4 GIF. Lottie has no image to link.
+const LOTTIE = 3;
+const GIF = 4;
+const STICKER_SIZE = 160;
+
+// Discord's own stickers and a server's stickers inside it need no Nitro.
+const stickerUsable = (sticker: CachedSticker, guild: string | undefined) =>
+  (!settings.forceFake && (premiumType ?? TIER_2) >= TIER_2) || !sticker.guild || sticker.guild === guild;
+
+const stickerLink = (sticker: CachedSticker) => {
+  const ext = sticker.format_type === GIF ? "gif" : "png";
+  const url = `https://media.discordapp.net/stickers/${sticker.id}.${ext}?size=${STICKER_SIZE}&name=${encodeURIComponent(sticker.name)}`;
+  if (!settings.useHyperLinks) return url;
+  return `[${settings.hyperLinkText.replaceAll("{{NAME}}", sticker.name)}](${url})`;
+};
+
+let releaseStickers: Phoenix.Remover | undefined;
+const applyStickers = () => {
+  if (settings.sendStickers && !releaseStickers) {
+    releaseStickers = phoenix.messages.unlockStickers?.();
+  } else if (!settings.sendStickers && releaseStickers) {
+    releaseStickers();
+    releaseStickers = undefined;
+  }
+};
+applyStickers();
+
+// The unlocked picker sends stickers as `sticker_ids`, which Discord refuses
+// without Nitro, so those go out as links in the text instead.
+phoenix.discord.onRequest({ method: "POST", pathPrefix: "/channels/", pathSuffix: "/messages" }, (req) => {
+  if (!settings.sendStickers) return;
+  const body = req.json<{ content?: string; sticker_ids?: string[] }>();
+  if (!body?.sticker_ids?.length) return;
+  const guild = channelGuild.get(/^\/channels\/(\d+)\//.exec(req.path)?.[1] ?? "");
+  const kept: string[] = [];
+  const links: string[] = [];
+  for (const id of body.sticker_ids) {
+    const sticker = stickers.get(id);
+    if (!sticker || !sticker.available || sticker.format_type === LOTTIE || stickerUsable(sticker, guild)) kept.push(id);
+    else links.push(stickerLink(sticker));
+  }
+  if (!links.length) return;
+  const content = [body.content?.trim(), ...links].filter(Boolean).join(" ");
+  const { sticker_ids: _, ...rest } = body;
+  return { body: kept.length ? { ...rest, content, sticker_ids: kept } : { ...rest, content } };
 });
 
 // --- Incoming rendering: turn fake Nitro emojis, stickers, and GIFs into real ones ---

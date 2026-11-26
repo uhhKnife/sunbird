@@ -415,6 +415,16 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
          let json = desktop::message_json(image);
          report(
+            "stream quality",
+            desktop::stream_quality(image).and_then(|func| {
+               prologues
+                  .stream_quality
+                  .is_none_or(|prologue| prologue.at(image, func))
+                  .then(|| at(func))
+                  .ok_or_else(|| "prologue changed".to_owned())
+            }),
+         );
+         report(
             "message json",
             json
                .as_ref()

@@ -104,22 +104,26 @@ impl Prologue {
 #[derive(Clone, Copy)]
 pub struct Prologues {
    /// `MessageRow::render`, `build_message_body` and `MessageContextMenu`.
-   pub row:         Prologue,
+   pub row:            Prologue,
    /// `host::section`, `Workspace::render_overlays`, `Store::delete_message`
    /// and `ReqwestTransport::send`.
-   pub frame:       Prologue,
-   pub media_fetch: Prologue,
+   pub frame:          Prologue,
+   pub media_fetch:    Prologue,
    /// The asset loader, [`asset_load`].
-   pub asset_load:  Prologue,
+   pub asset_load:     Prologue,
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
-   pub emoji_check: Prologue,
+   pub emoji_check:    Prologue,
    /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
-   pub ready_parse: Option<Prologue>,
+   pub ready_parse:    Option<Prologue>,
    /// [`ready_text`], Win64 only.
-   pub ready_text:  Option<Prologue>,
+   pub ready_text:     Option<Prologue>,
    /// [`sticker_check`], Win64 only: 8 pushes and `sub rsp, imm32`.
-   pub sticker_check: Option<Prologue>,
+   pub sticker_check:  Option<Prologue>,
+   /// `meetsApplicationStreamRequirements`, a leaf checking stream resolution
+   /// and FPS against Nitro and boost tiers. Its System V entry has not been
+   /// measured, and the hook stays off where there is no prologue.
+   pub stream_quality: Option<Prologue>,
 }
 
 impl Prologues {
@@ -134,60 +138,65 @@ impl Prologues {
       match abi {
          Abi::Win64 => {
             Self {
-               row:         Prologue {
+               row:            Prologue {
                   pattern: ROW_PROLOGUE,
                   len:     ROW_PROLOGUE_LEN,
                },
-               frame:       Prologue {
+               frame:          Prologue {
                   pattern: FRAME_PROLOGUE,
                   len:     FRAME_PROLOGUE_LEN,
                },
-               media_fetch: Prologue {
+               media_fetch:    Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               asset_load:  Prologue {
+               asset_load:     Prologue {
                   pattern: MEDIA_FETCH_PROLOGUE,
                   len:     MEDIA_FETCH_PROLOGUE_LEN,
                },
-               emoji_check: Prologue {
+               emoji_check:    Prologue {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
                },
                // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
-               ready_parse: Some(Prologue {
+               ready_parse:    Some(Prologue {
                   pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
                   len:     17,
                }),
-               ready_text:  Some(Prologue {
+               ready_text:     Some(Prologue {
                   pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
                   len:     15,
                }),
-               sticker_check: Some(Prologue {
+               sticker_check:  Some(Prologue {
                   pattern: Pattern::new(
                      "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ?? ?? ?? ??",
                   ),
                   len:     19,
                }),
+               stream_quality: Some(Prologue {
+                  pattern: Pattern::new("56 57 55 53 44 8B 54 24 ?? 44 8B 5C 24 ??"),
+                  len:     14,
+               }),
             }
          },
          Abi::SysV => {
             Self {
-               row:         SYSV_FRAME,
-               frame:       SYSV_FRAME,
-               media_fetch: SYSV_FRAME,
+               row:            SYSV_FRAME,
+               frame:          SYSV_FRAME,
+               media_fetch:    SYSV_FRAME,
                // Four pushes and `sub rsp, imm32`.
-               asset_load:  Prologue {
+               asset_load:     Prologue {
                   pattern: Pattern::new("41 57 41 56 41 54 53 48 81 EC ?? ?? ?? ??"),
                   len:     14,
                },
-               emoji_check: Prologue {
+               emoji_check:    Prologue {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
                },
-               ready_parse: None,
-               ready_text:  None,
-               sticker_check: None,
+               ready_parse:    None,
+               ready_text:     None,
+               sticker_check:  None,
+               stream_quality: None,
             }
          },
       }
@@ -865,6 +874,36 @@ pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
    }
 }
 
+/// Phoenix's Go Live stream quality check:
+/// `bool f(&User, has_guild, guild_tier, preset, resolution, fps)`.
+///
+/// Found from the static 18-entry `ApplicationStreamSettingRequirements` table
+/// (starting with Source at 60, 30, and 15 FPS, each requiring full Nitro). The
+/// check loads the table in each of its Nitro and guild branches.
+pub fn stream_quality(image: &Image<'_>) -> Found<usize> {
+   const TABLE_HEAD: [u8; 48] = [
+      0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00,
+      0x00, 0x00, 0x00,
+   ];
+   let tables = image.find_bytes(&TABLE_HEAD);
+   let mut counts: HashMap<usize, usize> = HashMap::new();
+   for sites in lea_refs_many(image, &tables).into_values() {
+      for site in sites {
+         if let Some((func, _)) = image.function_bounds(site) {
+            *counts.entry(func).or_default() += 1;
+         }
+      }
+   }
+   let candidates: Vec<usize> = counts
+      .into_iter()
+      .filter(|&(_, count)| count >= 2)
+      .map(|(func, _)| func)
+      .collect();
+   one("stream quality check", &candidates)
+}
+
 /// Settings page 24's sidebar name, `Phoenix`, and its id,
 /// `DESKTOP_PHOENIX`, both relabeled in place.
 #[derive(Clone, Copy, Debug)]
@@ -901,7 +940,8 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
 /// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
 /// lowers so page 24 is always shown.
 pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja ...`
+   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
+   // ...`
    let (guard, imm) = match Abi::of(image) {
       Abi::Win64 => {
          (
@@ -2197,7 +2237,8 @@ const NODE_SVG: &[u8] = b"features_ui/partner.svg";
 /// `child_node`'s head: the child handle wrapped as a node child, tag 0.
 const fn child_node_head(abi: Abi) -> [u8; 16] {
    match abi {
-      // `sub rsp,48h; lea rax,[rsp+28h]; and dword ptr [rax],0; mov [rax+8],rdx`
+      // `sub rsp,48h; lea rax,[rsp+28h]; and dword ptr [rax],0; mov
+      // [rax+8],rdx`
       Abi::Win64 => {
          [
             0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x44, 0x24, 0x28, 0x83, 0x20, 0x00, 0x48, 0x89,
@@ -3002,7 +3043,8 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       .ok_or("MessageContextMenu channel_id offset not found")?;
 
    // Find the `Copy Message ID` and `Delete Message` `lea`s inside `build_fn`
-   // directly (scanning only the ~19 KiB function instead of the whole `.text`).
+   // directly (scanning only the ~19 KiB function instead of the whole
+   // `.text`).
    let build_bytes = image
       .read(build_fn, build_end - build_fn)
       .ok_or("MessageContextMenu body is unmapped")?;
@@ -4024,7 +4066,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
             .map(|w| usize::from(w[3]))
       })
    };
-   // `text_get` is the member of C called by the most other members of C (>= 3).
+   // `text_get` is the member of C called by the most other members of C (>=
+   // 3).
    let mut caller_counts: HashMap<usize, usize> = HashMap::new();
    for (func, calls) in &c_calls {
       let mut seen = HashSet::new();
@@ -4102,8 +4145,8 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    }
    let (set_value, sv_calls) = set_value_hits[0];
 
-   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48 FF
-   // 08`).
+   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
+   // FF 08`).
    let arc_drop_slow = sv_calls
       .iter()
       .find_map(|&(site, callee)| {

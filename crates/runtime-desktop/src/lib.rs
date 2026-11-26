@@ -20,6 +20,7 @@ mod members;
 mod message;
 mod modal;
 mod os;
+mod ready;
 mod settings;
 mod staff;
 
@@ -131,6 +132,7 @@ pub fn prepare() -> Result<(), Error> {
    if registry.is_ok() {
       discord::install(&image);
       accessories::install_optimistic_delete(&image);
+      ready::install(&image);
    }
    // The index is tens of MB and nothing reads it after startup.
    phoenix_sigs::desktop::release_call_index();

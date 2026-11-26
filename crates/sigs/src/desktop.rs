@@ -83,6 +83,10 @@ pub struct Prologues {
    /// `getEmojiUnavailableReason`, a leaf: its first four instructions on
    /// Win64, five on System V, up to the `jne`.
    pub emoji_check: Prologue,
+   /// READY's parse, [`ready_parse`]. Only seen on Win64 so far.
+   pub ready_parse: Option<Prologue>,
+   /// [`ready_text`], Win64 only.
+   pub ready_text:  Option<Prologue>,
 }
 
 impl Prologues {
@@ -117,6 +121,15 @@ impl Prologues {
                   pattern: Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02"),
                   len:     14,
                },
+               // `push rbp; push rsi; sub rsp, imm32; lea rbp, [rsp + imm32]`.
+               ready_parse: Some(Prologue {
+                  pattern: Pattern::new("55 56 48 81 EC ?? ?? ?? ?? 48 8D AC 24 ?? ?? ?? ??"),
+                  len:     17,
+               }),
+               ready_text:  Some(Prologue {
+                  pattern: Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7"),
+                  len:     15,
+               }),
             }
          },
          Abi::SysV => {
@@ -133,6 +146,8 @@ impl Prologues {
                   pattern: Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E"),
                   len:     14,
                },
+               ready_parse: None,
+               ready_text:  None,
             }
          },
       }
@@ -2605,6 +2620,123 @@ pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usiz
       }
    }
    one("optimistic delete", &found)
+}
+
+/// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first
+/// call of the `READY` handler. Phoenix's session parses READY with it too,
+/// past the registry, so a hook here sees every READY.
+pub fn ready_parse(image: &Image<'_>, ready: usize) -> Found<usize> {
+   let prologue = prologues(image)
+      .ready_parse
+      .ok_or("READY's parse is only known on Win64")?;
+   let &(_, parse) = calls_in(image, ready, 0x80)
+      .first()
+      .ok_or_else(|| format!("READY handler at {ready:#x} makes no call"))?;
+   if prologue.at(image, parse) {
+      Ok(parse)
+   } else {
+      Err(format!(
+         "READY's first call at {parse:#x} opens unlike its parse"
+      ))
+   }
+}
+
+/// The session's READY parse for text under 2 MB, `fn(out, ptr, len) -> out`:
+/// the caller of [`ready_parse`] that builds its reader from the text it takes.
+///
+/// ```text
+/// push r14; push rsi; push rdi; push rbx; sub rsp, imm32; mov rdi, r8
+/// ...
+/// mov [rsp + 0x20], rdx; mov [rsp + 0x28], r8
+/// ```
+pub fn ready_text(image: &Image<'_>, parse: usize) -> Found<usize> {
+   const PROLOGUE: Pattern = Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7");
+   const READER: Pattern = Pattern::new("48 89 54 24 20 4C 89 44 24 28");
+   let mut callers = call_sites(image, |callee| callee == parse)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .filter(|&func| {
+         image.read(func, 0x40).is_some_and(|head| {
+            PROLOGUE.find_in(head).first() == Some(&0) && !READER.find_in(head).is_empty()
+         })
+      })
+      .collect::<Vec<_>>();
+   callers.sort_unstable();
+   callers.dedup();
+   one("READY text parse", &callers)
+}
+
+/// Phoenix's session READY handler, `fn(out, payload)`, which owns the gateway
+/// payload and parses READY itself, past the registry.
+#[derive(Clone, Copy, Debug)]
+pub struct ReadySession {
+   pub func:     usize,
+   /// The payload's kind byte, and the kind whose READY is parsed from the raw
+   /// text. Other kinds carry the gateway's own parse of it.
+   pub kind:     usize,
+   pub raw_kind: u8,
+   /// The raw text's pointer and length.
+   pub raw:      usize,
+   pub raw_len:  usize,
+}
+
+/// The caller of [`ready_parse`] that opens by checking the payload's kind:
+///
+/// ```text
+/// cmp byte ptr [rdx + kind], raw_kind ; 80 BA <kind> <raw_kind>
+/// jne value                           ; 0F 85 <rel32>
+/// mov rdi, [rdx + raw]                ; 48 8B BA <raw>
+/// mov rbx, [rdx + raw_len]            ; 48 8B 9A <raw_len>
+/// ```
+pub fn ready_session(image: &Image<'_>, parse: usize) -> Found<ReadySession> {
+   const CHECK: Pattern = Pattern::new(
+      "80 BA ?? ?? ?? ?? ?? 0F 85 ?? ?? ?? ?? 48 8B BA ?? ?? ?? ?? 48 8B 9A ?? ?? ?? ??",
+   );
+   let disp = |bytes: &[u8], at: usize| {
+      bytes
+         .get(at..at + 4)
+         .and_then(|word| Some(u32::from_le_bytes(word.try_into().ok()?) as usize))
+   };
+   let mut callers = call_sites(image, |callee| callee == parse)
+      .into_iter()
+      .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
+      .collect::<Vec<_>>();
+   callers.sort_unstable();
+   callers.dedup();
+   let mut found = Vec::new();
+   for func in callers {
+      if !prologues(image).row.at(image, func) {
+         continue;
+      }
+      let Some(head) = image.read(func, 0x100) else {
+         continue;
+      };
+      let Some(&at) = CHECK.find_in(head).first() else {
+         continue;
+      };
+      let check = &head[at..];
+      if let (Some(kind), Some(raw), Some(raw_len)) =
+         (disp(check, 2), disp(check, 16), disp(check, 23))
+      {
+         found.push(ReadySession {
+            func,
+            kind,
+            raw_kind: check[6],
+            raw,
+            raw_len,
+         });
+      }
+   }
+   match found.as_slice() {
+      [session] if session.raw_len == session.raw + 8 => Ok(*session),
+      [session] => {
+         Err(format!(
+            "READY session at {:#x} reads no &str",
+            session.func
+         ))
+      },
+      _ => Err(format!("{} READY sessions", found.len())),
+   }
 }
 
 /// `flag_override` in `StoreState`, from the inlined

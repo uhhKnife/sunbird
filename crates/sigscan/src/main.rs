@@ -302,6 +302,38 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                .map(at),
          );
          report(
+            "ready text",
+            registry
+               .as_ref()
+               .map_err(|_| "needs the registry".to_owned())
+               .and_then(|registry| {
+                  let id = registry.id("READY").ok_or("no READY")?;
+                  desktop::ready_parse(image, registry.entry(id).handler)
+                     .and_then(|parse| desktop::ready_text(image, parse))
+               })
+               .map(at),
+         );
+         report(
+            "ready session",
+            registry
+               .as_ref()
+               .map_err(|_| "needs the registry".to_owned())
+               .and_then(|registry| {
+                  let id = registry.id("READY").ok_or("no READY")?;
+                  desktop::ready_parse(image, registry.entry(id).handler)
+                     .and_then(|parse| desktop::ready_session(image, parse))
+               })
+               .map(|session| {
+                  format!(
+                     "{} (kind +{:#x} = {}, raw +{:#x})",
+                     at(session.func),
+                     session.kind,
+                     session.raw_kind,
+                     session.raw
+                  )
+               }),
+         );
+         report(
             "message context menu",
             desktop::message_context_menu(image).map(|menu| {
                format!(

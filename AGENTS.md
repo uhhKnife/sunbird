@@ -197,7 +197,9 @@ byte pattern says nothing about arm32.
   OkHttp executor and the guest sets every header, `authorization` included.
 - `READY` never passes through the gateway registry on 356207. Patches that rewrite READY do not
   apply. `LIBDISCORD_REDUCERS_TABLE` is an exported second registry with 86 more events and no
-  overlap.
+  overlap. Desktop's session parses READY itself too, from the text under 2 MB and from its own
+  payload above, and `runtime-desktop/src/ready.rs` hooks both. READY carries
+  `user_settings_proto` only when the cached settings' version differs from Discord's.
 - Motion. The host has 65536 animation slots. Ids at or above that are dropped silently. Phoenix
   allocates upward from 0, so ours come down from 65535. A reused slot keeps a dead view's spring
   until something re-springs it. Channel numbers are the cases of `mh/e0.d`. The `animate` prop

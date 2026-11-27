@@ -191,6 +191,36 @@ pub const DEVTOOLS_SHORTCUT: &str = if cfg!(target_os = "macos") {
    "Ctrl+Shift+I"
 };
 
+/// A letter or digit pressed with Control or Alt while Discord's main window
+/// is focused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Shortcut {
+   /// `A`-`Z` or `0`-`9`.
+   pub key:   u8,
+   pub ctrl:  bool,
+   pub shift: bool,
+   pub alt:   bool,
+}
+
+/// Whether this OS reports [`Shortcut`]s.
+pub const SHORTCUTS: bool = cfg!(windows);
+
+static SHORTCUT_HANDLER: OnceLock<fn(Shortcut) -> bool> = OnceLock::new();
+
+/// Sends [`Shortcut`]s to `handler`, which returns whether it took the key so
+/// Discord never sees it. It runs on Discord's UI thread, so it must not wait.
+/// Only the first handler set counts.
+pub fn set_shortcut_handler(handler: fn(Shortcut) -> bool) {
+   let _ = SHORTCUT_HANDLER.set(handler);
+}
+
+#[cfg(windows)]
+fn take_shortcut(shortcut: Shortcut) -> bool {
+   SHORTCUT_HANDLER
+      .get()
+      .is_some_and(|handler| handler(shortcut))
+}
+
 /// Opens the Sunbird `DevTools` / Runtime Console in the default browser
 /// ([`DEVTOOLS_SHORTCUT`] while Discord Phoenix is focused).
 pub fn open_devtools() {

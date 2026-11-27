@@ -214,6 +214,20 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   )
                }),
             );
+            report(
+               "va scaler lookup",
+               desktop::va_scaler_lookup(image).map(|skip| at(skip.at)),
+            );
+            report(
+               "linux primary display",
+               desktop::linux_primary_display(image).map(|found| {
+                  format!(
+                     "{} (displays {})",
+                     at(found.primary_display),
+                     at(found.displays)
+                  )
+               }),
+            );
          }
          report(
             "staff flag",
@@ -434,6 +448,33 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          );
          report("media fetch", desktop::media_fetch(image).map(at));
          report("composer gift", desktop::composer_gift(image).map(at));
+         if abi == x86::Abi::Win64 {
+            report(
+               "channel toolbar",
+               desktop::channel_toolbar(image).map(|toolbar| {
+                  format!(
+                     "button {}, append {}, sizes {:#x}/{:#x}, click +{:#x}",
+                     at(toolbar.button_site),
+                     at(toolbar.append_site),
+                     toolbar.button_size,
+                     toolbar.toolbar_size,
+                     toolbar.on_click,
+                  )
+               }),
+            );
+            report(
+               "channel sidebar",
+               desktop::channel_sidebar(image).map(|sidebar| {
+                  format!(
+                     "column {}, publish {}, rail {}, handle {}",
+                     at(sidebar.column_site),
+                     at(sidebar.publish_site),
+                     at(sidebar.rail),
+                     at(sidebar.handle_site),
+                  )
+               }),
+            );
+         }
          report(
             "emoji check",
             desktop::emoji_check(image).and_then(|check| {

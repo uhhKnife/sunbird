@@ -264,7 +264,7 @@ static ICON_NAMES: OnceLock<Vec<String>> = OnceLock::new();
 
 /// A plugin's icon as a Mana icon id: `res://ic_mana_angle_brackets` is
 /// `AngleBrackets`. Without an icon, the puzzle piece mobile shows too.
-fn map_icon(icon: Option<&str>) -> Option<u16> {
+pub fn map_icon(icon: Option<&str>) -> Option<u16> {
    let Some(names) = ICON_NAMES.get() else {
       return legacy_icon(icon?);
    };

@@ -3,7 +3,8 @@
 //! Subclasses Discord's main GPUI `HWND` so pressing `Ctrl+Shift+I` while
 //! Discord Phoenix is focused opens the Sunbird `DevTools` / Runtime Console
 //! without registering a global hotkey that would steal `Ctrl+Shift+I` from
-//! browsers or editors.
+//! browsers or editors. Plugin shortcuts (`phoenix.ui.addShortcut`) come
+//! through the same subclass.
 
 use std::{
    ffi::c_void,
@@ -84,12 +85,22 @@ unsafe extern "system" fn discord_subclass_proc(
       match msg {
          WM_KEYDOWN | WM_SYSKEYDOWN => {
             let is_repeat = (lparam & 0x4000_0000) != 0;
-            if wparam == usize::from(b'I') && !is_repeat {
-               let ctrl = GetKeyState(VK_CONTROL) < 0;
-               let shift = GetKeyState(VK_SHIFT) < 0;
-               let alt = GetKeyState(VK_MENU) < 0;
-               if ctrl && shift && !alt {
+            // Virtual key codes for letters and digits are their ASCII.
+            if let Ok(key) = u8::try_from(wparam)
+               && key.is_ascii_alphanumeric()
+               && !is_repeat
+            {
+               let shortcut = crate::Shortcut {
+                  key,
+                  ctrl: GetKeyState(VK_CONTROL) < 0,
+                  shift: GetKeyState(VK_SHIFT) < 0,
+                  alt: GetKeyState(VK_MENU) < 0,
+               };
+               if key == b'I' && shortcut.ctrl && shortcut.shift && !shortcut.alt {
                   crate::open_devtools();
+                  return 0;
+               }
+               if (shortcut.ctrl || shortcut.alt) && crate::take_shortcut(shortcut) {
                   return 0;
                }
             }

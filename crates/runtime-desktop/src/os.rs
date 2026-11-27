@@ -280,10 +280,145 @@ mod linux {
       unsafe { (frame.ping)(&raw const ping) };
    }
 
+   /// Builds clip pipelines without `vapostproc`, whose frames fail on some VA
+   /// drivers and freeze the clip.
+   fn skip_va_scaler(image: &Image<'static>) {
+      let skip = match desktop::va_scaler_lookup(image) {
+         Ok(skip) => skip,
+         Err(err) => {
+            log::warn!("desktop video: {err}, clips keep vapostproc");
+            return;
+         },
+      };
+      // SAFETY: rewrites one branch to its unconditional form, from `prepare`
+      // before Discord's threads run.
+      match unsafe { image.write_code(skip.at, skip.patch) } {
+         Ok(()) => log::info!("desktop video: skipping vapostproc @ {:#x}", skip.at),
+         Err(err) => log::warn!("desktop video: {err}"),
+      }
+   }
+
+   /// `Option<Rc<dyn PlatformDisplay>>`, `ptr` 0 for `None`.
+   #[repr(C)]
+   #[derive(Clone, Copy)]
+   struct DisplayRc {
+      ptr:    usize,
+      vtable: usize,
+   }
+
+   #[repr(C)]
+   struct DisplayVec {
+      cap: usize,
+      ptr: *const DisplayRc,
+      len: usize,
+   }
+
+   type PrimaryDisplayFn = unsafe extern "C" fn(*const u8) -> DisplayRc;
+   type DisplaysFn = unsafe extern "C" fn(*mut DisplayVec, *const u8);
+
+   struct PrimaryDisplay {
+      orig:     PrimaryDisplayFn,
+      displays: DisplaysFn,
+   }
+
+   static PRIMARY_DISPLAY: OnceLock<PrimaryDisplay> = OnceLock::new();
+   static FALLBACK_DISPLAY: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+
+   /// Wayland has no primary display, which leaves the overlay without one on
+   /// `KWin`, so fall back to the first display.
+   unsafe extern "C" fn primary_display_detour(platform: *const u8) -> DisplayRc {
+      let Some(hook) = PRIMARY_DISPLAY.get() else {
+         return DisplayRc {
+            ptr:    0,
+            vtable: 0,
+         };
+      };
+      // SAFETY: same argument.
+      let primary = unsafe { (hook.orig)(platform) };
+      if primary.ptr != 0 {
+         return primary;
+      }
+      let Some((ptr, vtable)) = *FALLBACK_DISPLAY.get_or_init(|| first_display(hook, platform))
+      else {
+         return primary;
+      };
+      // SAFETY: the cache owns one strong count; this hands out another. Main
+      // thread only.
+      unsafe { *(ptr as *mut usize) += 1 };
+      DisplayRc {
+         ptr,
+         vtable,
+      }
+   }
+
+   fn first_display(hook: &PrimaryDisplay, platform: *const u8) -> Option<(usize, usize)> {
+      let mut displays = DisplayVec {
+         cap: 0,
+         ptr: std::ptr::null(),
+         len: 0,
+      };
+      // SAFETY: same platform.
+      unsafe { (hook.displays)(&raw mut displays, platform) };
+      if displays.len == 0
+         || displays.cap < displays.len
+         || displays.ptr.is_null()
+         || !displays.ptr.is_aligned()
+      {
+         log::warn!("desktop overlay: displays() returned no readable Vec");
+         return None;
+      }
+      // SAFETY: `len > 0`. The `Vec` and the rest are leaked, once.
+      let first = unsafe { *displays.ptr };
+      log::info!(
+         "desktop overlay: no primary display, using the first of {}",
+         displays.len
+      );
+      Some((first.ptr, first.vtable))
+   }
+
+   fn install_primary_display(image: &Image<'static>) {
+      let found = match desktop::linux_primary_display(image) {
+         Ok(found) => found,
+         Err(err) => {
+            log::warn!("desktop overlay: {err}");
+            return;
+         },
+      };
+      let prologue = desktop::LINUX_PRIMARY_DISPLAY_PROLOGUE;
+      // SAFETY: from `prepare`, before Discord's threads run.
+      let trampoline = match unsafe {
+         image.hook_entry(
+            found.primary_display,
+            prologue.pattern,
+            prologue.len,
+            primary_display_detour as *const () as usize,
+         )
+      } {
+         Ok(trampoline) => trampoline,
+         Err(err) => {
+            log::warn!("desktop overlay: {err}");
+            return;
+         },
+      };
+      // SAFETY: located by sigs.
+      let _ = PRIMARY_DISPLAY.set(unsafe {
+         PrimaryDisplay {
+            orig:     std::mem::transmute::<usize, PrimaryDisplayFn>(trampoline),
+            displays: std::mem::transmute::<usize, DisplaysFn>(found.displays),
+         }
+      });
+      log::info!(
+         "desktop overlay: hooked primary_display @ {:#x}",
+         found.primary_display
+      );
+   }
+
    pub struct Linux;
 
    impl DesktopOs for Linux {
       fn install(image: &Image<'static>) {
+         skip_va_scaler(image);
+         install_primary_display(image);
          let found = match desktop::wayland_frame(image) {
             Ok(found) => found,
             Err(err) => {

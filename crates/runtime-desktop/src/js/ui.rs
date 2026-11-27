@@ -33,6 +33,7 @@ use phoenix_runtime::{
       Cell,
    },
 };
+use phoenix_ui_desktop::Shortcut;
 use rquickjs::{
    Array,
    CatchResultExt,
@@ -74,8 +75,11 @@ use crate::{
       PageModalSpec,
       Prompt,
    },
+   shortcuts,
+   sidebar,
    sticker,
    stream,
+   toolbar,
 };
 
 #[derive(Clone)]
@@ -1132,6 +1136,202 @@ fn hide<'js>(ctx: &Ctx<'js>, plugin: &str, id: &str) -> rquickjs::Result<Functio
    })
 }
 
+/// `phoenix.ui.collapseChannels`: the channel sidebar stays collapsed while
+/// any plugin holds it.
+fn collapse_channels<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Function<'js>> {
+   static NEXT_COLLAPSE: AtomicU64 = AtomicU64::new(1);
+
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !sidebar::collapse(true) {
+      return noop_handle(ctx);
+   }
+   let hold = NEXT_COLLAPSE.fetch_add(1, Ordering::Relaxed);
+   registry
+      .collapses
+      .borrow_mut()
+      .push((hold, plugin.to_owned()));
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut collapses = registry.collapses.borrow_mut();
+      let before = collapses.len();
+      collapses.retain(|(held, _)| *held != hold);
+      if collapses.len() != before {
+         sidebar::collapse(false);
+      }
+   })
+}
+
+/// `phoenix.ui.addHeaderButton`: a button after the member list toggle in the
+/// channel header toolbar. `update` changes its icon or label.
+fn add_header_button<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_BUTTON: AtomicU64 = AtomicU64::new(1);
+
+   let icon = options.get::<_, Option<String>>("icon")?;
+   let label = options
+      .get::<_, Option<String>>("label")?
+      .unwrap_or_default();
+   let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
+   let on_press = options.get::<_, Function<'js>>("onPress")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   let Some(icon) = context_menu::map_icon(icon.as_deref()).filter(|_| toolbar::ready()) else {
+      return noop_handle(ctx);
+   };
+   let id = NEXT_BUTTON.fetch_add(1, Ordering::Relaxed);
+   registry
+      .header_buttons
+      .borrow_mut()
+      .push((id, plugin.to_owned(), on_press));
+   drop(registry);
+   toolbar::set(id, icon, label, priority);
+
+   let remove = Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      registry
+         .header_buttons
+         .borrow_mut()
+         .retain(|(held, ..)| *held != id);
+      toolbar::remove(id);
+   })?;
+   remove.set(
+      "update",
+      Function::new(
+         ctx.clone(),
+         move |patch: Object<'js>| -> rquickjs::Result<()> {
+            let Some(mut button) = toolbar::get(id) else {
+               return Ok(());
+            };
+            if let Some(icon) = patch.get::<_, Option<String>>("icon")? {
+               button.icon = context_menu::map_icon(Some(&icon)).unwrap_or(button.icon);
+            }
+            if let Some(label) = patch.get::<_, Option<String>>("label")? {
+               button.label = label;
+            }
+            toolbar::set(id, button.icon, button.label, button.priority);
+            Ok(())
+         },
+      )?,
+   )?;
+   Ok(remove)
+}
+
+/// Runs the `onPress` of header button `id`.
+pub fn press_header_button(engine: &Engine, id: u64) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let found = registry
+         .header_buttons
+         .borrow()
+         .iter()
+         .find(|(held, ..)| *held == id)
+         .map(|(_, plugin, press)| (plugin.clone(), press.clone()));
+      drop(registry);
+      let Some((plugin, press)) = found else {
+         return;
+      };
+      let Ok(arg) = build_message_context(&ctx, 0, 0, false) else {
+         return;
+      };
+      if let Err(err) = press.call::<_, Value<'_>>((arg,)).catch(&ctx) {
+         log::error!("[{plugin}] addHeaderButton onPress: {err}");
+      }
+   });
+}
+
+/// `phoenix.ui.addShortcut`: `run` for a letter or digit pressed with Ctrl or
+/// Alt while Discord is focused, which Discord then never sees.
+fn add_shortcut<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   static NEXT_SHORTCUT: AtomicU64 = AtomicU64::new(1);
+
+   let key = options.get::<_, String>("key")?;
+   let flag = |name: &str| -> rquickjs::Result<bool> {
+      Ok(options.get::<_, Option<bool>>(name)?.unwrap_or(false))
+   };
+   let shortcut = Shortcut {
+      key:   match key.as_bytes() {
+         [key] if key.is_ascii_alphanumeric() => key.to_ascii_uppercase(),
+         _ => {
+            return Err(Exception::throw_type(
+               ctx,
+               &format!("shortcut key {key:?} is not one letter or digit"),
+            ));
+         },
+      },
+      ctrl:  flag("ctrl")?,
+      shift: flag("shift")?,
+      alt:   flag("alt")?,
+   };
+   if !shortcut.ctrl && !shortcut.alt {
+      return Err(Exception::throw_type(
+         ctx,
+         "a shortcut needs ctrl or alt, or it would take typed text",
+      ));
+   }
+   let run = options.get::<_, Function<'js>>("run")?;
+   let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+      return noop_handle(ctx);
+   };
+   if !phoenix_ui_desktop::SHORTCUTS {
+      return noop_handle(ctx);
+   }
+   let id = NEXT_SHORTCUT.fetch_add(1, Ordering::Relaxed);
+   registry
+      .shortcuts
+      .borrow_mut()
+      .push((id, plugin.to_owned(), shortcut, run));
+   shortcuts::hold(shortcut);
+   Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+      let Some(registry) = ctx.userdata::<Desktop<'js>>() else {
+         return;
+      };
+      let mut held = registry.shortcuts.borrow_mut();
+      let before = held.len();
+      held.retain(|(existing, ..)| *existing != id);
+      if held.len() != before {
+         shortcuts::release(shortcut);
+      }
+   })
+}
+
+/// Runs the `phoenix.ui.addShortcut` handlers for `shortcut`.
+pub fn run_shortcut(engine: &Engine, shortcut: Shortcut) {
+   engine.with(|ctx| {
+      let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
+         return;
+      };
+      let handlers = registry
+         .shortcuts
+         .borrow()
+         .iter()
+         .filter(|(_, _, key, _)| *key == shortcut)
+         .map(|(_, plugin, _, run)| (plugin.clone(), run.clone()))
+         .collect::<Vec<_>>();
+      drop(registry);
+      for (plugin, run) in handlers {
+         if let Err(err) = run.call::<_, Value<'_>>(()).catch(&ctx) {
+            log::error!("[{plugin}] shortcut: {err}");
+         }
+      }
+   });
+}
+
 /// `phoenix.ui.onEvent`. Desktop sends `rowDoubleTap`, on message rows.
 fn on_event<'js>(
    ctx: &Ctx<'js>,
@@ -1350,6 +1550,22 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
          hide(&ctx, &hide_owner, &id)
       })?,
    )?;
+   if sidebar::ready() {
+      let collapse_owner = plugin.to_owned();
+      ui.set(
+         "collapseChannels",
+         Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+            collapse_channels(&ctx, &collapse_owner)
+         })?,
+      )?;
+   }
+   let shortcut_owner = plugin.to_owned();
+   ui.set(
+      "addShortcut",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_shortcut(&ctx, &shortcut_owner, &options)
+      })?,
+   )?;
    let event_owner = plugin.to_owned();
    ui.set(
       "onEvent",
@@ -1363,8 +1579,14 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
 
    // Graceful no-op shims for remaining mobile UI-op surfaces so cross-platform
    // plugins load without throwing on desktop.
-   for slot_fn in [
+   let header_owner = plugin.to_owned();
+   ui.set(
       "addHeaderButton",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         add_header_button(&ctx, &header_owner, &options)
+      })?,
+   )?;
+   for slot_fn in [
       "addComposerButton",
       "addProfileSection",
       "patchProps",

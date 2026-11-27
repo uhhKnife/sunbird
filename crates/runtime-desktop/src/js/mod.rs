@@ -9,6 +9,7 @@ use std::{
    collections::HashMap,
 };
 
+use phoenix_ui_desktop::Shortcut;
 use rquickjs::{
    Ctx,
    Function,
@@ -32,8 +33,11 @@ use crate::{
       DesktopMember,
    },
    members::Place,
+   shortcuts,
+   sidebar,
    sticker,
    stream,
+   toolbar,
 };
 
 /// What plugins registered with the desktop UI, kept in the runtime's userdata
@@ -57,6 +61,12 @@ pub struct Desktop<'js> {
    pub double_taps:     RefCell<Vec<(u64, String, Function<'js>)>>,
    /// `phoenix.ui.hide` holds by id and plugin.
    pub hides:           RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.collapseChannels` holds by id and plugin.
+   pub collapses:       RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.addHeaderButton` handlers by id and plugin.
+   pub header_buttons:  RefCell<Vec<(u64, String, Function<'js>)>>,
+   /// `phoenix.ui.addShortcut` handlers by id and plugin.
+   pub shortcuts:       RefCell<Vec<(u64, String, Shortcut, Function<'js>)>>,
    /// `phoenix.messages.unlockStickers` holds by id and plugin.
    pub sticker_unlocks: RefCell<Vec<(u64, String)>>,
    /// `phoenix.stream.unlockQuality` handles by id and plugin.
@@ -82,8 +92,8 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, emoji pick handlers and hidden counts `name` registered and
-/// redraws Discord without them.
+/// callbacks, emoji pick handlers, hidden counts, sidebar collapses, header
+/// buttons and shortcuts `name` registered and redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -148,6 +158,36 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let mut stream_unlocks = registry.stream_unlocks.borrow_mut();
    stream_unlocks.retain(|(_, plugin)| plugin != name);
    stream::unlock(!stream_unlocks.is_empty());
+
+   registry.collapses.borrow_mut().retain(|(_, plugin)| {
+      let held = plugin == name;
+      if held {
+         sidebar::collapse(false);
+      }
+      !held
+   });
+
+   registry
+      .header_buttons
+      .borrow_mut()
+      .retain(|(id, plugin, _)| {
+         let held = plugin == name;
+         if held {
+            toolbar::remove(*id);
+         }
+         !held
+      });
+
+   registry
+      .shortcuts
+      .borrow_mut()
+      .retain(|(_, plugin, shortcut, _)| {
+         let held = plugin == name;
+         if held {
+            shortcuts::release(*shortcut);
+         }
+         !held
+      });
 
    #[cfg(target_arch = "x86_64")]
    {

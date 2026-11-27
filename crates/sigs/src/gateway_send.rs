@@ -29,13 +29,18 @@ impl DesktopGatewaySend {
       }
 
       let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-      let lea = crate::one(
-         "gateway adopt anchor load",
-         &crate::desktop::lea_refs(image, anchor),
-      )?;
-      let (open_fn, open_end) = image
-         .function_bounds(lea)
-         .ok_or("gateway connect_adopting has no unwind entry")?;
+      let loads = crate::desktop::lea_refs(image, anchor);
+      if loads.is_empty() {
+         return Err("gateway adopt anchor is never loaded".to_owned());
+      }
+      let mut opens = loads
+         .into_iter()
+         .filter_map(|lea| image.function_bounds(lea))
+         .collect::<Vec<_>>();
+
+      opens.sort_unstable();
+      opens.dedup();
+      let (open_fn, open_end) = crate::one("gateway connect_adopting", &opens)?;
 
       let panic_addrs = image.find_bytes(START_SEND_PANIC);
       if panic_addrs.is_empty() {

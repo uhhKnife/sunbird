@@ -23,6 +23,7 @@ use std::{
       RwLock,
       atomic::{
          AtomicBool,
+         AtomicU64,
          Ordering,
       },
    },
@@ -53,6 +54,8 @@ pub trait Sink: Send + Sync {
 
 static SINKS: RwLock<Vec<Box<dyn Sink>>> = RwLock::new(Vec::new());
 static WATCHING: AtomicBool = AtomicBool::new(false);
+static HAPTICS_DISABLED: AtomicBool = AtomicBool::new(false);
+static HAPTICS_LOCKS: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
 /// The host's `UIManager` parses a batch on the caller's thread, so Rust's
 /// batches and [`apply_ops`] share this lock. It is held while the sinks run,
 /// so a follow-up batch a sink queues lands after the batch that made its
@@ -97,6 +100,35 @@ fn consult(bytes: &[u8], ask: impl Fn(&dyn Sink, &[u8]) -> Action) -> Action {
    replaced.map_or(Action::Pass, Action::Replace)
 }
 
+/// Whether any plugin currently suppresses haptic feedback.
+pub fn haptics_disabled() -> bool {
+   HAPTICS_DISABLED.load(Ordering::Acquire)
+}
+
+/// Suppresses haptic feedback until [`enable_haptics`] or [`forget_haptics`].
+pub fn disable_haptics(plugin: String) -> u64 {
+   static NEXT: AtomicU64 = AtomicU64::new(1);
+   let handle = NEXT.fetch_add(1, Ordering::Relaxed);
+   haptics_locks(|locks| locks.push((handle, plugin)));
+   handle
+}
+
+/// Releases one [`disable_haptics`] handle.
+pub fn enable_haptics(handle: u64) {
+   haptics_locks(|locks| locks.retain(|(id, _)| *id != handle));
+}
+
+/// Releases every [`disable_haptics`] handle owned by `plugin`.
+pub fn forget_haptics(plugin: &str) {
+   haptics_locks(|locks| locks.retain(|(_, owner)| owner != plugin));
+}
+
+fn haptics_locks(change: impl FnOnce(&mut Vec<(u64, String)>)) {
+   let mut locks = HAPTICS_LOCKS.lock().unwrap_or_else(PoisonError::into_inner);
+   change(&mut locks);
+   HAPTICS_DISABLED.store(!locks.is_empty(), Ordering::Release);
+}
+
 /// A guest-to-host call that is not a UI batch. `frame` reads the whole frame,
 /// which only Discord's requests need.
 fn host_call(head: &[u8], frame: impl FnOnce() -> Vec<u8>) -> Action {
@@ -104,6 +136,9 @@ fn host_call(head: &[u8], frame: impl FnOnce() -> Vec<u8>) -> Action {
       && let Some((module, method)) = phoenix_wire::HostCall::target(head)
    {
       phoenix_runtime::remote::record(&crate::debug::Trace::HostCall { module, method });
+   }
+   if haptics_disabled() && crate::host::is_module(head, crate::host::Module::Haptics) {
+      return Action::Drop;
    }
    if discord::wants(head) {
       discord::intercept_call(&frame())

@@ -1,4 +1,5 @@
-//! `sigscan <library.so | Discord.exe> [command]`
+//! `sigscan <library.so | Discord.exe | Discord.app/Contents/MacOS/Discord>
+//! [command]`
 //!
 //! Loads an ELF or PE64 binary the way the OS loader maps it and dumps the
 //! gateway registry the runtime would hook. On x86-64 files it also finds
@@ -28,6 +29,7 @@ use misstep::{
    ResultExt,
 };
 use phoenix_hook::{
+   arm64,
    image::Image,
    pattern::Pattern,
    x86,
@@ -42,7 +44,6 @@ use phoenix_sigs::{
    gateway_send::DesktopGatewaySend,
    http::DesktopHttpTransport,
    ios,
-   macos,
    mobile,
    registry::GatewayRegistry,
 };
@@ -73,7 +74,11 @@ fn main() -> misstep::Result<()> {
          .with_context(|| format!("{text} is not a hex address"))?;
       Ok(if value < base { base + value } else { value })
    };
-   let tools = Tools { image, base };
+   let tools = Tools {
+      image,
+      base,
+      arm64: parsed.machine() == Machine::Aarch64,
+   };
    match args.get(1).map(String::as_str) {
       None => dump(image),
       Some("check") => {
@@ -97,9 +102,19 @@ fn main() -> misstep::Result<()> {
          tools.dis(addr(2)?, count);
          Ok(())
       },
+      Some("flat") if tools.arm64 => {
+         let from = addr(2)?;
+         let to = args.get(3).map_or(Ok(from + 0x400), |_| addr(3))?;
+         tools.flat(from, to);
+         Ok(())
+      },
       Some(_) => Err(misstep::Report::msg(USAGE)),
    }
 }
+
+/// A string only the desktop clients carry, which tells macOS Phoenix from
+/// iOS's `PhoenixFatClient`; both are arm64 Mach-O.
+const MACOS_DESKTOP: &[u8] = b"DESKTOP_ACCESS_GATE_TITLE";
 
 /// Runs every locator for `machine` and prints what each found.
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
@@ -429,6 +444,38 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                   .ok_or_else(|| "prologue changed".to_owned())
             }),
          );
+         let pending = desktop::pending_counts(image);
+         let moved = |func: usize| {
+            desktop::entry_prologue(image, func)
+               .map(|prologue| format!("{} ({} bytes moved)", at(func), prologue.len))
+         };
+         report(
+            "pending counts",
+            pending.as_ref().map_err(Clone::clone).and_then(|found| {
+               Ok(format!(
+                  "badge {}, friend requests {}",
+                  moved(found.badge)?,
+                  moved(found.friend_requests)?
+               ))
+            }),
+         );
+         let friend_requests = pending
+            .as_ref()
+            .map(|found| found.friend_requests)
+            .map_err(|_| "needs the pending counts".to_owned());
+         report(
+            "home count",
+            friend_requests
+               .clone()
+               .and_then(|func| desktop::home_count(image, func))
+               .and_then(moved),
+         );
+         report(
+            "home badge",
+            friend_requests
+               .and_then(|func| desktop::home_badge(image, func))
+               .and_then(moved),
+         );
          let json = desktop::message_json(image);
          report(
             "stream quality",
@@ -488,8 +535,232 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                }),
          );
       },
-      Machine::Aarch64 if macho && image.file_name() == macos::EXECUTABLE => {
-         report("access gate", macos::access_gate(image).map(at));
+      // macOS Phoenix, the desktop client built for arm64.
+      Machine::Aarch64 if macho && !image.find_bytes(MACOS_DESKTOP).is_empty() => {
+         report(
+            "malloc re-exec",
+            image
+               .find_bytes(phoenix_sigs::MACOS_REEXEC.as_bytes())
+               .first()
+               .map(|&found| at(found))
+               .ok_or_else(|| "the loader waits for a re-exec this build never does".to_owned()),
+         );
+         report(
+            "malloc settings",
+            image
+               .find_bytes(phoenix_sigs::MACOS_MALLOC.as_bytes())
+               .first()
+               .map(|&found| at(found))
+               .ok_or_else(|| "the loader can't tell a launch that never re-execs".to_owned()),
+         );
+         let http = phoenix_sigs::macos::http_transport(image);
+         report(
+            "http transport",
+            http.as_ref().map_err(Clone::clone).map(|http| {
+               format!(
+                  "send {} ({} slots), poll {} ({} slots), request {:x?}",
+                  at(http.send_fn),
+                  http.send_slots.len(),
+                  at(http.poll_fn),
+                  http.poll_slots.len(),
+                  http.request
+               )
+            }),
+         );
+         report(
+            "http responses",
+            http.as_ref().map_err(Clone::clone).and_then(|http| {
+               http
+                  .response
+                  .clone()
+                  .map(|layout| format!("{} {layout:x?}", at(http.poll_fn)))
+            }),
+         );
+         report(
+            "gateway send",
+            phoenix_sigs::macos::gateway_send(image).map(|gw| {
+               format!(
+                  "{} ({} slots, ok {:#x})",
+                  at(gw.start_send_fn),
+                  gw.start_send_slots.len(),
+                  gw.ok_tag
+               )
+            }),
+         );
+         report(
+            "composer gift",
+            phoenix_sigs::macos::composer_gift(image).map(|gift| {
+               format!(
+                  "{} (shown {:#010x}, hidden {:#010x})",
+                  at(gift.site),
+                  gift.shown,
+                  gift.hidden
+               )
+            }),
+         );
+         report(
+            "settings label",
+            phoenix_sigs::macos::settings_label_parts(image)
+               .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
+         );
+         report(
+            "settings visibility",
+            phoenix_sigs::macos::settings_visibility(image)
+               .map(|guards| guards.into_iter().map(at).collect::<Vec<_>>().join(", ")),
+         );
+         report(
+            "settings section",
+            phoenix_sigs::macos::settings_section(image)
+               .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
+         );
+         report(
+            "staff flag",
+            phoenix_sigs::macos::staff(image).map(|field| format!("{field:x?}")),
+         );
+         report(
+            "message context menu",
+            phoenix_sigs::macos::message_context_menu(image).map(|menu| format!("{menu:x?}")),
+         );
+         let gpui = phoenix_sigs::macos::gpui(image);
+         report(
+            "gpui builders",
+            gpui.clone().map(|gpui| format!("{gpui:x?}")),
+         );
+         report(
+            "host allocator",
+            gpui
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| phoenix_sigs::macos::host_allocator(image, gpui.alloc_or_oom))
+               .map(|(alloc, dealloc)| format!("alloc {}, dealloc {}", at(alloc), at(dealloc))),
+         );
+         let gpui_layout = gpui
+            .as_ref()
+            .map_err(|_| "needs gpui builders".to_owned())
+            .and_then(|gpui| phoenix_sigs::macos::gpui_layouts(image, gpui));
+         report(
+            "gpui layouts",
+            gpui_layout
+               .as_ref()
+               .map(|layout| format!("{layout:x?}"))
+               .map_err(Clone::clone),
+         );
+         report(
+            "settings layer",
+            phoenix_sigs::macos::settings_layer(image).map(at),
+         );
+         report(
+            "native modal",
+            gpui
+               .as_ref()
+               .map_err(|_| "needs gpui builders".to_owned())
+               .and_then(|gpui| {
+                  let layout = gpui_layout
+                     .as_ref()
+                     .map_err(|_| "needs gpui layouts".to_owned())?;
+                  phoenix_sigs::macos::modal(image, gpui.div_into_any, &layout.div)
+               })
+               .map(|modal| {
+                  format!(
+                     "overlay {}, modal {}, {:x?}",
+                     at(modal.overlay_render),
+                     at(modal.modal_new),
+                     modal.layout
+                  )
+               }),
+         );
+         report(
+            "native text fields",
+            phoenix_sigs::macos::text_fields(image).map(|fields| {
+               format!(
+                  "single {}, multi {}, {:x?}",
+                  at(fields.cx_new_single),
+                  at(fields.cx_new_multiline),
+                  fields.layout
+               )
+            }),
+         );
+         report(
+            "svg builders",
+            phoenix_sigs::macos::svg_builders(image).map(|svg| format!("{svg:x?}")),
+         );
+         report(
+            "asset loader",
+            phoenix_sigs::macos::asset_load(image).map(at),
+         );
+         report(
+            "mouse down",
+            gpui_layout
+               .as_ref()
+               .map_err(|_| "needs gpui layouts".to_owned())
+               .and_then(|layout| phoenix_sigs::macos::mouse_down(image, &layout.div))
+               .map(|dismiss| format!("{dismiss:x?}")),
+         );
+         report(
+            "message header",
+            phoenix_sigs::macos::message_header(image).map(|header| format!("{header:x?}")),
+         );
+         report(
+            "member row",
+            phoenix_sigs::macos::member_row(image).map(|row| format!("{row:x?}")),
+         );
+         report(
+            "dm row",
+            phoenix_sigs::macos::dm_row(image).map(|row| format!("{row:x?}")),
+         );
+         let row = phoenix_sigs::macos::message_row(image);
+         report(
+            "message row",
+            row.as_ref()
+               .map(|row| format!("{row:x?}"))
+               .map_err(Clone::clone),
+         );
+         report(
+            "message body",
+            row.and_then(|row| phoenix_sigs::macos::message_body(image, row.func))
+               .map(|body| format!("{body:x?}")),
+         );
+         report(
+            "media fetch",
+            phoenix_sigs::macos::media_fetch(image).map(at),
+         );
+         report(
+            "optimistic delete",
+            registry
+               .as_ref()
+               .map_err(|_| "needs the registry".to_owned())
+               .and_then(|registry| {
+                  let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
+                  phoenix_sigs::macos::optimistic_delete(image, registry.entry(id).handler)
+               })
+               .map(|funcs| funcs.into_iter().map(at).collect::<Vec<_>>().join(", ")),
+         );
+         report(
+            "message json",
+            phoenix_sigs::macos::message_writer(image).map(|found| format!("{found:x?}")),
+         );
+         report(
+            "access gate",
+            phoenix_sigs::macos::access_gate(image).map(at),
+         );
+         report(
+            "access enforced",
+            phoenix_sigs::macos::access_read(image)
+               .and_then(|read| phoenix_sigs::macos::access_enforced(image, read))
+               .map(at),
+         );
+         report(
+            "pages under frame",
+            phoenix_sigs::macos::pages_under_frame(image).map(at),
+         );
+         report(
+            "emoji check",
+            phoenix_sigs::macos::emoji_check(image).map(|found| format!("{found:x?}")),
+         );
+         report(
+            "relaunch script",
+            phoenix_sigs::macos::relaunch_script(image).map(at),
+         );
       },
       Machine::Aarch64 if macho => {
          report(
@@ -566,7 +837,12 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 
       println!("   {:<40} {:#010x}{note}", entry.name, entry.handler);
    }
-   if let Ok(http) = DesktopHttpTransport::locate(image) {
+   let http = if image.function_starts.is_some() {
+      phoenix_sigs::macos::http_transport(image)
+   } else {
+      DesktopHttpTransport::locate(image)
+   };
+   if let Ok(http) = http {
       let fmt_opt = |addr: Option<usize>| {
          addr.map_or_else(|| "none".to_owned(), |addr| format!("{addr:#010x}"))
       };
@@ -586,9 +862,49 @@ fn dump(image: &Image<'_>) -> misstep::Result<()> {
 struct Tools<'a> {
    image: &'a Image<'a>,
    base:  usize,
+   /// Mach-O files are arm64, everything else sigscan reads as x86-64 here.
+   arm64: bool,
 }
 
 impl Tools<'_> {
+   /// The arm64 function holding `from`, with its outlined stubs inlined,
+   /// from `from` to `to`: calls, immediates and the addresses `adrp`
+   /// pairs load (with the bytes there when they read as text).
+   fn flat(&self, from: usize, to: usize) {
+      use phoenix_hook::arm64::Insn;
+      let Some(func) = self.image.function_containing(from) else {
+         println!("{} is in no function", self.at(from));
+         return;
+      };
+      let mut pages = [None::<usize>; 32];
+      for (pc, insn) in phoenix_sigs::macos::flattened_at(self.image, func) {
+         if let Insn::Adrp { rd, page } = insn {
+            pages[usize::from(rd)] = Some(page);
+         }
+         if !(from..to).contains(&pc) {
+            continue;
+         }
+         let text = match insn {
+            Insn::Bl { target } => format!("call {target:#x}"),
+            Insn::AddImm { rd, rn, imm } => {
+               match pages[usize::from(rn)] {
+                  Some(page) if rn != 31 => {
+                     let addr = page + imm;
+                     let preview = self.image.read(addr, 24).map_or_else(String::new, |bytes| {
+                        String::from_utf8_lossy(bytes).replace(|c: char| c.is_control(), ".")
+                     });
+                     format!("x{rd} = {addr:#x} \"{preview}\"")
+                  },
+                  _ => format!("{insn:x?}"),
+               }
+            },
+            Insn::Adrp { .. } => continue,
+            other => format!("{other:x?}"),
+         };
+         println!("{pc:#x}  {text}");
+      }
+   }
+
    fn at(&self, addr: usize) -> String {
       format!("{addr:#x} (rva {:#x})", addr - self.base)
    }
@@ -597,6 +913,14 @@ impl Tools<'_> {
       let found = self.image.find_bytes(text.as_bytes());
       if found.is_empty() {
          return Err(misstep::Report::msg(format!("{text:?} is not in the file")));
+      }
+      if self.arm64 {
+         for at in found.into_iter().take(16) {
+            println!("{text:?} at {}", self.at(at));
+            // Rust packs string literals together, so a load may start earlier.
+            self.print_arm64_refs(at.saturating_sub(0x40)..at + 1);
+         }
+         return Ok(());
       }
       for at in found.into_iter().take(16) {
          println!("{text:?} at {}", self.at(at));
@@ -629,7 +953,33 @@ impl Tools<'_> {
       Ok(())
    }
 
+   fn print_arm64_refs(&self, targets: std::ops::Range<usize>) {
+      let refs = arm64::code_refs(self.image, std::slice::from_ref(&targets));
+      if refs.is_empty() {
+         println!("   no code loads it");
+      }
+      for (site, target) in refs.into_iter().take(64) {
+         let function = self
+            .image
+            .function_bounds(site)
+            .map(|(start, _)| format!("   in fn {} +{:#x}", self.at(start), site - start));
+         println!(
+            "   {} -> {}{}",
+            self.at(site),
+            self.at(target),
+            function.unwrap_or_default()
+         );
+      }
+   }
+
    fn refs(&self, target: usize) {
+      if self.arm64 {
+         self.print_arm64_refs(target..target + 1);
+         for pointer in self.image.pointers_to(target).into_iter().take(64) {
+            println!("   pointer at {}", self.at(pointer));
+         }
+         return;
+      }
       let code = x86::code_refs(self.image, target..target + 1);
       let pointers = self.image.pointers_to(target);
       println!(
@@ -678,6 +1028,16 @@ impl Tools<'_> {
          },
          None => usize::MAX,
       };
+      if self.arm64 {
+         for (at, text) in arm64::disasm(code, addr, count) {
+            if at >= end {
+               println!("   -- end of function --");
+               break;
+            }
+            println!("   {}  {text}", self.at(at));
+         }
+         return;
+      }
       for line in x86::disasm(code, addr, count) {
          if line.addr >= end {
             println!("   -- end of function --");

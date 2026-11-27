@@ -50,7 +50,12 @@ static ORIG_MEDIA_FETCH: OnceLock<MediaFetchFn> = OnceLock::new();
 /// Locates and inline-hooks `libdiscord_media::fetch` during
 /// [`crate::prepare`].
 pub fn install(image: &Image<'static>) {
-   let func = match desktop::media_fetch(image) {
+   let found = if crate::X86_CODE {
+      desktop::media_fetch(image)
+   } else {
+      phoenix_sigs::macos::media_fetch(image)
+   };
+   let func = match found {
       Ok(func) => func,
       Err(err) => {
          log::warn!("desktop badges: {err}, custom badge icons disabled");

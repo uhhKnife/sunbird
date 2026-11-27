@@ -51,7 +51,7 @@ phoenix-ui-desktop      = { path = "crates/ui-desktop" }
 phoenix-ui-mobile       = { path = "crates/ui-mobile" }
 phoenix-wire            = { path = "crates/wire" }
 rquickjs                = { features = [ "parallel" ], version = "0.14" }
-rusqlite                = { default-features = false, features = [ "bundled" ], version = "0.35" }
+rusqlite                = { default-features = false, features = [ "bundled" ], version = "0.43" }
 serde                   = { features = [ "derive" ], version = "1" }
 serde_json              = { features = [ "raw_value" ], version = "1" }
 sunhook-sys             = { git = "https://github.com/sunbird-tools/sunhook" }

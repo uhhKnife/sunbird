@@ -70,6 +70,10 @@ pub fn install(image: &Image<'static>) {
 ///
 /// `message` points to a live `Message` for the whole call.
 pub unsafe fn json(message: *const u8, id: u64) -> Option<String> {
+   if !crate::X86_CODE {
+      // SAFETY: the caller's guarantee.
+      return unsafe { writer::json(message, id) };
+   }
    let &(to_value, drop_value) = FNS.get()?;
    let mut slot: Slot = [0; 16];
    // SAFETY: `slot` is larger than `Result<Value, Error>`, `message` is live.
@@ -237,4 +241,80 @@ fn write_value(out: &mut String, value: *const u8, bucket: Bucket, depth: usize)
       },
    }
    Some(())
+}
+
+/// macOS Phoenix: the message written by its own `Serialize` into a `Vec`
+/// Discord's allocator grows, and freed by that allocator.
+pub mod writer {
+   use std::{
+      ffi::c_void,
+      ptr,
+      slice,
+      sync::OnceLock,
+   };
+
+   use phoenix_hook::x86;
+
+   #[repr(C)]
+   struct RawVec {
+      cap: usize,
+      ptr: *mut u8,
+      len: usize,
+   }
+
+   type SerializeFn = unsafe extern "C" fn(*const u8, *mut *mut RawVec) -> *mut c_void;
+   type DeallocFn = unsafe extern "C" fn(*mut u8, usize, usize);
+
+   static WRITER: OnceLock<(SerializeFn, DeallocFn, usize)> = OnceLock::new();
+
+   /// Locates the writer using the warm arm64 reference index during startup.
+   #[cfg(target_os = "macos")]
+   pub fn install(image: &phoenix_hook::image::Image<'_>) {
+      match phoenix_sigs::macos::message_writer(image) {
+         Ok(found) => {
+            // SAFETY: shape-checked by `sigs`, with these Rust-ABI
+            // signatures, which arm64 passes like the C ABI.
+            let _ = WRITER.set(unsafe {
+               (
+                  std::mem::transmute::<usize, SerializeFn>(found.serialize),
+                  std::mem::transmute::<usize, DeallocFn>(found.dealloc),
+                  found.message_id,
+               )
+            });
+            log::info!("message json: {found:x?}");
+         },
+         Err(err) => log::warn!("message json: {err}, message actions read the cache"),
+      }
+   }
+
+   /// # Safety
+   ///
+   /// `message` points to a live `Message` for the whole call.
+   pub unsafe fn json(message: *const u8, id: u64) -> Option<String> {
+      let &(serialize, dealloc, id_at) = WRITER.get()?;
+      let held = x86::read_memory(message.addr() + id_at, 8)?;
+      if held.as_slice() != id.to_le_bytes() {
+         return None;
+      }
+      let mut out = RawVec {
+         cap: 0,
+         ptr: ptr::dangling_mut(),
+         len: 0,
+      };
+      let mut serializer = &raw mut out;
+      // SAFETY: `message` is live, and the serializer is a `&mut Vec<u8>`
+      // that Discord's allocator grows.
+      let error = unsafe { serialize(message, &raw mut serializer) };
+      let json = (error.is_null() && out.len <= out.cap)
+         // SAFETY: `out` holds `len` bytes the serializer wrote.
+         .then(|| unsafe { slice::from_raw_parts(out.ptr, out.len) })
+         .and_then(|bytes| String::from_utf8(bytes.to_vec()).ok());
+      if out.cap > 0 {
+         // SAFETY: frees the buffer with the allocator that grew it.
+         unsafe { dealloc(out.ptr, out.cap, 1) };
+      }
+      // ponytail: a boxed error leaks, a message that fails to serialize is
+      // rare.
+      json.filter(|json| json.starts_with(&format!("{{\"id\":\"{id}\"")))
+   }
 }

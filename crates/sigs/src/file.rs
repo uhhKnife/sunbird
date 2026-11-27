@@ -51,6 +51,7 @@ use object::{
 };
 use phoenix_hook::image::{
    BuildId,
+   FunctionStarts,
    Image,
    Segment,
 };
@@ -174,6 +175,7 @@ impl<'a> ElfFile<'a> {
          arm_exidx: None,
          pdata: None,
          pointer_width,
+         function_starts: None,
       };
       let mut loads = Vec::new();
       for segment in header.program_headers(endian, data).map_err(parse)? {
@@ -284,13 +286,14 @@ impl<'a> MachOFile<'a> {
          });
       }
       let mut image = Image {
-         path:          path.to_owned(),
-         build_id:      None,
-         segments:      Vec::new(),
-         eh_frame_hdr:  None,
-         arm_exidx:     None,
-         pdata:         None,
-         pointer_width: 8,
+         path:            path.to_owned(),
+         build_id:        None,
+         segments:        Vec::new(),
+         eh_frame_hdr:    None,
+         arm_exidx:       None,
+         pdata:           None,
+         pointer_width:   8,
+         function_starts: None,
       };
 
       // Fixup chains name segments by load-command order, `__PAGEZERO`
@@ -298,6 +301,8 @@ impl<'a> MachOFile<'a> {
       let mut by_index = Vec::new();
       let mut text = 0;
       let mut fixups = None;
+      let mut starts = None;
+      let mut linkedit = None;
       let mut code = Vec::new();
       for command in header.load_commands(endian, data, 0).map_err(parse)? {
          match command.map_err(parse)?.variant().map_err(parse)? {
@@ -305,6 +310,9 @@ impl<'a> MachOFile<'a> {
                let vmaddr = segment.vmaddr(endian);
                if segment.name() == b"__TEXT" {
                   text = vmaddr;
+               }
+               if segment.name() == b"__LINKEDIT" {
+                  linkedit = Some((vmaddr, segment.fileoff(endian)));
                }
                if segment.filesize(endian) == 0 {
                   by_index.push(None);
@@ -351,6 +359,14 @@ impl<'a> MachOFile<'a> {
             {
                fixups = Some(command.chained_fixups(endian, data).map_err(parse)?);
             },
+            LoadCommandVariant::LinkeditData(command)
+               if command.cmd.get(endian) == macho::LC_FUNCTION_STARTS =>
+            {
+               starts = Some((
+                  command.dataoff.get(endian) as usize,
+                  command.datasize.get(endian) as usize,
+               ));
+            },
             LoadCommandVariant::Uuid(uuid) if image.build_id.is_none() => {
                image.build_id = BuildId::from_bytes(&uuid.uuid);
             },
@@ -384,6 +400,15 @@ impl<'a> MachOFile<'a> {
                .ok_or_else(truncated)?
                .copy_from_slice(&value.to_le_bytes());
          }
+      }
+      if let (Some((offset, len)), Some((vmaddr, fileoff))) = (starts, linkedit)
+         && let Some(into) = (offset as u64).checked_sub(fileoff)
+      {
+         image.function_starts = Some(FunctionStarts::new(
+            usize::try_from(vmaddr + into).map_err(address)?,
+            len,
+            usize::try_from(text).map_err(address)?,
+         ));
       }
       Ok(Self { image, code })
    }
@@ -463,6 +488,7 @@ impl<'a> PeFile<'a> {
             arm_exidx: None,
             pdata,
             pointer_width: 8,
+            function_starts: None,
          },
          machine,
       })

@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
       - run: nix develop --command cargo test --release -p phoenix-hook -p phoenix-sigs
       - run: nix develop --command cargo build --release -p sigscan
       - name: sigscan check
@@ -55,5 +55,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-loader
+      - run: cargo clippy --locked --no-deps -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader -p sigscan -- -D warnings
+      - run: cargo test --locked --release -p phoenix-hook -p phoenix-sigs -p phoenix-runtime -p phoenix-runtime-desktop -p phoenix-ui-desktop -p phoenix-loader
       - run: cargo build --locked --release -p phoenix-loader

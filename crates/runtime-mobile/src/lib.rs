@@ -150,7 +150,7 @@ impl Platform for Mobile {
 
    #[cfg(target_os = "android")]
    fn before_plugins(&self, home: &Path) {
-      loader::adopt_staged(home, &home.join("plugins"));
+      phoenix_runtime::update::adopt_staged(home, &home.join("plugins"));
    }
 
    #[cfg(target_os = "ios")]

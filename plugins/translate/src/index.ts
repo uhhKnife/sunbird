@@ -1,5 +1,5 @@
 // @description Translates messages from the message menu, or every message in selected channels, using Kagi or Google
-// @version 0.2.2
+// @version 0.3.0
 // @author amaanq
 
 const { gateway } = phoenix;
@@ -131,51 +131,38 @@ const translators: Record<typeof settings.service, Translator> = {
 
 const baseLanguage = (code: string) => code.split("-")[0].toLowerCase();
 
-const subtext = (text: string) =>
-  text
-    .split("\n")
-    .map((line) => `-# ${line}`)
-    .join("\n");
+// Notes under messages by id, kept to the most recent 512.
+const notes = new Map<string, string>();
 
-type Translatable = Pick<Phoenix.GatewayMessage, "id" | "channel_id" | "guild_id" | "content">;
+const note = phoenix.ui.addMessageAccessory({
+  render: ({ messageId }) => notes.get(messageId) ?? null,
+});
 
-// The text each message had before a note went under it, so translating again
-// replaces the note instead of translating it too.
-const originals = new Map<string, string>();
-
-/// Shows `note` in small text under `message`'s own text.
-const showUnder = (message: Translatable, original: string, note: string) => {
-  originals.delete(message.id);
-  originals.set(message.id, original);
-  if (originals.size > 512) originals.delete(originals.keys().next().value!);
-  phoenix.enqueue(gateway.messageUpdate, {
-    id: message.id,
-    channel_id: message.channel_id,
-    ...(message.guild_id ? { guild_id: message.guild_id } : {}),
-    content: `${original}\n${subtext(note)}`,
-  });
+const showUnder = (id: string, text: string) => {
+  notes.delete(id);
+  notes.set(id, text);
+  if (notes.size > 512) notes.delete(notes.keys().next().value!);
+  note.update?.(id);
 };
 
-/// Translates `message` and shows the result under it. With `quiet`, a message
-/// already in the target language is left as it is.
-const translateMessage = async (message: Translatable, quiet: boolean) => {
-  const original = originals.get(message.id) ?? message.content ?? "";
-  if (!original.trim()) return;
-
+/// Translates `content` and shows the result under message `id`. With
+/// `quiet`, a message already in the target language is left as it is.
+const translateMessage = async (id: string, content: string, quiet: boolean) => {
+  if (!content.trim()) return;
   const target = settings.target.trim() || "en";
-  const translation = await translators[settings.service](original.trim(), target);
-  if (baseLanguage(translation.from) === baseLanguage(target) || translation.text.trim() === original.trim()) {
-    if (!quiet) showUnder(message, original, `Already in ${await languageName(baseLanguage(target))}`);
+  const translation = await translators[settings.service](content.trim(), target);
+  if (baseLanguage(translation.from) === baseLanguage(target) || translation.text.trim() === content.trim()) {
+    if (!quiet) showUnder(id, `Already in ${await languageName(baseLanguage(target))}`);
     return;
   }
-  showUnder(message, original, `${translation.text} (${translation.label})`);
+  showUnder(id, `${translation.text} (${translation.label})`);
 };
 
 phoenix.on(gateway.messageCreate, async (message) => {
   const channels = settings.channels.split(",").map((id) => id.trim());
   if (!channels.includes(message.channel_id)) return;
   try {
-    await translateMessage(message, true);
+    await translateMessage(message.id, message.content ?? "", true);
   } catch (err) {
     phoenix.log.warn(`translating ${message.id}: ${err}`);
   }
@@ -187,9 +174,8 @@ phoenix.ui.addMessageAction({
   onPress(ctx) {
     const message = ctx.message;
     if (!message) return;
-    translateMessage(message, false).catch((err) => {
-      const original = originals.get(message.id) ?? message.content ?? "";
-      showUnder(message, original, `Translation failed: ${err instanceof Error ? err.message : err}`);
+    translateMessage(message.id, message.content ?? "", false).catch((err) => {
+      showUnder(message.id, `Translation failed: ${err instanceof Error ? err.message : err}`);
     });
   },
 });

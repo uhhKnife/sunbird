@@ -80,31 +80,32 @@ pub fn install(image: &Image<'static>) {
    if !gpui::svg_ready() {
       return;
    }
-   let load = match desktop::asset_load(image) {
+   let found = if crate::X86_CODE {
+      desktop::asset_load(image)
+   } else {
+      phoenix_sigs::macos::asset_load(image)
+   };
+   let load = match found {
       Ok(load) => load,
       Err(err) => {
          log::warn!("desktop icons: {err}, icons fall back to text");
          return;
       },
    };
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).asset_load;
    // SAFETY: runs from `prepare` before Discord threads execute; `load_detour`
-   // has the loader's `(sret, path ptr, path len)` signature.
-   match unsafe {
-      image.hook_entry(
+   // has the loader's `(sret, path ptr, path len)` signature (adapted via
+   // `sret_callee`/`sret_caller` on arm64).
+   if let Some(orig) = unsafe {
+      crate::hook_sret::<AssetLoadFn>(
+         image,
+         |pro| pro.asset_load,
          load,
-         pro.pattern,
-         pro.len,
          load_detour as *const () as usize,
+         "desktop icons: asset loader hook failed",
       )
    } {
-      Ok(trampoline) => {
-         // SAFETY: `trampoline` replays the prologue and jumps past it.
-         let orig = unsafe { std::mem::transmute::<usize, AssetLoadFn>(trampoline) };
-         let _ = ORIG_LOAD.set(orig);
-         log::info!("desktop icons: hooked the asset loader @ {load:#x}");
-      },
-      Err(err) => log::warn!("desktop icons: asset loader hook failed: {err}"),
+      let _ = ORIG_LOAD.set(orig);
+      log::info!("desktop icons: hooked the asset loader @ {load:#x}");
    }
 }
 

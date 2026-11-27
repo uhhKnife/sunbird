@@ -1,19 +1,7 @@
 //! Native GPUI message accessories (`phoenix.ui.addMessageAccessory`) for
-//! Desktop Phoenix.
-//!
-//! Hooks Discord's message row GPUI renderer (`MessageRow::render`) during
-//! [`crate::prepare`] using build-independent anchors:
-//! 1. Locate the unique Rust format template `\x10message-content-\xc0\x00` in
-//!    `.rdata` and its `.text` `lea` xrefs (the two message-content helpers).
-//! 2. Intersect their direct callers' `.pdata` functions to find the single
-//!    `MessageRow::render` function (`sret: *mut RawAnyElement`, `row: *const
-//!    c_void`, `r8`, `r9`, plus 7 stack qwords).
-//! 3. Decode `message_id: u64`'s byte offset inside `row` from the `lea rax,
-//!    [rcx + disp32]` right before the `message-content-` xref.
-//! 4. After calling the original renderer, if any plugin returned accessory
-//!    lines or a tint for `message_id`, wrap the rendered `AnyElement` in a
-//!    native GPUI `Div` with colored text lines underneath and an optional
-//!    tinted left accent bar — without ever modifying `message.content`.
+//! Desktop Phoenix. A detour on `MessageRow::render` wraps the rendered row in
+//! a `Div` with the plugins' lines underneath and an optional tinted accent
+//! bar, and a detour on the body builder recolors the body text for a tint.
 
 use std::{
    collections::HashMap,
@@ -94,6 +82,7 @@ impl RenderedAccessory {
    }
 }
 
+#[derive(PartialEq, Eq)]
 enum CacheEntry {
    Pending,
    Ready(Vec<RenderedAccessory>),
@@ -101,7 +90,8 @@ enum CacheEntry {
 
 static ORIG_RENDER_ROW: OnceLock<RenderRowFn> = OnceLock::new();
 static ORIG_BUILD_BODY: OnceLock<BuildMessageBodyFn> = OnceLock::new();
-static ORIG_OPT_DELETE: OnceLock<OptimisticDeleteFn> = OnceLock::new();
+static ORIG_OPT_DELETE: [OnceLock<OptimisticDeleteFn>; MAX_DELETES] =
+   [const { OnceLock::new() }; MAX_DELETES];
 static MSG_ID_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static BODY_MSG_ID_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static ROW_COLORS_OFFSET: AtomicUsize = AtomicUsize::new(0);
@@ -111,6 +101,19 @@ static CACHE: LazyLock<RwLock<HashMap<u64, CacheEntry>>> =
 static WORKER_TX: OnceLock<mpsc::Sender<u64>> = OnceLock::new();
 
 const MAX_CACHE_ENTRIES: usize = 8192;
+
+/// Caches `entry` for `message_id`, dropping everything once the cache is full,
+/// and returns what it replaced.
+fn cache(
+   map: &mut HashMap<u64, CacheEntry>,
+   message_id: u64,
+   entry: CacheEntry,
+) -> Option<CacheEntry> {
+   if map.len() > MAX_CACHE_ENTRIES {
+      map.clear();
+   }
+   map.insert(message_id, entry)
+}
 
 pub fn set_active_count(count: usize) {
    ACTIVE_COUNT.store(count, Ordering::Release);
@@ -130,12 +133,8 @@ pub fn clear_cache() {
 pub fn set_rendered(message_id: u64, mut items: Vec<RenderedAccessory>) {
    items.sort_by_key(|a| a.priority);
    let changed = CACHE.write().is_ok_and(|mut map| {
-      if map.len() > MAX_CACHE_ENTRIES {
-         map.clear();
-      }
-      let prev_same = matches!(map.get(&message_id), Some(CacheEntry::Ready(old)) if *old == items);
-      map.insert(message_id, CacheEntry::Ready(items));
-      !prev_same
+      let prev = cache(&mut map, message_id, CacheEntry::Ready(items));
+      prev.as_ref() != map.get(&message_id)
    });
    if changed {
       invalidate_discord_windows();
@@ -166,14 +165,9 @@ fn ensure_worker() -> &'static mpsc::Sender<u64> {
                   items.sort_by_key(|a| a.priority);
                   let non_empty = !items.is_empty();
                   if let Ok(mut map) = CACHE.write() {
-                     if map.len() > MAX_CACHE_ENTRIES {
-                        map.clear();
-                     }
-                     map.insert(mid, CacheEntry::Ready(items));
+                     cache(&mut map, mid, CacheEntry::Ready(items));
                   }
-                  if non_empty {
-                     any_visible = true;
-                  }
+                  any_visible |= non_empty;
                }
                if any_visible {
                   invalidate_discord_windows();
@@ -198,10 +192,7 @@ fn lookup_cached(message_id: u64) -> Option<Vec<RenderedAccessory>> {
       if map.contains_key(&message_id) {
          return false;
       }
-      if map.len() > MAX_CACHE_ENTRIES {
-         map.clear();
-      }
-      map.insert(message_id, CacheEntry::Pending);
+      cache(&mut map, message_id, CacheEntry::Pending);
       true
    });
    if should_queue {
@@ -228,24 +219,28 @@ pub const fn argb_to_rgba(argb: u32) -> u32 {
    ((argb & 0x00FF_FFFF) << 8) | a
 }
 
-// ---------------------------------------------------------------------------
-// GPUI Repaint Trigger
-// ---------------------------------------------------------------------------
-
 /// Requests an immediate GPUI re-render on all visible Discord windows so
 /// updated message accessories appear right away.
 pub fn invalidate_discord_windows() {
    crate::modal::force_redraw();
 }
 
-// ---------------------------------------------------------------------------
-// Anchor Locator & Inline Hook
-// ---------------------------------------------------------------------------
+/// The message id currently being rendered on this thread on macOS arm64.
+#[cfg(target_os = "macos")]
+pub fn current_rendering_message_id() -> u64 {
+   arm64::current_rendering_message_id()
+}
 
 /// Locates and hooks Discord's GPUI `MessageRow::render` from `DllMain`.
 pub fn install(image: &Image<'static>) {
    if !gpui::supports_accessories() {
       log::warn!("desktop accessories: GPUI text/push primitives unavailable, skipping");
+      return;
+   }
+
+   if !crate::X86_CODE {
+      #[cfg(target_os = "macos")]
+      arm64::install(image);
       return;
    }
 
@@ -258,27 +253,20 @@ pub fn install(image: &Image<'static>) {
    };
    MSG_ID_OFFSET.store(offset, Ordering::Release);
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).row;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `render_row_detour` matches `MessageRow::render`'s exact 11-argument sret
    // ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
+   let Some(orig) = (unsafe {
+      crate::hook::<RenderRowFn>(
+         image,
+         |pro| pro.row,
          render_row,
-         pro.pattern,
-         pro.len,
          render_row_detour as *const () as usize,
+         "desktop accessories: MessageRow hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop accessories: MessageRow hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays the 17-byte prologue and jumps to `render_row
-   // + 17`.
-   let orig = unsafe { std::mem::transmute::<usize, RenderRowFn>(trampoline) };
    let _ = ORIG_RENDER_ROW.set(orig);
    log::info!(
       "desktop accessories: hooked MessageRow render @ {render_row:#x} (msg_id +{offset:#x})"
@@ -302,27 +290,20 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
    BODY_MSG_ID_OFFSET.store(msg_id_off, Ordering::Release);
    ROW_COLORS_OFFSET.store(colors_off, Ordering::Release);
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).row;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `build_body_detour` matches `build_message_body`'s verified 6-argument
    // ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
+   let Some(orig) = (unsafe {
+      crate::hook::<BuildMessageBodyFn>(
+         image,
+         |pro| pro.row,
          body_fn,
-         pro.pattern,
-         pro.len,
          build_body_detour as *const () as usize,
+         "desktop accessories: message body tint hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop accessories: message body tint hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays the 17-byte prologue and jumps to `body_fn +
-   // 17`.
-   let orig = unsafe { std::mem::transmute::<usize, BuildMessageBodyFn>(trampoline) };
    let _ = ORIG_BUILD_BODY.set(orig);
    log::info!(
       "desktop accessories: hooked message body tint @ {body_fn:#x} (msg_id +{msg_id_off:#x}, \
@@ -407,41 +388,39 @@ unsafe extern "C" fn render_row_detour(
    // SAFETY: `row` is Discord's live `&MessageRow` and `offset` was decoded
    // from its `message-content-{id}` formatting read.
    let message_id = unsafe { row.cast::<u8>().add(offset).cast::<u64>().read_unaligned() };
+   decorate(sret, message_id);
+   out
+}
+
+/// Wraps the row `sret` rendered for `message_id` with the accessories
+/// plugins returned for it.
+fn decorate(sret: *mut RawAnyElement, message_id: u64) {
    if message_id == 0 {
-      return out;
+      return;
    }
    double_click::wrap_row(sret, message_id);
    if ACTIVE_COUNT.load(Ordering::Relaxed) == 0 {
-      return out;
+      return;
    }
 
    let Some(items) = lookup_cached(message_id) else {
-      return out;
+      return;
    };
 
-   let mut lines = Vec::new();
-   let mut tint: Option<u32> = None;
-   for item in &items {
-      if item.tint.is_some() {
-         tint = item.tint;
-      }
-      if !item.text.is_empty() {
-         lines.push((item.text.clone(), item.color));
-      }
-   }
+   let tint = items.iter().rev().find_map(|item| item.tint);
+   let lines = items
+      .into_iter()
+      .filter(|item| !item.text.is_empty())
+      .map(|item| (item.text, item.color))
+      .collect::<Vec<_>>();
    if lines.is_empty() && tint.is_none() {
-      return out;
+      return;
    }
 
    let _ = std::panic::catch_unwind(|| {
       gpui::wrap_with_accessories(sret, &lines, tint);
    });
-   out
 }
-
-// ---------------------------------------------------------------------------
-// Same-Client Optimistic Delete Hook
-// ---------------------------------------------------------------------------
 
 /// Locates and hooks Desktop Phoenix's same-client optimistic message delete
 /// (`Store::delete_message`), so deleting a message from this client respects
@@ -453,40 +432,46 @@ pub fn install_optimistic_delete(image: &Image<'static>) {
       );
       return;
    };
-   let opt_del = match desktop::optimistic_delete(image, del_fn) {
-      Ok(opt_del) => opt_del,
+   let found = if crate::X86_CODE {
+      desktop::optimistic_delete(image, del_fn).map(|func| vec![func])
+   } else {
+      phoenix_sigs::macos::optimistic_delete(image, del_fn)
+   };
+   let funcs = match found {
+      Ok(funcs) => funcs,
       Err(err) => {
          log::warn!("desktop accessories: {err}, skipping optimistic delete hook");
          return;
       },
    };
-
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
-   // SAFETY: runs from `prepare` before Discord threads execute;
-   // `optimistic_delete_detour` matches `Store::delete_message`'s exact
-   // `(store, args, meta) -> bool` ABI.
-   let trampoline = match unsafe {
-      image.hook_entry(
-         opt_del,
-         pro.pattern,
-         pro.len,
-         optimistic_delete_detour as *const () as usize,
-      )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop accessories: optimistic delete hook failed: {err}");
-         return;
-      },
-   };
-   // SAFETY: `trampoline` replays the 19-byte prologue and jumps to `opt_del +
-   // 19`.
-   let orig = unsafe { std::mem::transmute::<usize, OptimisticDeleteFn>(trampoline) };
-   let _ = ORIG_OPT_DELETE.set(orig);
-   log::info!("desktop accessories: hooked same-client optimistic delete @ {opt_del:#x}");
+   for (index, &func) in funcs.iter().take(MAX_DELETES).enumerate() {
+      // SAFETY: runs from `prepare` before Discord threads execute; each
+      // detour matches the store delete's `(store, args, meta) -> bool` ABI.
+      let Some(orig) = (unsafe {
+         crate::hook::<OptimisticDeleteFn>(
+            image,
+            |pro| pro.frame,
+            func,
+            DETOURS[index] as *const () as usize,
+            "desktop accessories: optimistic delete hook failed",
+         )
+      }) else {
+         continue;
+      };
+      let _ = ORIG_OPT_DELETE[index].set(orig);
+      log::info!("desktop accessories: hooked same-client optimistic delete @ {func:#x}");
+   }
 }
 
-unsafe extern "C" fn optimistic_delete_detour(
+/// The client's own message deletes, one detour and original each; arm64
+/// Discord has two.
+const MAX_DELETES: usize = 2;
+const DETOURS: [OptimisticDeleteFn; MAX_DELETES] = [
+   optimistic_delete_detour::<0>,
+   optimistic_delete_detour::<1>,
+];
+
+unsafe extern "C" fn optimistic_delete_detour<const N: usize>(
    store: *mut c_void,
    args: *const *const u64,
    meta: *const c_void,
@@ -508,7 +493,7 @@ unsafe extern "C" fn optimistic_delete_detour(
          }
       }
    }
-   let Some(orig) = ORIG_OPT_DELETE.get().copied() else {
+   let Some(orig) = ORIG_OPT_DELETE[N].get().copied() else {
       return 0;
    };
    // SAFETY: forwards all arguments verbatim to the original optimistic delete.
@@ -525,5 +510,224 @@ mod tests {
       assert_eq!(argb_to_rgba(0x8058_65F2), 0x5865_F280);
       assert_eq!(argb_to_rgba(0x00F2_3F43), 0xF23F_43FF);
       assert_eq!(argb_to_rgba(0), 0);
+   }
+}
+
+/// `MessageRow::render` on macOS, arm64 ([`phoenix_sigs::macos::message_row`]).
+///
+/// It takes `x0` the row, `x1`..`x7`, `d0` and one stack word, and returns
+/// the 0x20-byte `AnyElement` through `x8`, which a Rust `extern "C"` function
+/// returning [`RawAnyElement`] does too, so the detour is native. Extra stack
+/// words are read from the caller's frame and passed back unchanged.
+#[cfg(target_os = "macos")]
+mod arm64 {
+   use std::sync::{
+      OnceLock,
+      atomic::Ordering,
+   };
+
+   use phoenix_hook::image::Image;
+
+   use super::{
+      ACTIVE_COUNT,
+      RawAnyElement,
+      decorate,
+   };
+
+   type RenderFn = unsafe extern "C" fn(
+      row: *const u8,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+      s0: usize,
+      s1: usize,
+      s2: usize,
+      s3: usize,
+   ) -> RawAnyElement;
+
+   static ORIG: OnceLock<RenderFn> = OnceLock::new();
+   static ROW: OnceLock<phoenix_sigs::macos::MessageRow> = OnceLock::new();
+
+   std::thread_local! {
+      /// The message the render on this thread is drawing, read by header hooks.
+      static RENDERING: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+   }
+
+   pub fn current_rendering_message_id() -> u64 {
+      RENDERING.with(std::cell::Cell::get)
+   }
+
+   pub fn install(image: &Image<'static>) {
+      let row = match phoenix_sigs::macos::message_row(image) {
+         Ok(row) => row,
+         Err(err) => {
+            log::warn!("desktop accessories: {err}, skipping");
+            return;
+         },
+      };
+      // SAFETY: runs from `prepare` before Discord's threads; `detour` has the
+      // render's arm64 signature.
+      let Some(orig) = (unsafe {
+         crate::hook::<RenderFn>(
+            image,
+            |pro| pro.frame,
+            row.func,
+            detour as *const () as usize,
+            "desktop accessories: MessageRow hook failed",
+         )
+      }) else {
+         return;
+      };
+      let _ = ORIG.set(orig);
+      let _ = ROW.set(row);
+      log::info!("desktop accessories: hooked MessageRow render {row:x?}");
+      install_body_tint(image, row.func);
+   }
+
+   type BodyFn = unsafe extern "C" fn(*const u8, *mut u8, usize, usize, usize, usize) -> Returned;
+
+   /// What the builder leaves in `x0` and `x1`, passed back as is.
+   #[repr(C)]
+   struct Returned(usize, usize);
+
+   static BODY: OnceLock<(BodyFn, phoenix_sigs::macos::MessageBody)> = OnceLock::new();
+
+   fn install_body_tint(image: &Image<'static>, render_row: usize) {
+      let body = match phoenix_sigs::macos::message_body(image, render_row) {
+         Ok(body) => body,
+         Err(err) => {
+            log::warn!("desktop accessories: {err}, skipping body tint");
+            return;
+         },
+      };
+      // SAFETY: runs from `prepare` before Discord's threads; `body_detour` has
+      // the builder's arm64 signature.
+      let Some(orig) = (unsafe {
+         crate::hook::<BodyFn>(
+            image,
+            |pro| pro.frame,
+            body.func,
+            body_detour as *const () as usize,
+            "desktop accessories: message body tint hook failed",
+         )
+      }) else {
+         return;
+      };
+      log::info!("desktop accessories: hooked message body tint {body:x?}");
+      let _ = BODY.set((orig, body));
+   }
+
+   /// Points every text color the body may pick at the tint for this call.
+   unsafe extern "C" fn body_detour(
+      view: *const u8,
+      config: *mut u8,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+   ) -> Returned {
+      let (orig, body) = BODY.get().expect("the detour only runs once BODY is set");
+      let tint = (ACTIVE_COUNT.load(Ordering::Relaxed) > 0 && !view.is_null() && !config.is_null())
+         // SAFETY: `view` is the live message view the builder reads the id from.
+         .then(|| unsafe { view.add(body.message_id).cast::<u64>().read_unaligned() })
+         .filter(|&id| id != 0)
+         .and_then(super::lookup_cached_tint);
+      let Some(argb) = tint else {
+         // SAFETY: forwards every argument to the original builder.
+         return unsafe { orig(view, config, a2, a3, a4, a5) };
+      };
+      let rgba = super::argb_to_rgba(argb);
+      // SAFETY: `config` is the render's stack frame for this call, and these
+      // `u32` colors are restored before it returns.
+      unsafe {
+         let saved = body
+            .colors
+            .iter()
+            .map(|&at| config.add(at).cast::<u32>().read_unaligned())
+            .collect::<Vec<_>>();
+         for &at in &body.colors {
+            config.add(at).cast::<u32>().write_unaligned(rgba);
+         }
+         let out = orig(view, config, a2, a3, a4, a5);
+         for (&at, color) in body.colors.iter().zip(saved) {
+            config.add(at).cast::<u32>().write_unaligned(color);
+         }
+         out
+      }
+   }
+
+   /// The message id the row renders: `row.rc -> Rc<Message> -> id`.
+   ///
+   /// # Safety
+   ///
+   /// `row` is the live row the render was called with.
+   unsafe fn message_id(row: *const u8) -> u64 {
+      let Some(at) = ROW.get() else {
+         return 0;
+      };
+      // SAFETY: the render loads the `Rc` from `row + rc` and hands
+      // `rc + value` to the helper that formats `id`.
+      unsafe {
+         let rc = row.add(at.rc).cast::<*const u8>().read_unaligned();
+         if rc.is_null() {
+            return 0;
+         }
+         rc.add(at.value + at.message_id)
+            .cast::<u64>()
+            .read_unaligned()
+      }
+   }
+
+   unsafe extern "C" fn detour(
+      row: *const u8,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+      s0: usize,
+      s1: usize,
+      s2: usize,
+      s3: usize,
+   ) -> RawAnyElement {
+      let orig = *ORIG.get().expect("the detour only runs once ORIG is set");
+      let id = if row.is_null() {
+         0
+      } else {
+         // SAFETY: `row` is the render's live row.
+         unsafe { message_id(row) }
+      };
+      let valid = (1 << 32..1 << 63).contains(&id);
+      let prev = RENDERING.with(|slot| slot.replace(if valid { id } else { 0 }));
+      crate::headers::arm64::clear_last_name_node();
+      // SAFETY: forwards every register and the stack words to the render.
+      let mut out = unsafe {
+         orig(
+            row, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, s0, s1, s2, s3,
+         )
+      };
+      crate::headers::arm64::clear_last_name_node();
+      RENDERING.with(|slot| slot.set(prev));
+      if valid {
+         if ACTIVE_COUNT.load(Ordering::Relaxed) > 0 {
+            decorate(&raw mut out, id);
+         }
+         crate::double_click::wrap_row(&raw mut out, id);
+      }
+      out
    }
 }

@@ -50,7 +50,12 @@ struct Installed {
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
 pub fn install(image: &Image<'static>) {
-   let found = match DesktopGatewaySend::locate(image) {
+   let located = if crate::X86_CODE {
+      DesktopGatewaySend::locate(image)
+   } else {
+      phoenix_sigs::macos::gateway_send(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("gateway send: {err}, phoenix.gateway.onSend inactive");
@@ -58,9 +63,23 @@ pub fn install(image: &Image<'static>) {
       },
    };
 
+   let (start_send_addr, detour_addr) = if crate::X86_CODE {
+      (found.start_send_fn, start_send_detour as *const () as usize)
+   } else {
+      let (Some(orig), Some(detour)) = (
+         phoenix_hook::image::sret_caller(found.start_send_fn),
+         phoenix_hook::image::sret_callee(start_send_detour as *const () as usize),
+      ) else {
+         log::warn!("gateway send: no memory for arm64 sret thunks");
+         return;
+      };
+      (orig, detour)
+   };
+
    let (host_alloc, host_dealloc) = host_allocator();
-   // SAFETY: start_send_fn is the verified SocketSink::start_send entry from the binary's vtable.
-   let start_send = unsafe { std::mem::transmute::<usize, StartSendFn>(found.start_send_fn) };
+   // SAFETY: start_send_addr is the verified SocketSink::start_send entry (or
+   // its arm64 sret_caller thunk).
+   let start_send = unsafe { std::mem::transmute::<usize, StartSendFn>(start_send_addr) };
    let _ = INSTALLED.set(Installed {
       start_send,
       ok_tag: found.ok_tag,
@@ -71,7 +90,7 @@ pub fn install(image: &Image<'static>) {
    let writes = found
       .start_send_slots
       .iter()
-      .map(|&slot| (slot, start_send_detour as *const () as usize))
+      .map(|&slot| (slot, detour_addr))
       .collect::<Vec<_>>();
    // SAFETY: each slot is a verified .rdata vtable slot holding start_send_fn.
    match unsafe { image.swap_words(&writes) } {

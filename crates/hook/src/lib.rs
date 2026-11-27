@@ -13,14 +13,18 @@ use std::{
 // On wasm32 only the parts the host-side patcher reads build; live process
 // scanning uses dl_iterate_phdr on Unix and PE module enumeration on Windows.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code, unused_imports))]
+pub mod arm64;
 pub mod image;
 pub mod pattern;
-#[cfg(target_arch = "x86_64")] pub mod x86;
+// macOS builds it on arm64 too, so sigscan reads x86 Desktop builds there and
+// the desktop runtime compiles; its locators are not run on arm64 code.
 #[cfg(all(
    target_os = "android",
    any(target_arch = "aarch64", target_arch = "arm")
 ))]
 pub mod shadowhook;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod x86;
 
 #[cfg(all(
    target_os = "android",

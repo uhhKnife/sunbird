@@ -46,8 +46,14 @@ writeFileSync(`${out}index.json`, JSON.stringify(index, null, 2) + '\n');
 const so = `${out}libphoenix-arm64.so`;
 if (existsSync(so)) {
   const loader = readFileSync(so, 'latin1').match(/phoenix-version:([\w.-]+);/)?.[1] ?? '0';
+  const loader_crcs = Object.fromEntries(
+    readdirSync(out)
+      .filter((name) => /^libphoenix-.*\.(so|dylib)$/.test(name))
+      .sort()
+      .map((name) => [name, crc32(readFileSync(`${out}${name}`))]),
+  );
   const plugins = Object.fromEntries(index.map(({ name }) => [name, crc32(readFileSync(`${out}${name}.js`))]));
-  writeFileSync(fileURLToPath(new URL('../version.json', import.meta.url)), JSON.stringify({ loader, plugins }, null, 2) + '\n');
+  writeFileSync(fileURLToPath(new URL('../version.json', import.meta.url)), JSON.stringify({ loader, loader_crcs, plugins }, null, 2) + '\n');
 } else {
   console.log('no libphoenix-arm64.so, leaving web/version.json as it is');
 }

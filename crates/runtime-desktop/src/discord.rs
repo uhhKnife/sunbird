@@ -382,12 +382,17 @@ unsafe extern "C" fn owned_bytes_clone(
 /// A copy of `len` bytes at `ptr` in a `Vec` from Discord's allocator, which
 /// frees it.
 fn host_vec(ptr: *const u8, len: usize) -> RawVec {
-   let dst = INSTALLED
-      .get()
-      .and_then(|inst| inst.host_alloc)
-      .filter(|_| len > 0 && !ptr.is_null())
-      // SAFETY: the host's own `__rust_alloc(len, 1)`.
-      .map(|alloc| unsafe { alloc(len, 1) })
+   let alloc = || {
+      INSTALLED
+         .get()
+         .and_then(|inst| inst.host_alloc)
+         // SAFETY: the host's own `__rust_alloc(len, 1)`.
+         .map(|alloc| unsafe { alloc(len, 1) })
+         .or_else(|| crate::gpui::host_alloc(len, 1))
+   };
+   let dst = (len > 0 && !ptr.is_null())
+      .then(alloc)
+      .flatten()
       .filter(|dst| !dst.is_null());
    let Some(dst) = dst else {
       return RawVec {
@@ -456,13 +461,30 @@ unsafe extern "C" fn owned_bytes_drop(data: *mut (), _ptr: *const u8, _len: usiz
 /// Locates Desktop Phoenix's `ReqwestTransport` and `SendFuture` vtable slots
 /// and installs request/response interception.
 pub fn install(image: &Image<'static>) {
-   let found = match DesktopHttpTransport::locate(image) {
+   let found = if crate::X86_CODE {
+      DesktopHttpTransport::locate(image)
+   } else {
+      phoenix_sigs::macos::http_transport(image)
+   };
+   let mut found = match found {
       Ok(found) => found,
       Err(err) => {
          log::warn!("discord desktop: HTTP transport: {err}");
          return;
       },
    };
+   if !crate::X86_CODE
+      && found.host_alloc.is_none()
+      && let Some(alloc_or_oom) = crate::gpui::alloc_or_oom_addr()
+   {
+      match phoenix_sigs::macos::host_allocator(image, alloc_or_oom) {
+         Ok((alloc, dealloc)) => {
+            found.host_alloc = Some(alloc);
+            found.host_dealloc = Some(dealloc);
+         },
+         Err(err) => log::warn!("discord desktop: {err}, response bodies can't grow"),
+      }
+   }
    // Discord's API client calls `send` directly rather than through the
    // vtable, so `send` is hooked in place and the detour calls the trampoline.
    // It opens with the same register saves and `sub rsp` as a render frame.

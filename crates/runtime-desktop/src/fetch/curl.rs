@@ -23,6 +23,12 @@ use phoenix_runtime::fetch::{
    TIMEOUT_MS,
 };
 
+#[cfg(target_os = "linux")]
+const LIBCURL: &CStr = c"libcurl.so.4";
+/// Part of macOS, built against its Secure Transport and keychain.
+#[cfg(target_os = "macos")]
+const LIBCURL: &CStr = c"/usr/lib/libcurl.4.dylib";
+
 const CURL_GLOBAL_DEFAULT: c_long = 3;
 const CURLPROTO_HTTP: c_long = 1;
 const CURLPROTO_HTTPS: c_long = 2;
@@ -83,9 +89,12 @@ fn curl() -> Option<&'static Curl> {
       .get_or_init(|| {
          // SAFETY: each symbol is read with its type from `curl/curl.h`.
          let curl = unsafe {
-            let lib = libc::dlopen(c"libcurl.so.4".as_ptr(), libc::RTLD_NOW);
+            let lib = libc::dlopen(LIBCURL.as_ptr(), libc::RTLD_NOW);
             if lib.is_null() {
-               log::warn!("fetch: libcurl.so.4 is not installed, HTTP is off");
+               log::warn!(
+                  "fetch: {} is not installed, HTTP is off",
+                  LIBCURL.to_string_lossy()
+               );
                return None;
             }
             let global_init: unsafe extern "C" fn(c_long) -> c_int = sym(lib, c"curl_global_init")?;
@@ -167,7 +176,8 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
          url: url.to_owned(),
       }
    };
-   let curl = curl().ok_or_else(|| fail("libcurl.so.4 is not available".to_owned()))?;
+   let curl =
+      curl().ok_or_else(|| fail(format!("{} is not available", LIBCURL.to_string_lossy())))?;
    let url_cstr = CString::new(url).map_err(|_| not_http())?;
    let method = CString::new(request.method.as_str())
       .map_err(|_| fail("the method has a NUL byte".to_owned()))?;

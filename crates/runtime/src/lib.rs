@@ -37,6 +37,7 @@ pub mod discord;
 pub mod fetch;
 pub mod gateway;
 pub mod highlight;
+pub mod installer;
 pub mod js;
 pub mod local;
 mod platform;
@@ -75,10 +76,24 @@ pub enum Error {
    },
    #[error(transparent)]
    Hook(#[from] phoenix_hook::Error),
-   #[error("{url}: plugins install from https:// URLs ending in a name like plugin.js")]
+   #[error("{url}: plugins install from https:// links to a .js file, a GitHub file or a gist")]
    PluginUrl { url: String },
-   #[error("{name}: plugin files are .js files named with letters, digits, - or _")]
+   #[error("{url}: this GitHub page is not a file, link the plugin's .js file")]
+   PluginGitHubPage { url: String },
+   #[error("{url}: the gist has {found} .js files, link one with its #file- anchor")]
+   PluginGist { url: String, found: usize },
+   #[error("{name}: plugin files are .js files")]
    PluginFile { name: String },
+   #[error("{name}: the download is a web page, not a plugin")]
+   PluginPage { name: String },
+   #[error("{name}: the download is JSON data, not a plugin")]
+   PluginData { name: String },
+   #[error("{name}: this is an ES module, bundle it into a plain script (esbuild --format=iife)")]
+   PluginModule { name: String },
+   #[error("{name}: this is TypeScript source, install its bundled .js")]
+   PluginTypeScript { name: String },
+   #[error("{name}: {message}")]
+   PluginSyntax { name: String, message: String },
    #[error("{url}: the download is not UTF-8 text")]
    NotUtf8 { url: String },
    #[error(transparent)]
@@ -365,48 +380,31 @@ pub fn evaluate(code: &str) {
    }
 }
 
-/// Downloads a plugin bundle into `home/plugins` and loads it, replacing a
-/// plugin of the same name. Returns the plugin's name.
-pub fn install(url: &str) -> Result<String, Error> {
-   let bad_url = || {
-      Error::PluginUrl {
-         url: url.to_owned(),
-      }
+/// Downloads a plugin into `home/plugins` and loads it, replacing a plugin of
+/// the same name. Takes direct links, GitHub file pages and gists.
+pub fn install(url: &str) -> Result<installer::Installed, Error> {
+   let (download, name) = match installer::parse(url)? {
+      installer::Link::File { url, name } => (url, name),
+      installer::Link::Gist { id, anchor } => installer::gist(url, &id, anchor.as_deref())?,
    };
-   let rest = url.strip_prefix("https://").ok_or_else(bad_url)?;
-   let path = rest.split(['?', '#']).next().unwrap_or_default();
-   let name = path
-      .rsplit('/')
-      .next()
-      .and_then(plugin_name)
-      .ok_or_else(bad_url)?;
-
-   let body = fetch::get(url)?;
-   let source = String::from_utf8(body).map_err(|_| {
+   let source = String::from_utf8(fetch::get(&download)?).map_err(|_| {
       Error::NotUtf8 {
-         url: url.to_owned(),
+         url: download.clone(),
       }
    })?;
-   save_source(name, source)?;
-   Ok(name.to_owned())
-}
-
-/// The plugin name a file name like `plugin.js` gives.
-fn plugin_name(file: &str) -> Option<&str> {
-   file.strip_suffix(".js").filter(|name| {
-      !name.is_empty()
-         && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-   })
+   add(name, source)
 }
 
 /// Installs a bundle the user picked from the device, named by its file name.
-/// Returns the plugin's name.
-pub fn install_file(file: &str, bytes: Vec<u8>) -> Result<String, Error> {
-   let name = plugin_name(file).ok_or_else(|| {
-      Error::PluginFile {
-         name: file.to_owned(),
+pub fn install_file(file: &str, bytes: Vec<u8>) -> Result<installer::Installed, Error> {
+   let name = installer::name_of(file, &[file], None).map_err(|err| {
+      match err {
+         Error::PluginUrl { .. } => {
+            Error::PluginFile {
+               name: file.to_owned(),
+            }
+         },
+         other => other,
       }
    })?;
    let source = String::from_utf8(bytes).map_err(|_| {
@@ -414,8 +412,20 @@ pub fn install_file(file: &str, bytes: Vec<u8>) -> Result<String, Error> {
          url: file.to_owned(),
       }
    })?;
-   save_source(name, source)?;
-   Ok(name.to_owned())
+   add(name, source)
+}
+
+fn add(name: String, source: String) -> Result<installer::Installed, Error> {
+   installer::check(&name, &source)?;
+   let previous = engine().and_then(|engine| {
+      engine
+         .plugins()
+         .into_iter()
+         .find(|plugin| plugin.name == name)
+   });
+   let replaced = installer::Replaced::of(previous.as_ref(), &source);
+   save_source(&name, source)?;
+   Ok(installer::Installed { name, replaced })
 }
 
 /// Writes `source` to `home/plugins/<name>.js` and loads it, replacing the
@@ -440,15 +450,22 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
-/// Deletes a plugin installed into `home/plugins` and unloads it.
-pub fn uninstall(name: &str) -> Result<(), Error> {
+/// What an uninstall left in the plugin's place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uninstalled {
+   Removed,
+   /// The plugin had replaced a bundled one, which runs again as the user
+   /// had it.
+   RestoredBundled,
+}
+
+/// Deletes a plugin installed into `home/plugins` and unloads it, putting
+/// back the bundled plugin it replaced.
+pub fn uninstall(name: &str) -> Result<Uninstalled, Error> {
    let state = STATE.get().ok_or(Error::NotStarted)?;
    let file = state.plugins_dir().join(format!("{name}.js"));
    std::fs::remove_file(&file).map_err(io_error(&file))?;
-   if let Some(mut engine) = engine() {
-      engine.uninstall(name);
-   }
-   Ok(())
+   Ok(engine().map_or(Uninstalled::Removed, |mut engine| engine.uninstall(name)))
 }
 
 /// Evaluates an enabled plugin again with its hooks cleared.

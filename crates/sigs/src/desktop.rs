@@ -599,6 +599,44 @@ fn none_stores(code: &[u8]) -> Vec<usize> {
       .collect()
 }
 
+/// Offsets of `lea reg, [base + d8]` followed within 16 bytes by
+/// `mov byte [reg], 0xff`, the same `None` store where the build keeps the
+/// slot's address to pass it to a drop call first.
+fn none_stores_through(code: &[u8]) -> Vec<usize> {
+   (0..code.len())
+      .filter_map(|at| {
+         let [rex, 0x8D, modrm, ..] = *code.get(at..at + 5)? else {
+            return None;
+         };
+         if rex & 0xF8 != 0x48 || modrm & 0xC0 != 0x40 {
+            return None;
+         }
+         let (disp, len) = if modrm & 7 == 4 {
+            (code[at + 4], 5)
+         } else {
+            (code[at + 3], 4)
+         };
+         let dst = modrm >> 3 & 7;
+         if dst == 4 || dst == 5 {
+            return None;
+         }
+         let store: &[u8] = if rex & 4 == 0 {
+            &[0xC6, dst, 0xFF]
+         } else {
+            &[0x41, 0xC6, dst, 0xFF]
+         };
+         let after = code.get(at + len..(at + len + 16).min(code.len()))?;
+         after
+            .windows(store.len())
+            .enumerate()
+            .any(|(pos, w)| {
+               w == store && (rex & 4 != 0 || pos == 0 || after[pos - 1] & 0xF0 != 0x40)
+            })
+            .then_some(usize::from(disp))
+      })
+      .collect()
+}
+
 /// The 32-bit immediate after the first `prefix`.
 fn imm_after(code: &[u8], prefix: &[u8]) -> Option<usize> {
    let at = code.windows(prefix.len()).position(|w| w == prefix)? + prefix.len();
@@ -980,6 +1018,222 @@ pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
 
 /// Settings page 24's sidebar name, `Phoenix`, and its id,
 /// `DESKTOP_PHOENIX`, both relabeled in place.
+
+/// The id the DM list gives its pending friend requests badge.
+pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
+/// The id the DM list gives its message requests badge.
+pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
+
+/// What draws Phoenix's pending friend and message request counts.
+#[derive(Clone, Copy, Debug)]
+pub struct PendingCounts {
+   /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
+   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only.
+   pub badge:           usize,
+   /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
+   /// requests the DM list's Friends row and the inbox's Friends tab show.
+   pub friend_requests: usize,
+}
+
+/// The DM list draws both badges through one builder, each call just after the
+/// `lea` of its id. The friends count comes from the call whose `eax` the
+/// count argument was copied from.
+pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
+   let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
+   let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
+   if badge != requests_badge {
+      return Err(format!(
+         "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
+      ));
+   }
+   let friend_requests = count_source(image, friends_call)?;
+   function_code(image, friend_requests, "friend requests count")?;
+   if !counts_incoming(image, friend_requests) {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} compares no type with 3"
+      ));
+   }
+   Ok(PendingCounts {
+      badge,
+      friend_requests,
+   })
+}
+
+/// `u32 f(&RelationshipStore)`, the number on the Home button.
+///
+/// It adds the DM mentions to the friend requests `friend_requests` counts,
+/// inlined but for its one call, which counts the game friend requests. The
+/// Home button is the other caller of that which counts incoming requests and
+/// returns a plain count.
+pub fn home_count(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let counts = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| {
+         func != friend_requests && !returns_badge(image, func) && counts_incoming(image, func)
+      })
+      .collect::<Vec<_>>();
+   one("Home count", &counts)
+}
+
+/// `(state, count) f(&Store, _)`, a badge built from the same counts as
+/// [`home_count`].
+///
+/// State 2 is a count, state 1 an unread dot. The badge is the caller of the
+/// game friend requests count which returns a count in `edx`.
+pub fn home_badge(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let game_requests = game_requests(image, friend_requests)?;
+   let badges = callers(image, game_requests)
+      .into_iter()
+      .filter(|&func| func != friend_requests && returns_badge(image, func))
+      .collect::<Vec<_>>();
+   one("Home badge", &badges)
+}
+
+/// The one call `friend_requests` makes, which counts the game friend requests.
+fn game_requests(image: &Image<'_>, friend_requests: usize) -> Found<usize> {
+   let calls = straight_calls(image, friend_requests);
+   let [(_, game_requests)] = calls[..] else {
+      return Err(format!(
+         "friend requests count at {friend_requests:#x} makes {} calls, not 1",
+         calls.len()
+      ));
+   };
+   Ok(game_requests)
+}
+
+/// Whether `func` compares a relationship type with 3, an incoming request, as
+/// it opens.
+fn counts_incoming(image: &Image<'_>, func: usize) -> bool {
+   function_code(image, func, "").is_ok_and(|code| {
+      phoenix_hook::x86::disasm(code, func, 0x80)
+         .iter()
+         .any(|line| line.text.starts_with("cmp byte ptr [") && line.text.ends_with("],3"))
+   })
+}
+
+/// Whether `func` can answer state 2 in `eax` and sets `edx` just before its
+/// epilogue.
+fn returns_badge(image: &Image<'_>, func: usize) -> bool {
+   let Ok(code) = function_code(image, func, "") else {
+      return false;
+   };
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let Some(ret) = lines.iter().position(|line| line.text == "ret") else {
+      return false;
+   };
+   let body = &lines[..ret];
+   let sets_count = body
+      .iter()
+      .rev()
+      .find(|line| !line.text.starts_with("pop ") && !line.text.starts_with("add rsp,"))
+      .is_some_and(|line| line.text.starts_with("mov edx,"));
+   sets_count && body.iter().any(|line| line.text == "mov eax,2")
+}
+
+/// The one `lea` of the UI id `id`.
+fn id_lea(image: &Image<'_>, id: &[u8]) -> Found<usize> {
+   // The ids are packed back to back without a NUL, so `literal` misses them.
+   let leas = image
+      .find_bytes(id)
+      .into_iter()
+      .flat_map(|at| lea_refs(image, at))
+      .collect::<Vec<_>>();
+   one(&format!("{} lea", String::from_utf8_lossy(id)), &leas)
+}
+
+/// The site and callee of the `call` that draws the badge with id `id`, the
+/// first after the `lea` of the id.
+fn badge_call(image: &Image<'_>, id: &[u8]) -> Found<(usize, usize)> {
+   let lea = id_lea(image, id)?;
+   calls_in(image, lea, 0x40).first().copied().ok_or_else(|| {
+      format!(
+         "no call follows the {} lea at {lea:#x}",
+         String::from_utf8_lossy(id)
+      )
+   })
+}
+
+/// Follows the count argument of the `call` at `site` back through register
+/// copies to the call that returned it in `eax`.
+fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
+   let func = image
+      .function_containing(site)
+      .ok_or_else(|| format!("badge call at {site:#x} is in no function"))?;
+   let code = image
+      .read(func, site - func)
+      .ok_or_else(|| format!("DM list at {func:#x} is unmapped"))?;
+   let lines = phoenix_hook::x86::disasm(code, func, usize::MAX);
+   let mut reg = reg32_name(Abi::of(image).arg(3));
+   for (at, line) in lines.iter().enumerate().rev() {
+      let Some(source) = line.text.strip_prefix(&format!("mov {reg},")) else {
+         continue;
+      };
+      if source != "eax" {
+         if source.contains('[') {
+            return Err(format!(
+               "the friends badge count is loaded from memory at {:#x}",
+               line.addr
+            ));
+         }
+         source.clone_into(&mut reg);
+         continue;
+      }
+      // Win64 pads calls that can unwind with a `nop`.
+      let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
+      return match before {
+         Some(call) if call.text.starts_with("call ") => {
+            call
+               .target
+               .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
+         },
+         _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
+      };
+   }
+   Err(format!("the badge call at {site:#x} has no count source"))
+}
+
+/// The 32-bit name of a 64-bit general register, as the disassembly prints it.
+fn reg32_name(register: Register) -> String {
+   let name = reg_name(register);
+   match name.strip_prefix('r') {
+      Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => format!("{name}d"),
+      Some(rest) => format!("e{rest}"),
+      None => name,
+   }
+}
+
+/// The `jmp [rip]` and 8-byte target [`Image::hook_entry`] writes.
+const ENTRY_JUMP_LEN: usize = 14;
+
+/// The whole instructions opening `func` that an absolute jump covers, for a
+/// hook on a function no fixed prologue describes.
+pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
+   let head = image
+      .read(func, 32)
+      .ok_or_else(|| format!("{func:#x} is unmapped"))?;
+   let mut len = 0;
+   for line in phoenix_hook::x86::disasm(head, func, head.len()) {
+      len += line.len;
+      if len < ENTRY_JUMP_LEN {
+         continue;
+      }
+      if !phoenix_hook::x86::relocatable(&head[..len], func) {
+         return Err(format!("{func:#x} opens with code that cannot move"));
+      }
+      let hex = head[..len]
+         .iter()
+         .map(|byte| format!("{byte:02X}"))
+         .collect::<Vec<_>>()
+         .join(" ");
+      let pattern = Pattern::leak(hex).ok_or("prologue bytes make no pattern")?;
+      return Ok(Prologue { pattern, len });
+   }
+   Err(format!("{func:#x} opens with less than a jump's bytes"))
+}
+
+/// Settings page 24's sidebar name, `Phoenix`, and the `PHOENIX` that ends
+/// its id, both relabeled in place.
 #[derive(Clone, Copy, Debug)]
 pub struct SettingsLabel {
    pub name: usize,
@@ -987,11 +1241,24 @@ pub struct SettingsLabel {
 }
 
 /// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
-/// then a load of the id. COFF builds keep the two as one literal,
-/// `PhoenixDESKTOP_PHOENIX`; ELF builds place them apart.
+/// then a load of the id.
+///
+/// The id is `DESKTOP_PHOENIX` through Linux build 2233 and `PHOENIX` after
+/// it. COFF builds keep name and id as one literal, `PhoenixDESKTOP_PHOENIX`;
+/// ELF builds place them apart.
 pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
    const NAME: &[u8] = b"Phoenix";
-   let ids = image.find_bytes(b"DESKTOP_PHOENIX");
+   const ID: &[u8] = b"PHOENIX";
+   const PREFIX: &[u8] = b"DESKTOP_";
+   let suffixes = image.find_bytes(ID);
+   let ids: Vec<usize> = suffixes
+      .iter()
+      .filter_map(|&suffix| {
+         let start = suffix.checked_sub(PREFIX.len())?;
+         (image.read(start, PREFIX.len())? == PREFIX).then_some(start)
+      })
+      .chain(suffixes.iter().copied())
+      .collect();
    let mut found: Vec<(usize, usize)> = lea_refs_many(image, &ids)
       .into_iter()
       .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
@@ -1002,7 +1269,12 @@ pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
             .windows(3)
             .rposition(|w| w == lea_rip(Register::RAX))?;
          let name = rel32_target(image, start + at + 3)?;
-         (image.read(name, NAME.len())? == NAME).then_some((name, id))
+         let suffix = if image.read(id, ID.len())? == ID {
+            id
+         } else {
+            id + PREFIX.len()
+         };
+         (image.read(name, NAME.len())? == NAME).then_some((name, suffix))
       })
       .collect();
    found.sort_unstable();
@@ -1059,6 +1331,7 @@ pub fn settings_section(image: &Image<'_>) -> Found<Section> {
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
+#[derive(Debug, Clone)]
 pub struct Gpui {
    /// The `Location` `div_new` takes, a static in `.rdata`.
    pub caller_loc:       usize,
@@ -1364,7 +1637,6 @@ fn debug_offsets(image: &Image<'_>, func: usize, depth: usize) -> HashMap<String
 
 /// `<StyleRefinement as Debug>::fmt`, the one loader of a `StyleRefinement`
 /// literal that prints `text`, `padding` and `gap`.
-#[expect(clippy::too_many_lines, reason = "one line per decoded field")]
 fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
    let leas = string_leas(image, &[b"StyleRefinement"]);
    let mut funcs: Vec<usize> = leas
@@ -1389,6 +1661,15 @@ fn style_offsets(image: &Image<'_>, bytes: usize) -> Found<StyleOffsets> {
          found.len()
       ));
    };
+   style_from_fields(fields, bytes)
+}
+
+/// [`StyleOffsets`] from `StyleRefinement`'s fields by name, as either
+/// architecture's `Debug` reader returns them, checked against its size.
+pub(crate) fn style_from_fields(
+   fields: &HashMap<String, usize>,
+   bytes: usize,
+) -> Found<StyleOffsets> {
    let get = |name: &str| -> Found<usize> {
       fields
          .get(name)
@@ -1765,7 +2046,9 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
       .find(|disp| (0x100..=0x800).contains(disp))
       .ok_or("message body id load not found")?;
    // Three `mov r32, imm32` with consecutive `RowColors` field offsets
-   // `+0xc`, `+0x8` and `+0x4`.
+   // `+0xc`, `+0x8` and `+0x4`. Newer builds take `lea r64, [arg1 + RowColors]`
+   // and pick the fields with `push imm8; pop`.
+   let arg1 = number(Abi::of(image).arg(1));
    let row_colors_offset = head
       .windows(15)
       .enumerate()
@@ -1777,6 +2060,11 @@ pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> 
             imm32(image, func + at + 11)?,
          );
          (a == c + 4 && c == d + 4 && (0x100..=0x400).contains(&d)).then(|| d - 4)
+      })
+      .or_else(|| {
+         mem_operands(head, 0x8D)
+            .find(|&(_, base, disp)| base == arg1 && (0x100..=0x400).contains(&disp))
+            .map(|(_, _, disp)| disp)
       })
       .ok_or("message body row colors not found")?;
    Ok(MessageBody {
@@ -3155,10 +3443,10 @@ pub fn message_context_menu(image: &Image<'_>) -> Found<MessageContextMenu> {
       ));
    }
 
-   // Right after `MessageContextMenu`'s anchor call, the 4th call computes
-   // message permissions and reads `&message.channel_id` into its second
-   // argument, `lea arg1, [msg + disp32]`.
-   let post_anchor_calls = calls_in(image, anchor_lea, 0x80);
+   // Soon after `MessageContextMenu`'s anchor call, a call computes message
+   // permissions and reads `&message.channel_id` into its second argument,
+   // `lea arg1, [msg + disp32]`, as far as anchor + 0x7D on Linux.
+   let post_anchor_calls = calls_in(image, anchor_lea, 0xC0);
    let channel_id_offset = post_anchor_calls
       .iter()
       .find_map(|&(_, callee)| {
@@ -3528,14 +3816,15 @@ pub fn modal(image: &Image<'_>, div_into_any: usize, div: &DivLayout) -> Found<M
 
    // `Div::id` is the first call after `lea` of `"game-server-shop-carousel"`,
    // checking `ElementId::None` in `Interactivity` (`cmp byte ptr [rcx +
-   // disp32], 0xff`). Builds from 2026-11 keep a second copy of the string
-   // that other code loads as a first argument.
-   // `Div::id(div, id)` takes the id string as its third argument.
+   // disp32], 0xff`).
+   // `Div::id(div, id)` takes the id string as its third argument. The
+   // string has more than one copy (two on 1.0.9269), and only one of them
+   // is loaded there.
    let abi = Abi::of(image);
    let carousel_leas: Vec<usize> = image
       .find_bytes(b"game-server-shop-carousel")
       .into_iter()
-      .flat_map(&leas_of)
+      .flat_map(leas_of)
       .filter(|&lea| image.read(lea, 3) == Some(&lea_rip(abi.arg(2))[..]))
       .collect();
    let carousel_lea = one("game-server-shop-carousel load", &carousel_leas)?;
@@ -3597,13 +3886,13 @@ pub struct WaylandFrame {
 
 /// Locates [`WaylandFrame`] from `frame`'s start and the `request_frame` that
 /// moves `status` from idle to requested and pings, on System V builds.
+///
+/// `frame` loads `force_render` with the first `movzx r8d, byte [state +
+/// disp32]`, whose state register changed from r13 to r12 after build 2233.
 pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
    const FRAME: Pattern = Pattern::new(
-      "55 41 57 41 56 41 55 41 54 53 48 81 EC ?? ?? ?? ?? 48 8B 6F 10 C6 45 10 01 4C 8B 2F 49 83 \
-       7D 10 00 0F 85 ?? ?? ?? ?? 41 C6 85 ?? ?? ?? ?? 00 41 80 BD ?? ?? ?? ?? 02 0F 93 C0 4C 8B \
-       67 08 49 83 7C 24 10 00 0F 85 ?? ?? ?? ?? 45 0F B6 85",
+      "55 41 57 41 56 41 55 41 54 53 48 81 EC ?? ?? ?? ?? 48 8B 6F 10 C6 45 10 01 4C 8B",
    );
-   const FRAME_LEN: usize = 78;
    /// `status` at +0x10, idle 7 to requested 5, `requested` at +0x20 set to
    /// `Instant::now()`, then a tail call to `Ping::ping(&self.ping)` at +0x18.
    const REQUEST: Pattern = Pattern::new(
@@ -3613,8 +3902,15 @@ pub fn wayland_frame(image: &Image<'_>) -> Found<WaylandFrame> {
    );
    const REQUEST_LEN: usize = 71;
    let frame = one("Wayland frame", &image.scan(FRAME))?;
-   let force_render =
-      imm32(image, frame + FRAME_LEN).ok_or("Wayland frame force_render did not decode")?;
+   let force_render = image
+      .read(frame, 0x80)
+      .and_then(|code| {
+         phoenix_hook::x86::disasm(code, frame, 24)
+            .into_iter()
+            .find(|line| line.text.starts_with("movzx r8d,byte ptr ["))
+      })
+      .and_then(|line| imm32(image, line.addr + line.len - 4))
+      .ok_or("Wayland frame force_render did not decode")?;
    let request = one("Wayland request_frame", &image.scan(REQUEST))?;
    let ping = rel32_target(image, request + REQUEST_LEN)
       .and_then(|slot| image.read_usize(slot))
@@ -4087,6 +4383,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
    const READ_PANIC: &[u8] = b"readmana_gpui::components::rich_text::state::RichTextState";
    const TEXT_INPUT_TYPE: &[u8] = b"mana_html::hosted::text_input::TextInput";
    const TEXT_AREA_TYPE: &[u8] = b"mana_html::hosted::text_area::TextArea";
+   const LOCK_DEC: [u8; 4] = [0xF0, 0x48, 0xFF, 0x08];
 
    let abi = Abi::of(image);
    let (ctor_single, ctor_multi, inner_a) = field_state_new(image, abi)?;
@@ -4236,6 +4533,15 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
          .iter()
          .any(|load| code.windows(load.len()).any(|w| w == load.as_slice()))
    };
+   // ELF repeats the store on the unwind path.
+   let cleared_slots = |body: &[u8]| {
+      let mut stores = none_stores(body);
+      if stores.is_empty() {
+         stores = none_stores_through(body);
+      }
+      stores.dedup();
+      stores
+   };
    let set_value_hits: Vec<(usize, &Vec<(usize, usize)>)> = c_calls
       .iter()
       .filter(|(func, calls)| {
@@ -4256,49 +4562,82 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
          let Some(body) = image.read(start, end - start) else {
             return false;
          };
-         // ELF repeats the store on the unwind path.
-         let mut stores = none_stores(body);
-         stores.dedup();
+         let stores = cleared_slots(body);
          stores.len() == 1 && loads_len(body)
       })
       .map(|(f, calls)| (*f, calls))
       .collect();
-   if set_value_hits.len() != 1 {
+   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
+   // FF 08`), or, where the drop is outlined, tail-jumped to after it at the
+   // end of the `SharedString` drop's own tail jump.
+   let outlined_drop_slow = |drop: usize| {
+      let tail = |func: usize| {
+         let (start, end) = image
+            .function_bounds(func)
+            .filter(|&(start, end)| end - start <= 0x20)?;
+         let body = image.read(start, end - start)?;
+         let target = phoenix_hook::x86::disasm(body, start, usize::MAX)
+            .into_iter()
+            .filter_map(|line| jump_target(image, image.read(line.addr, line.len)?, line.addr))
+            .find(|&target| !(start..end).contains(&target))?;
+         Some((body, target))
+      };
+      let (_, inner) = tail(drop)?;
+      let (body, target) = tail(inner)?;
+      body.windows(4).any(|w| w == LOCK_DEC).then_some(target)
+   };
+   let set_value_callees = |sv_calls: &[(usize, usize)]| -> Found<(usize, bool, usize)> {
+      let inline = sv_calls.iter().find_map(|&(site, callee)| {
+         let before = image.read(site.saturating_sub(24), 24)?;
+         before.windows(4).any(|w| w == LOCK_DEC).then_some(callee)
+      });
+      let arc_drop_slow = inline
+         .or_else(|| {
+            sv_calls
+               .iter()
+               .find_map(|&(_, callee)| outlined_drop_slow(callee))
+         })
+         .ok_or("Arc<str>::drop_slow not found in FieldState::set_value")?;
+
+      // `update_entity_dyn` is called in `set_value` right after the name's
+      // length and begins with `inc qword ptr [arg0 + disp32]`.
+      let update_entity_dyn = sv_calls
+         .iter()
+         .find_map(|&(site, callee)| {
+            if !loads_len(image.read(site.saturating_sub(32), 32)?) {
+               return None;
+            }
+            let head = image.read(callee, 0x40)?;
+            head
+               .windows(3)
+               .any(|w| w == inc_disp32(abi.arg(0)))
+               .then_some(callee)
+         })
+         .ok_or("App::update_entity_dyn not found in FieldState::set_value")?;
+      Ok((arc_drop_slow, inline.is_some(), update_entity_dyn))
+   };
+   // ELF can keep two copies of `set_value` from different codegen units,
+   // one with its drops outlined, each calling its own `Arc<str>::drop_slow`.
+   let resolved = set_value_hits
+      .iter()
+      .map(|&(func, calls)| Ok((func, set_value_callees(calls)?)))
+      .collect::<Found<Vec<(usize, (usize, bool, usize))>>>()?;
+   let Some(&(set_value, (arc_drop_slow, _, update_entity_dyn))) = resolved
+      .iter()
+      .find(|(_, (_, inline, _))| *inline)
+      .or_else(|| resolved.first())
+   else {
+      return Err("FieldState::set_value matched 0 functions".to_owned());
+   };
+   if resolved
+      .iter()
+      .any(|&(_, (_, _, found))| found != update_entity_dyn)
+   {
       return Err(format!(
-         "FieldState::set_value matched {} functions",
-         set_value_hits.len()
+         "FieldState::set_value matched {} functions that disagree",
+         resolved.len()
       ));
    }
-   let (set_value, sv_calls) = set_value_hits[0];
-
-   // `arc_drop_slow` is called right after `lock dec qword ptr [rax]` (`F0 48
-   // FF 08`).
-   let arc_drop_slow = sv_calls
-      .iter()
-      .find_map(|&(site, callee)| {
-         let before = image.read(site.saturating_sub(24), 24)?;
-         before
-            .windows(4)
-            .any(|w| w == [0xF0, 0x48, 0xFF, 0x08])
-            .then_some(callee)
-      })
-      .ok_or("Arc<str>::drop_slow not found in FieldState::set_value")?;
-
-   // `update_entity_dyn` is called in `set_value` right after the name's
-   // length and begins with `inc qword ptr [arg0 + disp32]`.
-   let update_entity_dyn = sv_calls
-      .iter()
-      .find_map(|&(site, callee)| {
-         if !loads_len(image.read(site.saturating_sub(32), 32)?) {
-            return None;
-         }
-         let head = image.read(callee, 0x40)?;
-         head
-            .windows(3)
-            .any(|w| w == inc_disp32(abi.arg(0)))
-            .then_some(callee)
-      })
-      .ok_or("App::update_entity_dyn not found in FieldState::set_value")?;
 
    // Several hosted elements share `HOSTED_NEW`, so each is the one that fills
    // its own size.
@@ -4355,7 +4694,7 @@ pub fn text_fields(image: &Image<'_>) -> Found<TextFields> {
 
    // `FieldState::new` ends by writing `None` into its three
    // `Option<SharedString>`s; the one `set_value` clears is the pending value.
-   let pending_value = none_stores(function_code(image, set_value, "FieldState::set_value")?)[0];
+   let pending_value = cleared_slots(function_code(image, set_value, "FieldState::set_value")?)[0];
    let slots = field_slots(image, inner_a)
       .filter(|slots| slots.contains(&pending_value))
       .ok_or("FieldState::new no longer clears three SharedString slots")?;
@@ -4467,12 +4806,9 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
    Ok(func)
 }
 
-/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
-///
-/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
-/// and the desktop runtime hooks the function to unwrap custom badge icon
-/// URLs (`/badge-icons/phx_u_<hex>`).
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+/// The `tracing::Callsite` static naming `"media_fetch"` /
+/// `"libdiscord_media::fetch"`, the same data on every platform.
+pub(crate) fn media_fetch_callsite(image: &Image<'_>) -> Found<usize> {
    let name = one(
       "media_fetch tracing name",
       &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
@@ -4504,8 +4840,16 @@ pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
          pos = off + 8;
       }
    }
-   let callsite = one("media_fetch callsite", &callsites)?;
+   one("media_fetch callsite", &callsites)
+}
 
+/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
+///
+/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
+/// and the desktop runtime hooks the function to unwrap custom badge icon
+/// URLs (`/badge-icons/phx_u_<hex>`).
+pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
+   let callsite = media_fetch_callsite(image)?;
    let mut funcs: Vec<usize> = lea_refs(image, callsite)
       .into_iter()
       .filter_map(|site| Some(image.function_bounds(site)?.0))
@@ -4610,6 +4954,60 @@ fn rip_leas(code: &[u8], addr: usize) -> impl Iterator<Item = (usize, usize)> + 
          (addr + pos + 6).checked_add_signed(disp as isize)?,
       ))
    })
+}
+
+/// Mana's icon names in id order: a `MenuItem`'s icon is the index of its
+/// name in this list.
+///
+/// The icon table pairs each name with `icons/<Name>.svg`; the paths are read
+/// in a run from `icons/A.svg`, and the ids are their names sorted, which
+/// Discord's own menu icons (`Copy` 0x99, `Id` 0x15b, `Link` 0x177, `Trash`
+/// 0x280 on 2026-11 builds) confirm.
+pub fn icon_names(image: &Image<'_>) -> Found<Vec<String>> {
+   /// How far apart two paths in the table may sit, a name between them.
+   const GAP: usize = 128;
+   let start = image
+      .find_bytes_iter(b"icons/A.svg")
+      .next()
+      .ok_or("icon table not found")?;
+   let mut names = Vec::new();
+   let mut at = start;
+   while let Some(window) = image.read(at, GAP) {
+      let Some(path) = window.windows(6).position(|w| w == b"icons/") else {
+         break;
+      };
+      let Some(rest) = image.read(at + path + 6, GAP) else {
+         break;
+      };
+      let Some(end) = rest.windows(4).position(|w| w == b".svg") else {
+         break;
+      };
+      let Ok(name) = std::str::from_utf8(&rest[..end]) else {
+         break;
+      };
+      at += path + 6 + end + 4;
+      // `Name.secondary.svg` is a second layer of `Name`, with no id.
+      if name.contains('.') {
+         continue;
+      }
+      if !name.bytes().all(|byte| byte.is_ascii_alphanumeric())
+         || (name == "A" && !names.is_empty())
+      {
+         break;
+      }
+      names.push(name.to_owned());
+   }
+   names.sort_unstable();
+   names.dedup();
+   let has = |name: &str| {
+      names
+         .binary_search_by(|probe| probe.as_str().cmp(name))
+         .is_ok()
+   };
+   if names.len() < 100 || !["Copy", "Id", "Link", "Trash"].into_iter().all(has) {
+      return Err(format!("icon table holds {} names", names.len()));
+   }
+   Ok(names)
 }
 
 #[cfg(test)]

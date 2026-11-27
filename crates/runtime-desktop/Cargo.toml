@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
-[target.'cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
+[target.'cfg(any(windows, target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 flub               = { workspace = true }
 log                = { workspace = true }
 phoenix-hook       = { workspace = true }
@@ -16,7 +16,7 @@ rquickjs           = { workspace = true }
 serde              = { workspace = true }
 serde_json         = { workspace = true }
 
-[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+[target.'cfg(any(target_os = "macos", all(target_os = "linux", target_arch = "x86_64")))'.dependencies]
 libc = { workspace = true }
 
 [lints]

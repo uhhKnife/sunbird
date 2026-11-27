@@ -623,6 +623,48 @@ impl From<RawNode> for Node {
    }
 }
 
+/// View props that trigger native haptic feedback on mobile views.
+const HAPTIC_PROPS: [Prop; 6] = [
+   prop!("haptic"),
+   prop!("haptics"),
+   prop!("longPressHaptic"),
+   prop!("startHaptic"),
+   prop!("stepHaptic"),
+   prop!("dropHaptic"),
+];
+
+/// Suppresses haptic props in `ops`.
+///
+/// Boolean `true` becomes `false` so native defaults stay off without changing
+/// the wire type, and non-boolean haptic values are removed. Returns whether
+/// any op changed.
+pub fn strip_haptic_props(ops: &mut [Op]) -> bool {
+   let mut changed = false;
+   for op in ops {
+      let (Op::Create { props, .. } | Op::Update { props, .. }) = op else {
+         continue;
+      };
+      props.retain_mut(|(key, value)| {
+         if !HAPTIC_PROPS.contains(key) {
+            return true;
+         }
+         match value {
+            Value::Bool(false) | Value::Null => true,
+            Value::Bool(true) => {
+               *value = Value::Bool(false);
+               changed = true;
+               true
+            },
+            _ => {
+               changed = true;
+               false
+            },
+         }
+      });
+   }
+   changed
+}
+
 pub fn templates() -> &'static Templates {
    static TEMPLATES: OnceLock<Templates> = OnceLock::new();
    TEMPLATES.get_or_init(|| {
@@ -648,4 +690,59 @@ pub fn templates() -> &'static Templates {
             .unwrap_or_else(|err| panic!("templates.json knobWorklet: {err}")),
       }
    })
+}
+
+#[cfg(test)]
+mod tests {
+   use super::*;
+
+   #[test]
+   fn strip_haptic_props_disables_bool_and_drops_typed_values() {
+      let mut ops = vec![
+         Op::Create {
+            id:    1,
+            kind:  ViewKind::View,
+            props: vec![
+               (Prop::TEXT, Value::Str("hi".into())),
+               (prop!("haptic"), Value::Str("light".into())),
+               (prop!("haptics"), Value::Bool(true)),
+               (prop!("longPressHaptic"), Value::Str("heavy".into())),
+            ],
+         },
+         Op::Update {
+            id:    2,
+            props: vec![
+               (prop!("startHaptic"), Value::Bool(true)),
+               (prop!("stepHaptic"), Value::Str("tick".into())),
+               (prop!("dropHaptic"), Value::Bool(false)),
+            ],
+         },
+      ];
+
+      assert!(strip_haptic_props(&mut ops));
+
+      let decoded = decode(&encode(&ops)).expect("re-encoded batch decodes");
+      assert_eq!(
+         decoded,
+         vec![
+            Op::Create {
+               id:    1,
+               kind:  ViewKind::View,
+               props: vec![
+                  (Prop::TEXT, Value::Str("hi".into())),
+                  (prop!("haptics"), Value::Bool(false)),
+               ],
+            },
+            Op::Update {
+               id:    2,
+               props: vec![
+                  (prop!("startHaptic"), Value::Bool(false)),
+                  (prop!("dropHaptic"), Value::Bool(false)),
+               ],
+            },
+         ]
+      );
+      // second pass is a no-op so batches without active haptics are not re-encoded
+      assert!(!strip_haptic_props(&mut ops));
+   }
 }

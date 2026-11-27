@@ -35,11 +35,16 @@ pub struct Response {
 
 /// The body of a 2xx answer to a GET.
 pub fn get(url: &str) -> Result<Vec<u8>, FetchError> {
+   get_with(url, Vec::new())
+}
+
+/// [`get`] with request headers.
+pub fn get_with(url: &str, headers: Vec<(String, String)>) -> Result<Vec<u8>, FetchError> {
    let response = send(&Request {
-      url:     url.to_owned(),
-      method:  "GET".to_owned(),
-      headers: Vec::new(),
-      body:    None,
+      url: url.to_owned(),
+      method: "GET".to_owned(),
+      headers,
+      body: None,
    })?;
    if !(200..300).contains(&response.status) {
       return Err(FetchError::Status {

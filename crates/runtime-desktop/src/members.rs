@@ -193,6 +193,11 @@ pub fn install(image: &Image<'static>) {
    }
    // Without it, decorations show their text instead of icons.
    gpui::locate_svg(image);
+   if !crate::X86_CODE {
+      #[cfg(target_os = "macos")]
+      arm64::install(image);
+      return;
+   }
    match desktop::member_row(image) {
       Ok(row) => install_name(image, &row.name),
       Err(err) => log::warn!("desktop members: {err}, skipping"),
@@ -354,4 +359,244 @@ fn lines_for(user_id: u64) -> Option<Vec<gpui::Piece>> {
       .map(RenderedAccessory::piece)
       .collect::<Vec<_>>();
    (!lines.is_empty()).then_some(lines)
+}
+
+#[cfg(target_os = "macos")]
+mod arm64 {
+   use std::cell::Cell;
+
+   use super::{
+      AtomicUsize,
+      DM_LEAD,
+      Image,
+      MEMBERS,
+      NameChildFn,
+      OnceLock,
+      Ordering,
+      c_void,
+      decorate,
+   };
+
+   type DmRowFn = unsafe extern "C" fn(
+      *mut c_void,
+      *mut c_void,
+      *const u8,
+      *mut c_void,
+      *mut c_void,
+   ) -> *mut c_void;
+   type DmNameBoxFn =
+      unsafe extern "C" fn(*mut c_void, usize, usize, usize, usize, usize, usize) -> *mut c_void;
+
+   static ORIG_MEMBER_NAME: OnceLock<NameChildFn> = OnceLock::new();
+   static MEMBER_ENV_USER_ID: AtomicUsize = AtomicUsize::new(0);
+
+   static ORIG_DM_ROW: OnceLock<DmRowFn> = OnceLock::new();
+   static ORIG_DM_NAME_BOX: OnceLock<DmNameBoxFn> = OnceLock::new();
+   static ORIG_DIV_CHILD_ANY: OnceLock<NameChildFn> = OnceLock::new();
+   static DM_PROPS_SOME: AtomicUsize = AtomicUsize::new(0);
+   static DM_PROPS_USER: AtomicUsize = AtomicUsize::new(0);
+
+   thread_local! {
+      static ACTIVE_DM_USER: Cell<u64> = const { Cell::new(0) };
+      static LAST_DM_NAME_PTR: Cell<usize> = const { Cell::new(0) };
+   }
+
+   /// Hooks the member name closure and the DM row name box on macOS arm64.
+   pub fn install(image: &Image<'static>) {
+      match phoenix_sigs::macos::member_row(image) {
+         Ok(row) => install_member(image, row),
+         Err(err) => log::warn!("desktop members: {err}, skipping"),
+      }
+      match phoenix_sigs::macos::dm_row(image) {
+         Ok(row) => install_dm(image, row),
+         Err(err) => log::warn!("desktop members: {err}, skipping the DM list"),
+      }
+   }
+
+   fn install_member(image: &Image<'static>, row: phoenix_sigs::macos::MemberRow) {
+      MEMBER_ENV_USER_ID.store(row.env_user_id, Ordering::Release);
+      // SAFETY: called from `prepare` before Discord threads run;
+      // `member_name_detour` matches the closure's x86-style sret ABI.
+      if let Some(orig) = unsafe {
+         crate::hook_sret::<NameChildFn>(
+            image,
+            |pro| pro.frame,
+            row.name_closure,
+            member_name_detour as *const () as usize,
+            "desktop members: member name hook failed",
+         )
+      } {
+         let _ = ORIG_MEMBER_NAME.set(orig);
+         log::info!(
+            "desktop members: hooked member name closure @ {:#x} (env +{:#x})",
+            row.name_closure,
+            row.env_user_id
+         );
+      }
+   }
+
+   fn install_dm(image: &Image<'static>, row: phoenix_sigs::macos::DmRow) {
+      DM_PROPS_SOME.store(row.props_some, Ordering::Release);
+      DM_PROPS_USER.store(row.props_user, Ordering::Release);
+      // SAFETY: called from `prepare` before Discord threads run; each detour
+      // matches its target's x86-style sret ABI.
+      let hooked = unsafe {
+         let Some(orig_row) = crate::hook_sret::<DmRowFn>(
+            image,
+            |pro| pro.frame,
+            row.func,
+            dm_row_detour as *const () as usize,
+            "desktop members: DM row hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DM_ROW.set(orig_row);
+         let Some(orig_box) = crate::hook_sret::<DmNameBoxFn>(
+            image,
+            |pro| pro.frame,
+            row.name_box,
+            dm_name_box_detour as *const () as usize,
+            "desktop members: DM name box hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DM_NAME_BOX.set(orig_box);
+         let Some(orig_child) = crate::hook_sret::<NameChildFn>(
+            image,
+            |pro| pro.frame,
+            row.div_child_any,
+            div_child_any_detour as *const () as usize,
+            "desktop members: DM child hook failed",
+         ) else {
+            return;
+         };
+         let _ = ORIG_DIV_CHILD_ANY.set(orig_child);
+         true
+      };
+      if hooked {
+         log::info!(
+            "desktop members: hooked DM row @ {:#x} (name_box {:#x}, child {:#x})",
+            row.func,
+            row.name_box,
+            row.div_child_any
+         );
+      }
+   }
+
+   unsafe extern "C" fn member_name_detour(
+      out: *mut c_void,
+      row: *mut c_void,
+      env: *mut c_void,
+   ) -> *mut c_void {
+      let Some(orig) = ORIG_MEMBER_NAME.get().copied() else {
+         return out;
+      };
+      // SAFETY: forwards `member_name`'s own arguments.
+      let result = unsafe { orig(out, row, env) };
+      if !MEMBERS.active() || result.is_null() || env.is_null() {
+         return result;
+      }
+      // SAFETY: `env` holds a pointer to the member's `u64` user id at the
+      // decoded offset.
+      let user_id = unsafe {
+         let id_ptr = env
+            .cast::<u8>()
+            .add(MEMBER_ENV_USER_ID.load(Ordering::Relaxed))
+            .cast::<*const u64>()
+            .read_unaligned();
+         if id_ptr.is_null() {
+            return result;
+         }
+         id_ptr.read_unaligned()
+      };
+      decorate(result, user_id, 0.0);
+      result
+   }
+
+   unsafe extern "C" fn dm_row_detour(
+      out: *mut c_void,
+      a0: *mut c_void,
+      props: *const u8,
+      a2: *mut c_void,
+      a3: *mut c_void,
+   ) -> *mut c_void {
+      let Some(orig) = ORIG_DM_ROW.get().copied() else {
+         return out;
+      };
+      let user_id = if MEMBERS.active() && !props.is_null() {
+         // SAFETY: `props` holds the recipient's `Option<UserId>` at the
+         // decoded offsets; `some == 0` for group DMs.
+         unsafe {
+            let some = props
+               .add(DM_PROPS_SOME.load(Ordering::Relaxed))
+               .cast::<u64>()
+               .read_unaligned();
+            if some != 0 {
+               props
+                  .add(DM_PROPS_USER.load(Ordering::Relaxed))
+                  .cast::<u64>()
+                  .read_unaligned()
+            } else {
+               0
+            }
+         }
+      } else {
+         0
+      };
+      let prev_user = ACTIVE_DM_USER.replace(user_id);
+      let prev_ptr = LAST_DM_NAME_PTR.replace(0);
+      // SAFETY: forwards `dm_row`'s own arguments.
+      let res = unsafe { orig(out, a0, props, a2, a3) };
+      ACTIVE_DM_USER.set(prev_user);
+      LAST_DM_NAME_PTR.set(prev_ptr);
+      res
+   }
+
+   unsafe extern "C" fn dm_name_box_detour(
+      out: *mut c_void,
+      a0: usize,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+   ) -> *mut c_void {
+      let Some(orig) = ORIG_DM_NAME_BOX.get().copied() else {
+         return out;
+      };
+      // SAFETY: forwards `dm_name_box`'s own arguments.
+      let res = unsafe { orig(out, a0, a1, a2, a3, a4, a5) };
+      if ACTIVE_DM_USER.get() != 0 && !res.is_null() {
+         // SAFETY: `res` is the initialized `AnyElement` whose leading word is
+         // its unique `Box<dyn Element>` heap pointer.
+         let ptr = unsafe { res.cast::<usize>().read_unaligned() };
+         LAST_DM_NAME_PTR.set(ptr);
+      }
+      res
+   }
+
+   unsafe extern "C" fn div_child_any_detour(
+      out: *mut c_void,
+      div: *mut c_void,
+      child: *mut c_void,
+   ) -> *mut c_void {
+      let Some(orig) = ORIG_DIV_CHILD_ANY.get().copied() else {
+         return out;
+      };
+      let want = LAST_DM_NAME_PTR.get();
+      let matched = want != 0
+         && !child.is_null()
+         // SAFETY: `child` is a live `&AnyElement` passed to `Div::child`.
+         && unsafe { child.cast::<usize>().read_unaligned() } == want;
+      if matched {
+         LAST_DM_NAME_PTR.set(0);
+      }
+      // SAFETY: forwards `Div::child`'s own arguments.
+      let row = unsafe { orig(out, div, child) };
+      if matched && !row.is_null() {
+         let user_id = ACTIVE_DM_USER.get();
+         decorate(row, user_id, DM_LEAD);
+      }
+      row
+   }
 }

@@ -38,6 +38,7 @@ use phoenix_runtime::highlight::{
 };
 use phoenix_sigs::desktop::{
    self,
+   Dismiss,
    FieldLayout,
    ModalLayout,
    layout,
@@ -127,6 +128,8 @@ pub struct PageModalSpec {
 pub struct Choice {
    picked: Mutex<Option<i32>>,
    done:   Condvar,
+   #[cfg(target_os = "macos")]
+   panel_id: OnceLock<u64>,
 }
 
 impl Choice {
@@ -134,6 +137,8 @@ impl Choice {
       Self {
          picked: Mutex::new(None),
          done:   Condvar::new(),
+         #[cfg(target_os = "macos")]
+         panel_id: OnceLock::new(),
       }
    }
 
@@ -745,15 +750,15 @@ unsafe extern "C" fn modal_button_callback(
             };
             let url = raw.trim().to_owned();
             if url.is_empty() {
-               set_install_status("Enter an https:// URL ending in .js", true, false);
+               set_install_status("Enter an https:// link to a plugin .js file", true, false);
                return;
             }
             set_install_status("Downloading and installing plugin...", false, true);
             std::thread::spawn(move || {
                match phoenix_runtime::install(&url) {
-                  Ok(name) => {
+                  Ok(installed) => {
                      close_active();
-                     phoenix_ui_desktop::toast(&format!("Installed {name}"));
+                     phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
                      set_install_status(&format!("{err}"), true, false);
@@ -769,13 +774,128 @@ unsafe extern "C" fn modal_button_callback(
 // Public API
 // ---------------------------------------------------------------------------
 
+/// macOS draws pages and dialogs as `AppKit` windows
+/// ([`phoenix_ui_desktop::show_panel`]), since Discord's GPUI modal has no
+/// arm64 locators.
+#[cfg(target_os = "macos")]
+mod panel {
+   use std::sync::Arc;
+
+   use phoenix_ui_desktop::{
+      PanelButton,
+      PanelSection,
+      close_panel,
+      show_panel,
+   };
+
+   use super::{
+      Choice,
+      ChoiceOption,
+      ModalSection,
+      PageModalSpec,
+   };
+
+   fn section(section: ModalSection) -> PanelSection {
+      match section {
+         ModalSection::Buttons { title, buttons } => {
+            PanelSection::Buttons {
+               title,
+               buttons: buttons
+                  .into_iter()
+                  .map(|button| {
+                     PanelButton {
+                        label:    button.label,
+                        danger:   button.danger,
+                        on_press: button.on_press,
+                     }
+                  })
+                  .collect(),
+            }
+         },
+         ModalSection::Text { title, text } => PanelSection::Text { title, text },
+         ModalSection::Code {
+            title,
+            text,
+            monospace,
+            ..
+         } => {
+            PanelSection::Code {
+               title,
+               text,
+               monospace,
+            }
+         },
+      }
+   }
+
+   pub fn open(spec: PageModalSpec, on_close: Option<phoenix_ui_desktop::PanelAction>) -> u64 {
+      show_panel(
+         spec.title,
+         spec.sections.into_iter().map(section).collect(),
+         on_close,
+      )
+   }
+
+   /// A dialog whose buttons answer `choice` with their index and close it;
+   /// closing it any other way answers -1.
+   pub fn open_choice(
+      title: String,
+      body: Option<ModalSection>,
+      options: Vec<ChoiceOption>,
+      choice: &Arc<Choice>,
+   ) {
+      let id = Arc::new(std::sync::OnceLock::<u64>::new());
+      let mut sections: Vec<PanelSection> = body.into_iter().map(section).collect();
+      if !options.is_empty() {
+         let buttons = options
+            .into_iter()
+            .enumerate()
+            .map(|(index, option)| {
+               let (choice, id) = (Arc::clone(choice), Arc::clone(&id));
+               PanelButton {
+                  label:    option.label,
+                  danger:   option.danger,
+                  on_press: Arc::new(move || {
+                     choice.pick(i32::try_from(index).unwrap_or(-1));
+                     if let Some(&id) = id.get() {
+                        close_panel(id);
+                     }
+                  }),
+               }
+            })
+            .collect();
+         sections.push(PanelSection::Buttons {
+            title: None,
+            buttons,
+         });
+      }
+      let dismissed = Arc::clone(choice);
+      let panel_id = show_panel(title, sections, Some(Arc::new(move || dismissed.pick(-1))));
+      let _ = id.set(panel_id);
+      let _ = choice.panel_id.set(panel_id);
+   }
+}
+
 /// Opens a native GPUI modal for `phoenix.ui.openPage` and triggers a GPUI
 /// redraw immediately.
 pub fn open_page(spec: PageModalSpec) -> u64 {
+   if cfg!(target_os = "macos") && ORIG_OVERLAY_RENDER.get().is_none() {
+      return open_panel(spec);
+   }
    resolve_pending_choice();
    let id = NEXT_PAGE_ID.fetch_add(1, Ordering::Relaxed);
    set_active(Some(ActiveModal::Page { id, spec }));
    id
+}
+
+#[cfg(target_os = "macos")]
+fn open_panel(spec: PageModalSpec) -> u64 {
+   panel::open(spec, None)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn open_panel(_spec: PageModalSpec) -> u64 {
+   0
 }
 
 /// Replaces the active modal. `MODAL_OPEN` changes under the same lock, so a
@@ -798,6 +918,11 @@ pub fn open_choice(
    options: Vec<ChoiceOption>,
 ) -> Arc<Choice> {
    let choice = Arc::new(Choice::new());
+   #[cfg(target_os = "macos")]
+   if ORIG_OVERLAY_RENDER.get().is_none() {
+      panel::open_choice(title, body, options, &choice);
+      return choice;
+   }
    if ORIG_OVERLAY_RENDER.get().is_none() {
       choice.pick(-1);
       return choice;
@@ -862,6 +987,10 @@ pub fn ask(
 
 /// Closes `choice`'s dialog if it is still the one on screen.
 pub fn dismiss_choice(choice: &Arc<Choice>) {
+   #[cfg(target_os = "macos")]
+   if let Some(&id) = choice.panel_id.get() {
+      phoenix_ui_desktop::close_panel(id);
+   }
    finish_choice(choice, -1);
 }
 
@@ -922,6 +1051,11 @@ pub fn replace_page(id: u64, spec: PageModalSpec) -> bool {
 
 /// Closes an open page modal if its id still matches `id`.
 pub fn close_page(id: u64) {
+   #[cfg(target_os = "macos")]
+   if ORIG_OVERLAY_RENDER.get().is_none() {
+      phoenix_ui_desktop::close_panel(id);
+      return;
+   }
    let mut guard = ACTIVE_MODAL.lock().unwrap_or_else(PoisonError::into_inner);
    if matches!(&*guard, Some(ActiveModal::Page { id: cur, .. }) if *cur == id) {
       *guard = None;
@@ -1041,6 +1175,40 @@ pub fn force_redraw() {
 // Installation (`DllMain` / `crate::prepare`)
 // ---------------------------------------------------------------------------
 
+fn sret_wrap(addr: usize) -> Result<usize, &'static str> {
+   if crate::X86_CODE {
+      Ok(addr)
+   } else {
+      phoenix_hook::image::sret_caller(addr).ok_or("no memory for sret caller thunk")
+   }
+}
+
+fn set_dismiss(found: &Dismiss, interactivity: usize) {
+   // SAFETY: resolved and shape-checked against Discord by `sigs`.
+   let _ = DISMISS_SYM.set(unsafe {
+      DismissSymbols {
+         push: std::mem::transmute::<usize, ListenerPushFn>(found.listener_push),
+         is_hovered: std::mem::transmute::<usize, IsHoveredFn>(found.hitbox_is_hovered),
+         interactivity,
+         mouse_down_listeners: found.mouse_down_listeners,
+         propagate_event: found.propagate_event,
+      }
+   });
+}
+
+/// Fallback on macOS if native modal resolution fails: still resolve
+/// `mouse_down` so `rowDoubleTap` keeps working.
+#[cfg(target_os = "macos")]
+fn install_mouse_down_fallback(image: &Image<'static>, div: &desktop::DivLayout) {
+   match phoenix_sigs::macos::mouse_down(image, div) {
+      Ok(found) => {
+         set_dismiss(&found, div.interactivity);
+         log::info!("desktop mouse_down: resolved {found:x?}");
+      },
+      Err(err) => log::warn!("desktop mouse_down: {err}, rowDoubleTap disabled"),
+   }
+}
+
 /// Locates Discord's native `Modal`, `Div::id`, `TextInput`/`TextArea`, and
 /// window root render, then hooks `WindowRoot::render`.
 #[expect(clippy::too_many_lines, reason = "one symbol table per located group")]
@@ -1053,109 +1221,138 @@ pub fn install(image: &Image<'static>) {
       log::warn!("desktop modal: Div::child(AnyElement) unavailable, skipping");
       return;
    }
-   let found = match desktop::modal(image, div_into_any, &gpui_layout.div) {
+   let located = if crate::X86_CODE {
+      desktop::modal(image, div_into_any, &gpui_layout.div)
+   } else {
+      phoenix_sigs::macos::modal(image, div_into_any, &gpui_layout.div)
+   };
+   let found = match located {
       Ok(m) => m,
+      Err(err) => {
+         log::warn!("desktop modal: {err}, native modals disabled");
+         #[cfg(target_os = "macos")]
+         install_mouse_down_fallback(image, &gpui_layout.div);
+         return;
+      },
+   };
+   WINDOW_VAL_OFFSET.store(found.window_validation_offset, Ordering::Release);
+   set_dismiss(&found.dismiss, gpui_layout.div.interactivity);
+
+   let modal_sym = match (|| -> Result<ModalSymbols, &'static str> {
+      let modal_new = sret_wrap(found.modal_new)?;
+      let modal_into_any = sret_wrap(found.modal_into_any)?;
+      let modal_child_div = sret_wrap(found.modal_child_div)?;
+      let modal_footer_button = sret_wrap(found.modal_footer_button)?;
+      let div_id = sret_wrap(found.div_id)?;
+      // SAFETY: resolved and layout-verified against Discord.
+      Ok(unsafe {
+         ModalSymbols {
+            vec_push_any:        std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
+            modal_new:           std::mem::transmute::<usize, ModalNewFn>(modal_new),
+            modal_into_any:      std::mem::transmute::<usize, ModalIntoAnyFn>(modal_into_any),
+            modal_child_div:     std::mem::transmute::<usize, ModalChildDivFn>(modal_child_div),
+            modal_footer_button: std::mem::transmute::<usize, ModalFooterBtnFn>(
+               modal_footer_button,
+            ),
+            div_id:              std::mem::transmute::<usize, DivIdFn>(div_id),
+            layout:              found.layout,
+         }
+      })
+   })() {
+      Ok(sym) => sym,
       Err(err) => {
          log::warn!("desktop modal: {err}, native modals disabled");
          return;
       },
    };
-   WINDOW_VAL_OFFSET.store(found.window_validation_offset, Ordering::Release);
-   // SAFETY: resolved and shape-checked against `Discord.exe` by `sigs`.
-   let _ = DISMISS_SYM.set(unsafe {
-      DismissSymbols {
-         push:                 std::mem::transmute::<usize, ListenerPushFn>(
-            found.dismiss.listener_push,
-         ),
-         is_hovered:           std::mem::transmute::<usize, IsHoveredFn>(
-            found.dismiss.hitbox_is_hovered,
-         ),
-         interactivity:        gpui_layout.div.interactivity,
-         mouse_down_listeners: found.dismiss.mouse_down_listeners,
-         propagate_event:      found.dismiss.propagate_event,
-      }
-   });
-
-   // SAFETY: resolved and layout-verified against `Discord.exe`.
-   let modal_sym = unsafe {
-      ModalSymbols {
-         vec_push_any:        std::mem::transmute::<usize, VecPushAnyFn>(found.vec_push_any),
-         modal_new:           std::mem::transmute::<usize, ModalNewFn>(found.modal_new),
-         modal_into_any:      std::mem::transmute::<usize, ModalIntoAnyFn>(found.modal_into_any),
-         modal_child_div:     std::mem::transmute::<usize, ModalChildDivFn>(found.modal_child_div),
-         modal_footer_button: std::mem::transmute::<usize, ModalFooterBtnFn>(
-            found.modal_footer_button,
-         ),
-         div_id:              std::mem::transmute::<usize, DivIdFn>(found.div_id),
-         layout:              found.layout,
-      }
-   };
    let _ = MODAL_SYM.set(modal_sym);
 
-   match desktop::text_fields(image) {
+   let tf = if crate::X86_CODE {
+      desktop::text_fields(image)
+   } else {
+      phoenix_sigs::macos::text_fields(image)
+   };
+   match tf {
       Ok(tf) => {
-         // SAFETY: resolved and cross-checked against `Discord.exe`.
-         let sym = unsafe {
-            TextFieldSymbols {
-               cx_new_single:       std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_single),
-               cx_new_multiline:    std::mem::transmute::<usize, CxNewFieldFn>(tf.cx_new_multiline),
-               entity_map_get:      std::mem::transmute::<usize, EntityMapGetFn>(tf.entity_map_get),
-               entity_downgrade:    std::mem::transmute::<usize, EntityDowngradeFn>(
-                  tf.entity_downgrade,
-               ),
-               weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
-               text_get:            std::mem::transmute::<usize, TextGetFn>(tf.text_get),
-               set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
-               update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
-                  tf.update_entity_dyn,
-               ),
-               arc_drop_slow:       std::mem::transmute::<usize, ArcDropSlowFn>(tf.arc_drop_slow),
-               text_input_new:      std::mem::transmute::<usize, TextInputNewFn>(tf.text_input_new),
-               text_input_into_any: std::mem::transmute::<usize, TextInputIntoAnyFn>(
-                  tf.text_input_into_any,
-               ),
-               text_area_new:       std::mem::transmute::<usize, TextAreaNewFn>(tf.text_area_new),
-               text_area_into_any:  std::mem::transmute::<usize, TextAreaIntoAnyFn>(
-                  tf.text_area_into_any,
-               ),
-               layout:              tf.layout,
-            }
-         };
-         let _ = FIELD_SYM.set(sym);
-         log::info!(
-            "desktop modal: resolved native TextInput/TextArea (single={:#x}, multi={:#x}) {:x?}",
-            tf.cx_new_single,
-            tf.cx_new_multiline,
-            tf.layout,
-         );
+         let wrapped = (|| -> Result<TextFieldSymbols, &'static str> {
+            let cx_new_single = sret_wrap(tf.cx_new_single)?;
+            let cx_new_multiline = sret_wrap(tf.cx_new_multiline)?;
+            let entity_downgrade = sret_wrap(tf.entity_downgrade)?;
+            let text_get = sret_wrap(tf.text_get)?;
+            let text_input_new = sret_wrap(tf.text_input_new)?;
+            let text_input_into_any = sret_wrap(tf.text_input_into_any)?;
+            let text_area_new = sret_wrap(tf.text_area_new)?;
+            let text_area_into_any = sret_wrap(tf.text_area_into_any)?;
+            // SAFETY: resolved and cross-checked against Discord.
+            Ok(unsafe {
+               TextFieldSymbols {
+                  cx_new_single:       std::mem::transmute::<usize, CxNewFieldFn>(cx_new_single),
+                  cx_new_multiline:    std::mem::transmute::<usize, CxNewFieldFn>(cx_new_multiline),
+                  entity_map_get:      std::mem::transmute::<usize, EntityMapGetFn>(
+                     tf.entity_map_get,
+                  ),
+                  entity_downgrade:    std::mem::transmute::<usize, EntityDowngradeFn>(
+                     entity_downgrade,
+                  ),
+                  weak_drop:           std::mem::transmute::<usize, WeakDropFn>(tf.weak_drop),
+                  text_get:            std::mem::transmute::<usize, TextGetFn>(text_get),
+                  set_value:           std::mem::transmute::<usize, SetValueFn>(tf.set_value),
+                  update_entity_dyn:   std::mem::transmute::<usize, UpdateEntityDynFn>(
+                     tf.update_entity_dyn,
+                  ),
+                  arc_drop_slow:       std::mem::transmute::<usize, ArcDropSlowFn>(
+                     tf.arc_drop_slow,
+                  ),
+                  text_input_new:      std::mem::transmute::<usize, TextInputNewFn>(text_input_new),
+                  text_input_into_any: std::mem::transmute::<usize, TextInputIntoAnyFn>(
+                     text_input_into_any,
+                  ),
+                  text_area_new:       std::mem::transmute::<usize, TextAreaNewFn>(text_area_new),
+                  text_area_into_any:  std::mem::transmute::<usize, TextAreaIntoAnyFn>(
+                     text_area_into_any,
+                  ),
+                  layout:              tf.layout,
+               }
+            })
+         })();
+         match wrapped {
+            Ok(sym) => {
+               let _ = FIELD_SYM.set(sym);
+               log::info!(
+                  "desktop modal: resolved native TextInput/TextArea (single={:#x}, multi={:#x}) \
+                   {:x?}",
+                  tf.cx_new_single,
+                  tf.cx_new_multiline,
+                  tf.layout,
+               );
+            },
+            Err(err) => {
+               log::warn!("desktop modal: native TextInput/TextArea thunk failed: {err}");
+            },
+         }
       },
       Err(err) => {
          log::warn!("desktop modal: native TextInput/TextArea unavailable: {err}");
       },
    }
 
-   let pro = desktop::Prologues::of(phoenix_hook::x86::Abi::of(image)).frame;
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `overlay_render_detour` matches `Workspace::render_overlays`'s 5-arg sret
-   // ABI returning `Vec<AnyElement>`.
-   let trampoline = match unsafe {
-      image.hook_entry(
+   // ABI returning `Vec<AnyElement>` (via `sret_callee`/`sret_caller` on
+   // arm64).
+   let Some(orig) = (unsafe {
+      crate::hook_sret::<OverlayRenderFn>(
+         image,
+         |pro| pro.frame,
          found.overlay_render,
-         pro.pattern,
-         pro.len,
          overlay_render_detour as *const () as usize,
+         "desktop modal: overlay render hook failed",
       )
-   } {
-      Ok(trampoline) => trampoline,
-      Err(err) => {
-         log::warn!("desktop modal: overlay render hook failed: {err}");
-         return;
-      },
+   }) else {
+      return;
    };
-   // SAFETY: `trampoline` replays the 19-byte prologue and jumps to `+19`.
-   let orig = unsafe { std::mem::transmute::<usize, OverlayRenderFn>(trampoline) };
    let _ = ORIG_OVERLAY_RENDER.set(orig);
-   install_settings_layer(image, pro);
+   install_settings_layer(image);
    log::info!(
       "desktop modal: hooked Workspace::render_overlays @ {:#x} (push={:#x}, val +{:#x}) {:x?}",
       found.overlay_render,
@@ -1167,8 +1364,13 @@ pub fn install(image: &Image<'static>) {
 
 /// Hooks the Settings layer's render, so modals opened over Settings draw
 /// above it.
-fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
-   let func = match desktop::settings_layer(image) {
+fn install_settings_layer(image: &Image<'static>) {
+   let located = if crate::X86_CODE {
+      desktop::settings_layer(image)
+   } else {
+      phoenix_sigs::macos::settings_layer(image)
+   };
+   let func = match located {
       Ok(func) => func,
       Err(err) => {
          log::warn!("desktop modal: {err}, modals stay under Settings");
@@ -1177,21 +1379,17 @@ fn install_settings_layer(image: &Image<'static>, pro: desktop::Prologue) {
    };
    // SAFETY: from `prepare`, before Discord's threads run; the detour has the
    // Settings layer render's sret signature.
-   match unsafe {
-      image.hook_entry(
+   if let Some(orig) = unsafe {
+      crate::hook_sret::<SettingsLayerFn>(
+         image,
+         |pro| pro.frame,
          func,
-         pro.pattern,
-         pro.len,
          settings_layer_detour as *const () as usize,
+         "desktop modal: Settings layer hook failed",
       )
    } {
-      Ok(trampoline) => {
-         // SAFETY: `trampoline` replays the prologue of `func`.
-         let _ = ORIG_SETTINGS_LAYER
-            .set(unsafe { std::mem::transmute::<usize, SettingsLayerFn>(trampoline) });
-         log::info!("desktop modal: hooked Settings layer @ {func:#x}");
-      },
-      Err(err) => log::warn!("desktop modal: Settings layer hook failed: {err}"),
+      let _ = ORIG_SETTINGS_LAYER.set(orig);
+      log::info!("desktop modal: hooked Settings layer @ {func:#x}");
    }
 }
 
@@ -1267,8 +1465,9 @@ unsafe fn set_field_text(app: *mut c_void, entity: &RawEntity, text: &str) {
       text_len: text.len(),
       tf:       ptr::from_ref(tf),
    };
-   // SAFETY: `update_entity_dyn` leases `FieldState`, calls `set_value_trampoline`
-   // synchronously on this stack frame, ends the lease, and flushes effects.
+   // SAFETY: `update_entity_dyn` leases `FieldState`, calls
+   // `set_value_trampoline` synchronously on this stack frame, ends the lease,
+   // and flushes effects.
    unsafe {
       (tf.update_entity_dyn)(
          app,
@@ -1823,8 +2022,9 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                if let Some(init) = &ed.pending_init {
                   unsafe { set_field_text(app, &ent, init) };
                }
-               // SAFETY: constructs hosted `TextArea` from `&Entity<FieldState>`
-               // in a buffer that fits it and converts to `AnyElement`.
+               // SAFETY: constructs hosted `TextArea` from
+               // `&Entity<FieldState>` in a buffer that fits it and converts to
+               // `AnyElement`.
                let mut ta_any = unsafe {
                   let mut ta = RawTextArea::zeroed();
                   (tf.text_area_new)(&raw mut ta, &raw const ent);

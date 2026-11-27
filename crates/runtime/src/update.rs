@@ -8,6 +8,8 @@
 
 use std::{
    collections::BTreeMap,
+   fs,
+   path::Path,
    sync::{
       Mutex,
       PoisonError,
@@ -31,8 +33,10 @@ static MARKER: &str = concat!("phoenix-version:", env!("PHOENIX_VERSION"), ";");
 
 #[derive(serde::Deserialize)]
 struct Site {
-   loader:  String,
-   plugins: BTreeMap<String, u32>,
+   loader:      String,
+   #[serde(default)]
+   loader_crcs: BTreeMap<String, u32>,
+   plugins:     BTreeMap<String, u32>,
 }
 
 /// What the site has that this install lacks.
@@ -40,6 +44,8 @@ struct Site {
 pub struct Update {
    /// The site's version, when it is newer than [`VERSION`].
    pub loader:      Option<String>,
+   /// Expected CRC-32 for each loader binary listed in `version.json`.
+   pub loader_crcs: BTreeMap<String, u32>,
    /// Installed plugins whose code differs from the site's.
    pub plugins:     Vec<String>,
    /// Expected CRC-32 for each plugin in [`Self::plugins`].
@@ -129,7 +135,7 @@ pub fn fetch_catalog() {
 /// Installs a plugin the site lists. Site plugins can call API an older loader
 /// lacks, so platforms with an in-app loader updater wait until the loader is
 /// current.
-pub fn install_listed(name: &str) -> Result<String, crate::Error> {
+pub fn install_listed(name: &str) -> Result<crate::installer::Installed, crate::Error> {
    let updates_loader = crate::platform().is_some_and(<dyn crate::Platform>::updates_loader);
    if updates_loader && let Some(version) = found().and_then(|update| update.loader) {
       return Err(crate::Error::LoaderOutdated { version });
@@ -158,6 +164,7 @@ fn query() -> Result<Option<Update>, String> {
    }
    let update = (loader.is_some() || !plugins.is_empty()).then_some(Update {
       loader,
+      loader_crcs: site.loader_crcs,
       plugins,
       plugin_crcs,
    });
@@ -335,6 +342,35 @@ fn update_plugin(name: &str, expected_crc: Option<u32>) -> Result<(), String> {
    crate::save_source(name, source).map_err(|err| err.to_string())
 }
 
+/// Verifies a downloaded loader binary against its exact embedded version
+/// marker and the CRC-32 published for `asset` in `version.json`.
+pub fn verify_loader(
+   asset: &str,
+   version: &str,
+   bytes: &[u8],
+   update: &Update,
+) -> Result<(), String> {
+   let marker = format!("phoenix-version:{version};");
+   if !bytes
+      .windows(marker.len())
+      .any(|window| window == marker.as_bytes())
+   {
+      return Err(format!("missing version marker for {version}"));
+   }
+   let expected = update
+      .loader_crcs
+      .get(asset)
+      .copied()
+      .ok_or_else(|| format!("missing CRC-32 for {asset} in version.json"))?;
+   let actual = crc32fast::hash(bytes);
+   if actual != expected {
+      return Err(format!(
+         "CRC mismatch for {asset} (got {actual:#x}, expected {expected:#x})"
+      ));
+   }
+   Ok(())
+}
+
 /// The site's `plugins/<name>.js`, checked against its CRC-32.
 pub fn download_plugin(name: &str, expected_crc: Option<u32>) -> Result<String, String> {
    let url = format!("{ASSETS}plugins/{name}.js");
@@ -348,6 +384,73 @@ pub fn download_plugin(name: &str, expected_crc: Option<u32>) -> Result<String, 
       }
    }
    String::from_utf8(bytes).map_err(|err| format!("invalid UTF-8: {err}"))
+}
+
+/// Where plugins for a loader not installed yet wait, with that loader's
+/// version in [`STAGED_FOR`].
+const STAGED: &str = "plugins.next";
+const STAGED_FOR: &str = "loader";
+
+/// Downloads `update`'s plugins into [`STAGED`] for loader `version`, and
+/// returns the ones that failed. A failed one stays as it is, and the next
+/// check offers it again.
+#[must_use]
+pub fn stage_plugins(version: &str, update: &Update) -> Vec<String> {
+   let Some(state) = crate::state() else {
+      return vec!["runtime not started".to_owned()];
+   };
+   let dir = state.home.join(STAGED);
+   let _ = fs::remove_dir_all(&dir);
+   if let Err(err) = fs::create_dir_all(&dir) {
+      log::error!("staging plugins: {}: {err}", dir.display());
+      return vec![format!("create {}: {err}", dir.display())];
+   }
+   let mut failed = Vec::new();
+   for name in &update.plugins {
+      let staged =
+         download_plugin(name, update.plugin_crcs.get(name).copied()).and_then(|source| {
+            fs::write(dir.join(format!("{name}.js")), source).map_err(|err| err.to_string())
+         });
+      match staged {
+         Ok(()) => log::info!("staged plugin {name} for {version}"),
+         Err(err) => {
+            log::error!("staging {name} failed: {err}");
+            failed.push(format!("{name}: {err}"));
+         },
+      }
+   }
+   if let Err(err) = fs::write(dir.join(STAGED_FOR), version) {
+      log::error!("staging plugins: {err}");
+      failed.push(format!("write stage marker: {err}"));
+   }
+   failed
+}
+
+/// Moves the plugins staged for this loader, or an older one, into `plugins`.
+/// Plugins staged for a newer loader, whose install was not finished, wait.
+pub fn adopt_staged(home: &Path, plugins: &Path) {
+   let dir = home.join(STAGED);
+   let Ok(version) = fs::read_to_string(dir.join(STAGED_FOR)) else {
+      return;
+   };
+   if version.trim() > VERSION {
+      return;
+   }
+   if let Err(err) = fs::create_dir_all(plugins) {
+      log::error!("staged plugins: {}: {err}", plugins.display());
+      return;
+   }
+   for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+      let path = entry.path();
+      if path.extension().is_some_and(|extension| extension == "js")
+         && let Some(name) = path.file_name()
+         && let Err(err) = fs::rename(&path, plugins.join(name))
+      {
+         log::error!("staged plugin {}: {err}", path.display());
+      }
+   }
+   let _ = fs::remove_dir_all(&dir);
+   log::info!("moved in the plugins staged for {}", version.trim());
 }
 
 /// Claims the update slot. False when an update already runs.

@@ -1464,6 +1464,11 @@ declare namespace Phoenix {
     /// `"Record Voice Message"`) by omitting it from its parent's child list. Call the returned
     /// function to restore it. Desktop only knows `"composer.gift"`.
     hide(accessibilityId: string): Remover;
+    /// Hides the count of pending friend requests (the DM list's Friends row, the inbox's Friends
+    /// tab and their share of the Home button's count) or message requests (the DM list's
+    /// Message Requests row) until the returned function runs. The requests themselves stay
+    /// listed. Desktop only.
+    hideCount?(count: "friendRequests" | "messageRequests"): Remover;
     /// Observes or intercepts any Phoenix view event (e.g. `"rowDoubleTap"`, `"press"`),
     /// filtered by event name in Rust. With `intercept: true`, return `false` to pass the event
     /// back to Phoenix; any other return consumes it.
@@ -1501,6 +1506,10 @@ declare namespace Phoenix {
     /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
     /// function that dismisses it early.
     notify(options: NotifyOptions): () => void;
+    /// Suppresses haptic feedback across the app (host `Haptics` calls and view haptic props on
+    /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
+    /// to re-enable haptics.
+    disableHaptics?(): Remover;
     /// Copies `text` to the device clipboard.
     copy(text: string): void;
     /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for

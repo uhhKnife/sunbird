@@ -46,11 +46,63 @@ use crate::{
 /// which events a plugin listens to.
 struct Gateway {
    registry:  GatewayRegistry,
-   originals: Vec<GatewayHandler>,
+   /// The handlers' addresses, retargeted to a trampoline when the handler
+   /// itself is hooked too ([`call_handler_through`]).
+   originals: Vec<AtomicUsize>,
    hooked:    Vec<AtomicBool>,
 }
 
 static GATEWAY: OnceLock<Gateway> = OnceLock::new();
+
+impl Gateway {
+   fn original(&self, id: EventId) -> GatewayHandler {
+      let addr = self.originals[id.index()].load(Ordering::Acquire);
+      // SAFETY: a registry handler or the trampoline to one, both with the
+      // handler ABI.
+      unsafe { std::mem::transmute::<usize, GatewayHandler>(addr) }
+   }
+}
+
+/// The detour for platforms that also hook a handler's own entry directly.
+///
+/// Some hosts call a handler past the registry (macOS deletes your own message
+/// that way). Expects the hooked handler's trampoline in the fourth argument
+/// (`x3` on arm64) so events missing from the registry still run Discord's
+/// handler.
+#[must_use]
+pub fn entry_detour_with_fallback() -> usize {
+   detour_with_fallback as *const () as usize
+}
+
+/// Every distinct handler the registry holds, for a platform that hooks their
+/// entries too.
+#[must_use]
+pub fn handlers() -> Vec<usize> {
+   let Some(gateway) = GATEWAY.get() else {
+      return Vec::new();
+   };
+   let mut handlers: Vec<usize> = gateway
+      .registry
+      .iter()
+      .map(|(_, entry)| entry.handler)
+      .collect();
+   handlers.sort_unstable();
+   handlers.dedup();
+   handlers
+}
+
+/// Calls `handler`'s events through `trampoline` from now on, once the
+/// platform hooked `handler`'s entry to [`entry_detour`].
+pub fn call_handler_through(handler: usize, trampoline: usize) {
+   let Some(gateway) = GATEWAY.get() else {
+      return;
+   };
+   for (id, entry) in gateway.registry.iter() {
+      if entry.handler == handler {
+         gateway.originals[id.index()].store(trampoline, Ordering::Release);
+      }
+   }
+}
 /// Events plugins fed Phoenix from outside a hook. They run on the store
 /// thread ahead of the next event Phoenix handles, since only a handler call
 /// carries the store.
@@ -183,9 +235,7 @@ pub fn swap(
       .collect::<Vec<(usize, usize)>>();
    let originals = registry
       .iter()
-      // SAFETY: the registry walk only accepts entries whose handler starts a
-      // function, and every registry handler has this ABI.
-      .map(|(_, entry)| unsafe { std::mem::transmute::<usize, GatewayHandler>(entry.handler) })
+      .map(|(_, entry)| AtomicUsize::new(entry.handler))
       .collect();
    let hooked = registry.iter().map(|_| AtomicBool::new(false)).collect();
 
@@ -240,7 +290,7 @@ pub fn dispatch(event: EventId, data: &str) -> Option<bool> {
 
    // SAFETY: `handling` holds the arguments of a handler call still on this
    // thread's stack, and the event borrows strings that outlive the call.
-   let original = gateway.originals[event.index()];
+   let original = gateway.original(event);
    let result = unsafe { original(handling.store, &raw const synthetic, handling.ctx) };
    Some(result.is_ok())
 }
@@ -337,7 +387,7 @@ fn flush(gateway: &Gateway, store: *mut c_void, ctx: *mut c_void, rest: [u64; RE
       };
       // SAFETY: `store` and `ctx` are the arguments of the handler call this
       // runs inside, and the event borrows strings that outlive the call.
-      let original = gateway.originals[event.index()];
+      let original = gateway.original(event);
       if unsafe { original(store, &raw const synthetic, ctx) }.is_ok() {
          continue;
       }
@@ -370,6 +420,30 @@ unsafe extern "C" fn detour(
    event: *const GatewayEvent,
    ctx: *mut c_void,
 ) -> HandlerResult {
+   // SAFETY: forwarded from the registry caller.
+   unsafe { run_detour(store, event, ctx, None) }
+}
+
+unsafe extern "C" fn detour_with_fallback(
+   store: *mut c_void,
+   event: *const GatewayEvent,
+   ctx: *mut c_void,
+   fallback: usize,
+) -> HandlerResult {
+   let fallback = (fallback != 0).then(|| {
+      // SAFETY: `fallback` is the hooked handler's own trampoline.
+      unsafe { std::mem::transmute::<usize, GatewayHandler>(fallback) }
+   });
+   // SAFETY: forwarded from the directly hooked handler's caller.
+   unsafe { run_detour(store, event, ctx, fallback) }
+}
+
+unsafe fn run_detour(
+   store: *mut c_void,
+   event: *const GatewayEvent,
+   ctx: *mut c_void,
+   fallback: Option<GatewayHandler>,
+) -> HandlerResult {
    let gateway = GATEWAY
       .get()
       .expect("slots point here only after GATEWAY is set");
@@ -384,6 +458,11 @@ unsafe extern "C" fn detour(
    // SAFETY: name and data are borrowed strings that outlive the call.
    let (name, data) = unsafe { (text(event.name), text(event.data)) };
    let Some((id, name)) = name.and_then(|name| Some((gateway.registry.id(name)?, name))) else {
+      if let Some(fallback) = fallback {
+         log::warn!("gateway event without a registry entry, forwarding to original handler");
+         // SAFETY: `fallback` is the trampoline for the directly hooked handler.
+         return unsafe { fallback(store, event, ctx) };
+      }
       log::error!("gateway event without a registry entry, dropped");
       return HandlerResult::OK;
    };
@@ -391,9 +470,8 @@ unsafe extern "C" fn detour(
       event: name,
       bytes: data.map_or(0, str::len),
    });
-   let original = gateway.originals[id.index()];
-   // SAFETY: forwarded to the registry's own handler unchanged or with
-   // replaced data.
+   let original = fallback.unwrap_or_else(|| gateway.original(id));
+   // SAFETY: forwarded to the hooked handler unchanged or with replaced data.
    let call = |event: &GatewayEvent| unsafe { original(store, event, ctx) };
 
    let listened = gateway.hooked[id.index()].load(Ordering::Acquire);

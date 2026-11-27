@@ -10,6 +10,10 @@ const SEED: &str = "MESSAGE_CREATE";
 /// `RESUMED`, etc.) whose slice sits separately from the main registry or
 /// domain table.
 const DOMAIN_SEED: &str = "READY_SUPPLEMENTAL";
+/// An event every client handles. macOS Phoenix keeps it, with others, in a
+/// flat table apart from the domain tables, which is walked only when the
+/// walks above miss it.
+const SPLIT_SEED: &str = "MESSAGE_UPDATE";
 const STRIDE: usize = 3 * size_of::<usize>();
 /// Stride of a `libdiscord` domain reducer descriptor:
 /// `{domain_name_ptr, domain_name_len, domain_id, slice_ptr, slice_len}`.
@@ -68,6 +72,19 @@ impl GatewayRegistry {
          Ok(domain) => merge_entries(&mut entries, domain),
          Err(Error::NotFound { .. }) => {},
          Err(err) => return Err(err),
+      }
+
+      if !entries.iter().any(|entry| entry.name == SPLIT_SEED) {
+         for split in walk_split(image) {
+            // macOS dispatches MESSAGE_CREATE through the split table, whose
+            // handler differs from the domain table's, which never runs.
+            entries.retain(|known| {
+               !split
+                  .iter()
+                  .any(|entry| entry.name == known.name && entry.handler != known.handler)
+            });
+            merge_entries(&mut entries, split);
+         }
       }
 
       let by_name = entries
@@ -170,8 +187,8 @@ fn entry(image: &Image<'_>, slot: usize) -> Option<GatewayEntry> {
       return None;
    }
    Some(GatewayEntry {
-      name:    String::from_utf8(name.to_vec()).ok()?,
-      slots:   vec![slot],
+      name: String::from_utf8(name.to_vec()).ok()?,
+      slots: vec![slot],
       handler,
    })
 }
@@ -210,6 +227,29 @@ fn walk_flat(image: &Image<'_>, seed: &'static str) -> Result<Vec<GatewayEntry>,
          })
       },
    }
+}
+
+/// Every flat table holding [`SPLIT_SEED`]. macOS keeps two copies of it,
+/// each naming the event through its own copy of the string, and dispatches
+/// `MESSAGE_DELETE` through the second.
+fn walk_split(image: &Image<'_>) -> Vec<Vec<GatewayEntry>> {
+   let ptr_size = image.pointer_width;
+   let mut slots = image
+      .find_bytes_iter(SPLIT_SEED.as_bytes())
+      .flat_map(|string| image.pointers_to(string))
+      .filter(|&slot| {
+         image.read_usize(slot + ptr_size) == Some(SPLIT_SEED.len())
+            && image
+               .read_usize(slot + 2 * ptr_size)
+               .is_some_and(|code| image.is_function(code))
+      })
+      .collect::<Vec<_>>();
+   slots.sort_unstable();
+   slots.dedup();
+   slots
+      .into_iter()
+      .map(|slot| walk_from_slot(image, slot))
+      .collect()
 }
 
 /// Checks whether `slice_start` is referenced by a 5-word `libdiscord` domain

@@ -40,7 +40,7 @@ const LOADER_ASSET: &str = if cfg!(target_arch = "x86_64") {
 /// Stages `update`'s plugins for loader `version`, then installs it.
 pub fn install(version: &str, update: &Update) {
    update::set_status(Some("Downloading plugins...".to_owned()));
-   stage_plugins(version, update);
+   let _ = update::stage_plugins(version, update);
    run_loader_self_update();
 }
 
@@ -52,65 +52,6 @@ pub fn self_update_from_site() {
       return;
    }
    thread::spawn(run_loader_self_update);
-}
-
-/// Where plugins for a loader not installed yet wait, with that loader's
-/// version in [`STAGED_FOR`].
-const STAGED: &str = "plugins.next";
-const STAGED_FOR: &str = "loader";
-
-/// Downloads `update`'s plugins into [`STAGED`] for loader `version`. One that
-/// fails stays as it is, and the next check offers it again.
-fn stage_plugins(version: &str, update: &Update) {
-   let Some(state) = phoenix_runtime::state() else {
-      return;
-   };
-   let dir = state.home.join(STAGED);
-   let _ = fs::remove_dir_all(&dir);
-   if let Err(err) = fs::create_dir_all(&dir) {
-      log::error!("staging plugins: {}: {err}", dir.display());
-      return;
-   }
-   for name in &update.plugins {
-      let staged =
-         update::download_plugin(name, update.plugin_crcs.get(name).copied()).and_then(|source| {
-            fs::write(dir.join(format!("{name}.js")), source).map_err(|err| err.to_string())
-         });
-      match staged {
-         Ok(()) => log::info!("staged plugin {name} for {version}"),
-         Err(err) => log::error!("staging {name} failed: {err}"),
-      }
-   }
-   if let Err(err) = fs::write(dir.join(STAGED_FOR), version) {
-      log::error!("staging plugins: {err}");
-   }
-}
-
-/// Moves the plugins staged for this loader, or an older one, into `plugins`.
-/// Plugins staged for a newer loader, whose install was not finished, wait.
-pub fn adopt_staged(home: &Path, plugins: &Path) {
-   let dir = home.join(STAGED);
-   let Ok(version) = fs::read_to_string(dir.join(STAGED_FOR)) else {
-      return;
-   };
-   if version.trim() > update::VERSION {
-      return;
-   }
-   if let Err(err) = fs::create_dir_all(plugins) {
-      log::error!("staged plugins: {}: {err}", plugins.display());
-      return;
-   }
-   for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-      let path = entry.path();
-      if path.extension().is_some_and(|extension| extension == "js")
-         && let Some(name) = path.file_name()
-         && let Err(err) = fs::rename(&path, plugins.join(name))
-      {
-         log::error!("staged plugin {}: {err}", path.display());
-      }
-   }
-   let _ = fs::remove_dir_all(&dir);
-   log::info!("moved in the plugins staged for {}", version.trim());
 }
 
 fn run_loader_self_update() {

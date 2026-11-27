@@ -8,11 +8,15 @@
 
 use std::ffi::c_void;
 
-#[cfg(target_arch = "x86_64")] pub mod desktop;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod desktop;
 #[cfg(feature = "file")] pub mod file;
-#[cfg(target_arch = "x86_64")] pub mod gateway_send;
-#[cfg(target_arch = "x86_64")] pub mod http;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod gateway_send;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
+pub mod http;
 pub mod ios;
+#[cfg(any(target_arch = "x86_64", target_os = "macos"))]
 pub mod macos;
 pub mod mobile;
 pub mod registry;
@@ -44,14 +48,28 @@ pub struct StaffField {
    all(target_os = "linux", target_arch = "x86_64")
 )))]
 pub const LIBRARIES: &[&str] = &["liblibdiscord_wasm_host.so", "libstand_in.so"];
-#[cfg(target_os = "macos")]
-pub const LIBRARIES: &[&str] = &[macos::EXECUTABLE];
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub const LIBRARIES: &[&str] = &["discord-phoenix", "libstand_in.so"];
 #[cfg(target_os = "ios")]
 pub const LIBRARIES: &[&str] = &["PhoenixFatClient"];
+#[cfg(target_os = "macos")]
+pub const LIBRARIES: &[&str] = &["Discord", "libstand_in.dylib"];
 #[cfg(target_os = "windows")]
 pub const LIBRARIES: &[&str] = &["Discord.exe", "stand_in.dll"];
+
+/// What macOS Phoenix sets when it re-execs itself to apply its malloc
+/// settings.
+///
+/// The re-exec keeps the pid, and the loader starts only in the image that has
+/// this, since the first one is replaced. `sigscan check` reports a build
+/// without it, where the loader would never start.
+pub const MACOS_REEXEC: &str = "DISCORD_DESKTOP_MALLOC_REEXEC";
+
+/// One of the malloc settings macOS Phoenix re-execs itself to apply.
+///
+/// Launch Services sets them all from its Info.plist's `LSEnvironment`, so an
+/// app started through `open` never re-execs or sets [`MACOS_REEXEC`].
+pub const MACOS_MALLOC: &str = "MallocNanoZone";
 
 /// Name of the plugin bundle the patcher stores next to the loader in the APK's
 /// native library directory, a JSON object of plugin name to source.
@@ -88,17 +106,19 @@ pub struct GatewayEvent {
 
 /// The Rust `Result` a handler returns through a hidden pointer:
 /// - 96 bytes (12 words) on Desktop Phoenix (`Discord.exe`, Linux
-///   `discord-phoenix`), with `Ok` niche `u64::MAX - 1`
+///   `discord-phoenix`, macOS `Discord`), with `Ok` niche `u64::MAX - 1`
 ///   (`0xffff_ffff_ffff_fffe`)
 /// - 32 bytes (4 words) on mobile 64-bit, with `Ok` niche `u64::MAX`
 /// - 16 bytes (2 words) on armeabi-v7a, with `Ok` niche `u64::MAX`
 #[cfg(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 ))]
 pub const RESULT_WORDS: usize = 12;
 #[cfg(not(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64"),
    target_arch = "arm"
 )))]
@@ -108,11 +128,13 @@ pub const RESULT_WORDS: usize = 2;
 
 #[cfg(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 ))]
 const OK_TAG: u64 = u64::MAX - 1;
 #[cfg(not(any(
    target_os = "windows",
+   target_os = "macos",
    all(target_os = "linux", target_arch = "x86_64")
 )))]
 const OK_TAG: u64 = u64::MAX;
@@ -150,6 +172,7 @@ mod tests {
       assert!(!err.is_ok());
       #[cfg(any(
          target_os = "windows",
+         target_os = "macos",
          all(target_os = "linux", target_arch = "x86_64")
       ))]
       {
@@ -158,6 +181,7 @@ mod tests {
       }
       #[cfg(not(any(
          target_os = "windows",
+         target_os = "macos",
          all(target_os = "linux", target_arch = "x86_64"),
          target_arch = "arm"
       )))]

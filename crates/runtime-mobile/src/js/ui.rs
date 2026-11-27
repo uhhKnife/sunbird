@@ -359,6 +359,14 @@ pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'
    add_view_queries(ctx, &ui)?;
    add_mount(ctx, plugin, &ui)?;
    add_notify(ctx, plugin, &ui)?;
+   let owner = plugin.to_owned();
+   ui.set(
+      "disableHaptics",
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         let handle = crate::bridge::disable_haptics(owner.clone());
+         remover(&ctx, move |_| crate::bridge::enable_haptics(handle), None)
+      })?,
+   )?;
    ui.set(
       "copy",
       Function::new(ctx.clone(), |text: String| {

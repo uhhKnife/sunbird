@@ -171,8 +171,25 @@ impl Field {
    }
 }
 
+/// A host module whose calls phoenix matches by module number alone.
+#[derive(Clone, Copy)]
+pub enum Module {
+   Haptics,
+}
+
+impl Module {
+   const ALL: [Self; 1] = [Self::Haptics];
+
+   const fn name(self) -> &'static str {
+      match self {
+         Self::Haptics => "Haptics",
+      }
+   }
+}
+
 /// The numbers, laid out as the module and method of each [`Method`], then
-/// each [`Event`], then each [`Field`], `None` where the build lacks the name.
+/// each [`Event`], then each [`Field`], then each [`Module`], `None` where the
+/// build lacks the name.
 pub struct Table(Vec<Option<u16>>);
 
 impl Table {
@@ -188,6 +205,10 @@ impl Table {
 
    pub fn key(&self, field: Field) -> Option<Key> {
       self.0[2 * Method::ALL.len() + Event::ALL.len() + field as usize].map(Key::new)
+   }
+
+   pub fn module(&self, module: Module) -> Option<u16> {
+      self.0[2 * Method::ALL.len() + Event::ALL.len() + Field::ALL.len() + module as usize]
    }
 }
 
@@ -246,7 +267,16 @@ fn names() -> Vec<&'static str> {
    }
    names.extend(Event::ALL.map(Event::name));
    names.extend(Field::ALL.map(Field::name));
+   names.extend(Module::ALL.map(Module::name));
    names
+}
+
+/// Whether an `invoke` frame starting with `head` targets `module`.
+pub fn is_module(head: &[u8], module: Module) -> bool {
+   let Some((called, _)) = HostCall::target(head) else {
+      return false;
+   };
+   table().and_then(|host| host.module(module)) == Some(called)
 }
 
 fn keep(names: &[&str], numbers: Vec<Option<u16>>) {

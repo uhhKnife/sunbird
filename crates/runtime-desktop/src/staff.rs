@@ -36,7 +36,12 @@ pub fn start(image: &'static Image<'static>) {
 }
 
 fn locate(image: &Image<'_>) -> Option<Field> {
-   let field = phoenix_sigs::desktop::staff(image)
+   let located = if crate::X86_CODE {
+      phoenix_sigs::desktop::staff(image)
+   } else {
+      phoenix_sigs::macos::staff(image)
+   };
+   let field = located
       .inspect_err(|err| log::warn!("staff: {err}, leaving flag_override as is"))
       .ok()?;
    log::info!(
@@ -63,6 +68,17 @@ pub unsafe fn apply(state: *mut c_void) {
    unsafe {
       let tag = state.byte_add(field.tag).cast::<u32>();
       let value = state.byte_add(field.value).cast::<u64>();
+      // An `Option` tag is 0 or 1. Anything else means the offset doesn't
+      // fit this state, so nothing is written.
+      if ptr::read(tag) > 1 {
+         if !LOGGED.swap(true, Ordering::AcqRel) {
+            log::warn!(
+               "staff: flag_override's tag reads {}, leaving it",
+               ptr::read(tag)
+            );
+         }
+         return;
+      }
       let had = ptr::read(tag) == 1;
       let current = if had { ptr::read(value) } else { 0 };
       let wanted = if phoenix_runtime::staff_enabled() {

@@ -1008,6 +1008,42 @@ pub fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
    Some(buffer)
 }
 
+/// Copies `len` bytes of this process's memory at `addr`, or the readable
+/// start of them. Unmapped memory gives `None` instead of a fault.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+   unsafe extern "C" {
+      static mach_task_self_: u32;
+      fn mach_vm_read_overwrite(
+         task: u32,
+         address: u64,
+         size: u64,
+         data: u64,
+         out_size: *mut u64,
+      ) -> i32;
+   }
+
+   let mut buffer = vec![0u8; len];
+   let mut read = 0u64;
+   // SAFETY: `buffer` holds `len` writable bytes, and the kernel checks the
+   // source range instead of faulting.
+   let status = unsafe {
+      mach_vm_read_overwrite(
+         mach_task_self_,
+         addr as u64,
+         len as u64,
+         buffer.as_mut_ptr() as u64,
+         &raw mut read,
+      )
+   };
+   let read = usize::try_from(read)
+      .ok()
+      .filter(|&read| status == 0 && read > 0)?;
+   buffer.truncate(read);
+   Some(buffer)
+}
+
 /// The registers at a hooked function's entry, as the stub saved them.
 #[cfg(windows)]
 #[repr(C)]

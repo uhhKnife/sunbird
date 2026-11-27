@@ -1,5 +1,5 @@
-//! The few places Desktop Phoenix differs between Windows and Linux. Every
-//! other file in this crate is the same on both.
+//! The few places Desktop Phoenix differs between Windows, Linux and macOS.
+//! Every other file in this crate is the same on all three.
 
 use phoenix_hook::image::Image;
 
@@ -35,6 +35,7 @@ pub trait DesktopOs {
 }
 
 #[cfg(target_os = "linux")] pub use linux::Linux as Os;
+#[cfg(target_os = "macos")] pub use macos::Macos as Os;
 #[cfg(windows)] pub use windows::Windows as Os;
 
 #[cfg(windows)]
@@ -97,7 +98,8 @@ mod windows {
    /// this process's visible `Zed::Window`s, which redraws from any thread
    /// where `InvalidateRect` alone waits for the next input.
    unsafe extern "system" fn redraw_zed_window(hwnd: isize, lparam: isize) -> i32 {
-      // SAFETY: `lparam` is the `(pid, validation_offset)` `force_redraw` passed.
+      // SAFETY: `lparam` is the `(pid, validation_offset)` `force_redraw`
+      // passed.
       let (want_pid, val_off) = unsafe { *(lparam as *const (u32, usize)) };
       let mut pid = 0u32;
       // SAFETY: Win32 window queries for this process's own visible
@@ -115,7 +117,8 @@ mod windows {
                .is_some_and(|name| String::from_utf16_lossy(name) == "Zed::Window")
             {
                // This runs off GPUI's thread, which may be freeing the window,
-               // so the words behind the user data are copied, not dereferenced.
+               // so the words behind the user data are copied, not
+               // dereferenced.
                let user_data = GetWindowLongPtrW(hwnd, GWLP_USERDATA).cast_unsigned();
                let word = |at: usize| {
                   x86::read_memory(at, 8)
@@ -343,6 +346,83 @@ mod linux {
             .map(|segment| segment.addr)
             .min()
             .map_or(0, |addr| addr & !0xFFF)
+      }
+
+      fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {
+         x86::read_memory(addr, len)
+      }
+   }
+}
+
+#[cfg(target_os = "macos")]
+mod macos {
+   use phoenix_hook::{
+      image::Image,
+      x86,
+   };
+
+   use super::DesktopOs;
+
+   pub struct Macos;
+
+   impl DesktopOs for Macos {
+      /// Points Discord's relaunch after an update at the launcher in
+      /// `$SUNBIRD`, set by the copy's Info.plist, since the updated bundle is
+      /// signed by Discord again and ignores the loader.
+      fn install(image: &Image<'static>) {
+         const SCRIPT: &[u8] = br#"while kill -0 $0 2>&-;do sleep .2;done;/usr/bin/open -n "${SUNBIRD:-$1}";rm -rf "$2""#;
+
+         let at = match phoenix_sigs::macos::relaunch_script(image) {
+            Ok(at) => at,
+            Err(err) => {
+               log::warn!("relaunch: {err}, an update restarts without Sunbird");
+               return;
+            },
+         };
+         let mut script = SCRIPT.to_vec();
+         script.resize(phoenix_sigs::macos::RELAUNCH_SCRIPT.len(), b' ');
+         // SAFETY: a string no thread reads while the loader's constructor
+         // runs, replaced by one of the same length.
+         match unsafe { image.write_code(at, &script) } {
+            Ok(()) => log::info!("relaunch: Discord's updater restarts through Sunbird"),
+            Err(err) => log::warn!("relaunch: {err}"),
+         }
+      }
+
+      fn force_redraw(_validation_offset: usize) {
+         phoenix_ui_desktop::redraw_windows();
+      }
+
+      fn current_thread_id() -> u32 {
+         let mut id = 0u64;
+         // SAFETY: a null thread is the calling one, and `id` is a valid out
+         // pointer.
+         unsafe { libc::pthread_threadid_np(0, &raw mut id) };
+         #[expect(
+            clippy::cast_possible_truncation,
+            reason = "thread ids count up from boot and stay far below 2^32"
+         )]
+         let id = id as u32;
+         id
+      }
+
+      fn image_base(image: &Image<'_>) -> usize {
+         // The Mach-O header, so offsets match the file's `vmaddr -
+         // 0x1_0000_0000`.
+         let Some(inside) = image.segments.first().map(|segment| segment.addr) else {
+            return 0;
+         };
+         let mut info = libc::Dl_info {
+            dli_fname: std::ptr::null(),
+            dli_fbase: std::ptr::null_mut(),
+            dli_sname: std::ptr::null(),
+            dli_saddr: std::ptr::null_mut(),
+         };
+         // SAFETY: dladdr fills `info` for an address inside a loaded image.
+         if unsafe { libc::dladdr(inside as *const libc::c_void, &raw mut info) } == 0 {
+            return 0;
+         }
+         info.dli_fbase.addr()
       }
 
       fn read_memory(addr: usize, len: usize) -> Option<Vec<u8>> {

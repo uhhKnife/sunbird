@@ -22,6 +22,7 @@
 !crates/*/
 !crates/*/Cargo.toml
 !crates/*/build.rs
+!crates/loader/winres.rs
 !crates/*/src/
 !crates/*/src/**/
 !crates/*/src/**/*.rs

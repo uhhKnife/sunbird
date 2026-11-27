@@ -21,7 +21,7 @@ use crate::Found;
 
 /// Unique error string inside `ReqwestTransport::send` when handed a mobile
 /// host-file body.
-const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
+pub(crate) const HOST_FILE_ANCHOR: &[u8] = b"a host file body needs the host's transport";
 
 /// The size of `http::HeaderMap`, which `send`'s request starts with.
 pub const HEADER_MAP_SIZE: usize = 0x60;
@@ -136,7 +136,7 @@ impl DesktopHttpTransport {
       //    allocator static to its implementation.
       let host_alloc = box_future.and_then(|box_future| find_host_alloc(image, abi, box_future));
       let host_dealloc = find_host_dealloc(image, abi, send_fn, send_end)
-         .or_else(|| host_alloc.and_then(|alloc| dealloc_beside(image, abi, alloc)));
+         .or_else(|| host_alloc.and_then(|alloc| dealloc_sharing(image, abi, alloc)));
       let (host_alloc, host_dealloc) = match (host_alloc, host_dealloc) {
          (Some(alloc), Some(dealloc))
             if allocator_static(image, abi, alloc).is_none()
@@ -234,7 +234,7 @@ fn response_layout(abi: Abi, code: &[u8], ip: usize) -> Found<ResponseLayout> {
 
 /// Finds all `.rdata` vtable method-0 slots (`vtable + 24`) holding `method_fn`
 /// where `[drop_fn, size, align, method_fn]` passes Rust trait vtable checks.
-fn find_vtable_method_slots(
+pub(crate) fn find_vtable_method_slots(
    image: &Image<'_>,
    method_fn: usize,
    size_range: std::ops::RangeInclusive<usize>,
@@ -397,9 +397,14 @@ fn find_host_alloc(image: &Image<'_>, abi: Abi, box_future: usize) -> Option<usi
    None
 }
 
-/// Whether the first call in `func` is followed by `test al, al`.
+/// Whether the first call in `func` is followed by `test al, al`. Linux
+/// builds since 2026-11-26 put a one-byte `ret` shim right before
+/// `__rust_alloc`, so the read stops at the function's end.
 fn checks_allocator(image: &Image<'_>, func: usize) -> bool {
-   let Some(code) = image.read(func, 0x20) else {
+   let len = image
+      .function_bounds(func)
+      .map_or(0x20, |(_, end)| (end - func).min(0x20));
+   let Some(code) = image.read(func, len) else {
       return false;
    };
    phoenix_hook::x86::disasm(code, func, 12)
@@ -462,21 +467,25 @@ fn counts_down(image: &Image<'_>, func: usize) -> bool {
    })
 }
 
-/// `__rust_dealloc`, from the allocator shims emitted next to `alloc`.
+/// `__rust_dealloc`, from the other allocator shims that load `alloc`'s
+/// global allocator static.
 ///
 /// System V builds free request bodies through wrappers the leaf search in
 /// [`find_host_dealloc`] does not reach. `alloc` hands the global allocator
 /// static to its implementation with `lea rdi, [rip + disp32]`, and so does
 /// `__rust_dealloc`, without `alloc`'s set-up check and counting the freed
-/// bytes down after.
-fn dealloc_beside(image: &Image<'_>, abi: Abi, alloc: usize) -> Option<usize> {
-   /// The shims are a few dozen bytes each.
-   const NEAR: usize = 0x400;
+/// bytes down after. Linux build 2233 emits the two 0x45 bytes apart, later
+/// builds 0x2ce8.
+fn dealloc_sharing(image: &Image<'_>, abi: Abi, alloc: usize) -> Option<usize> {
    let global = allocator_static(image, abi, alloc)?;
-   let start = alloc.saturating_sub(NEAR);
-   let mut found: Vec<usize> = lea_arg0(abi, image.read(start, 2 * NEAR)?, start)
-      .filter(|&(_, target)| target == global)
-      .filter_map(|(lea, _)| Some(image.function_bounds(lea)?.0))
+   let mut found: Vec<usize> = crate::desktop::lea_refs(image, global)
+      .into_iter()
+      .filter(|&lea| {
+         image
+            .read(lea, 7)
+            .is_some_and(|code| lea_arg0(abi, code, lea).next().is_some())
+      })
+      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
       .filter(|&func| func != alloc && !checks_allocator(image, func) && counts_down(image, func))
       .collect();
    found.dedup();

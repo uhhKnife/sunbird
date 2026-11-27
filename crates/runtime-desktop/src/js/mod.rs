@@ -15,6 +15,11 @@ use rquickjs::{
    JsLifetime,
 };
 
+#[cfg(target_arch = "x86_64")]
+use crate::counts::{
+   self,
+   Count,
+};
 use crate::{
    accessories,
    composer,
@@ -56,6 +61,9 @@ pub struct Desktop<'js> {
    pub sticker_unlocks: RefCell<Vec<(u64, String)>>,
    /// `phoenix.stream.unlockQuality` handles by id and plugin.
    pub stream_unlocks:  RefCell<Vec<(u64, String)>>,
+   /// `phoenix.ui.hideCount` holds by id and plugin.
+   #[cfg(target_arch = "x86_64")]
+   pub hidden_counts:   RefCell<Vec<(u64, String, Count)>>,
 }
 
 impl<'js> Desktop<'js> {
@@ -74,8 +82,8 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, and emoji pick handlers `name` registered and redraws Discord
-/// without them.
+/// callbacks, emoji pick handlers and hidden counts `name` registered and
+/// redraws Discord without them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -140,4 +148,11 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let mut stream_unlocks = registry.stream_unlocks.borrow_mut();
    stream_unlocks.retain(|(_, plugin)| plugin != name);
    stream::unlock(!stream_unlocks.is_empty());
+
+   #[cfg(target_arch = "x86_64")]
+   {
+      let mut hidden = registry.hidden_counts.borrow_mut();
+      hidden.retain(|(_, plugin, _)| plugin != name);
+      counts::hide(hidden.iter().map(|&(.., count)| count));
+   }
 }

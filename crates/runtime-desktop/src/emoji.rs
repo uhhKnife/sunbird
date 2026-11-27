@@ -31,7 +31,12 @@ static CHECK: OnceLock<(CheckFn, usize)> = OnceLock::new();
 
 /// Hooks the check from [`crate::prepare`], before Discord's threads run.
 pub fn install(image: &Image<'static>) {
-   let found = match desktop::emoji_check(image) {
+   let located = if crate::X86_CODE {
+      desktop::emoji_check(image)
+   } else {
+      phoenix_sigs::macos::emoji_check(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("emoji check: {err}, Nitro-locked emojis stay locked");

@@ -8,9 +8,9 @@ use phoenix_hook::{
 
 use crate::Found;
 
-const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
-const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
-const START_SEND_SLOT_OFFSET: usize = 32;
+pub(crate) const ADOPT_ANCHOR: &[u8] = b"gateway connect adopted the early socket";
+pub(crate) const START_SEND_PANIC: &[u8] = b"assertion failed: this.state.is_none()";
+pub(crate) const START_SEND_SLOT_OFFSET: usize = 32;
 
 // WsMessage::Text(String) tag and payload offset in libdiscord_gateway::transport
 pub const WS_MESSAGE_TEXT_TAG: u64 = 2;
@@ -29,9 +29,10 @@ impl DesktopGatewaySend {
       }
 
       let anchor = crate::one("gateway adopt anchor", &image.find_bytes(ADOPT_ANCHOR))?;
-      let lea = *crate::desktop::lea_refs(image, anchor)
-         .first()
-         .ok_or("gateway adopt anchor is never loaded")?;
+      let lea = crate::one(
+         "gateway adopt anchor load",
+         &crate::desktop::lea_refs(image, anchor),
+      )?;
       let (open_fn, open_end) = image
          .function_bounds(lea)
          .ok_or("gateway connect_adopting has no unwind entry")?;
@@ -98,7 +99,7 @@ fn rip_leas(image: &Image<'_>, start: usize, end: usize) -> Vec<usize> {
    out
 }
 
-fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
+pub(crate) fn sink_vtable_start_send(image: &Image<'_>, vtable: usize) -> Option<usize> {
    if !vtable.is_multiple_of(8) {
       return None;
    }
@@ -170,7 +171,7 @@ fn parse_ok_tag(rhs: &str) -> Option<u64> {
    }
 }
 
-fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
+pub(crate) fn find_sink_slots(image: &Image<'_>, start_send: usize) -> Vec<usize> {
    let mut slots = Vec::new();
    for slot in image.pointers_to(start_send) {
       let Some(vtable) = slot.checked_sub(START_SEND_SLOT_OFFSET) else {
@@ -273,9 +274,9 @@ mod tests {
       }
 
       let image = Image {
-         path:          "Discord.exe".to_owned(),
-         build_id:      None,
-         segments:      vec![
+         path:            "Discord.exe".to_owned(),
+         build_id:        None,
+         segments:        vec![
             Segment {
                addr:       text_base,
                bytes:      Cow::Borrowed(&text),
@@ -289,10 +290,11 @@ mod tests {
                writable:   false,
             },
          ],
-         eh_frame_hdr:  None,
-         arm_exidx:     None,
-         pdata:         Some((text_base, rdata_base + pdata_off, pdata_len)),
-         pointer_width: 8,
+         eh_frame_hdr:    None,
+         arm_exidx:       None,
+         pdata:           Some((text_base, rdata_base + pdata_off, pdata_len)),
+         function_starts: None,
+         pointer_width:   8,
       };
 
       let found = DesktopGatewaySend::locate(&image).expect("should locate SocketSink");

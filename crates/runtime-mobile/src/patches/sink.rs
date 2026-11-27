@@ -157,6 +157,17 @@ fn decode_hex_url(hex: &str) -> Option<String> {
    url.starts_with("https://").then_some(url)
 }
 
+/// Feeds a batch to the mirror while no patch is active, so one turned on
+/// later starts from the live tree.
+fn track(ops: &[Op], debug: bool) {
+   let mut state = patches();
+   state.mirror.apply(ops, debug);
+   if let Some(found) = state.mirror.root() {
+      ROOT_ID.store(found, Ordering::Release);
+      state.note_root_ready();
+   }
+}
+
 pub struct PatchSink;
 
 impl Sink for PatchSink {
@@ -164,7 +175,8 @@ impl Sink for PatchSink {
       let active = ACTIVE.load(Ordering::Acquire);
       let debug = phoenix_runtime::remote::enabled();
       let has_badge_uri = memmem::find(batch, b"/badge-icons/phx_u_").is_some();
-      if !active && !GUARDING.load(Ordering::Acquire) && !has_badge_uri {
+      let no_haptics = crate::bridge::haptics_disabled();
+      if !active && !GUARDING.load(Ordering::Acquire) && !has_badge_uri && !no_haptics {
          let root = ROOT_ID.load(Ordering::Acquire);
          if !debug && root != 0 && memmem::find(batch, &root.to_le_bytes()).is_none() {
             return Action::Pass;
@@ -173,12 +185,7 @@ impl Sink for PatchSink {
             if debug {
                crate::debug::record_ops(&ops);
             }
-            let mut state = patches();
-            state.mirror.apply(&ops, debug);
-            if let Some(found) = state.mirror.root() {
-               ROOT_ID.store(found, Ordering::Release);
-               state.note_root_ready();
-            }
+            track(&ops, debug);
          }
          return Action::Pass;
       }
@@ -192,7 +199,13 @@ impl Sink for PatchSink {
       if debug {
          crate::debug::record_ops(&ops);
       }
-      let restored = restore_originals(&mut ops) | (has_badge_uri && unwrap_badge_uris(&mut ops));
+      let root = ROOT_ID.load(Ordering::Acquire);
+      if !active && (debug || root == 0 || memmem::find(batch, &root.to_le_bytes()).is_some()) {
+         track(&ops, debug);
+      }
+      let restored = restore_originals(&mut ops)
+         | (has_badge_uri && unwrap_badge_uris(&mut ops))
+         | (no_haptics && phoenix_ui_mobile::strip_haptic_props(&mut ops));
       let rewritten = if active {
          patches().rewrite(ops, restored)
       } else {

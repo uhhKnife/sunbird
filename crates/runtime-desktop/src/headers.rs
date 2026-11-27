@@ -172,14 +172,9 @@ fn resolver() -> &'static mpsc::Sender<u64> {
    })
 }
 
-/// The icons the header decorations drew for the author of the message at
-/// `frame`, queueing what is unknown.
-fn icons(symbols: &Symbols, site: usize, frame: *const u8) -> Vec<(&'static str, Option<u32>)> {
-   let Some(&slot) = symbols.slots.get(site) else {
-      return Vec::new();
-   };
-   // SAFETY: the builder keeps the message id at `[frame+slot]` at the call.
-   let message_id = unsafe { frame.add(slot).cast::<u64>().read_unaligned() };
+/// The icons the header decorations drew for `message_id`'s author, queueing
+/// what is unknown.
+fn icons_for_message(message_id: u64) -> Vec<(&'static str, Option<u32>)> {
    if message_id < MIN_SNOWFLAKE {
       return Vec::new();
    }
@@ -189,6 +184,48 @@ fn icons(symbols: &Symbols, site: usize, frame: *const u8) -> Vec<(&'static str,
       .into_iter()
       .flat_map(|item| item.icons)
       .collect()
+}
+
+/// The icons the header decorations drew for the author of the message at
+/// `frame`, queueing what is unknown.
+fn icons(symbols: &Symbols, site: usize, frame: *const u8) -> Vec<(&'static str, Option<u32>)> {
+   let Some(&slot) = symbols.slots.get(site) else {
+      return Vec::new();
+   };
+   // SAFETY: the builder keeps the message id at `[frame+slot]` at the call.
+   let message_id = unsafe { frame.add(slot).cast::<u64>().read_unaligned() };
+   icons_for_message(message_id)
+}
+
+fn append_icons(
+   mut node: *mut c_void,
+   svg_new: SvgNewFn,
+   push_svg: PushSvgFn,
+   svg_color: usize,
+   icons: Vec<(&'static str, Option<u32>)>,
+) -> *mut c_void {
+   for (path, color) in icons {
+      let mut leaf = [0u64; LEAF_WORDS];
+      let leaf = leaf.as_mut_ptr().cast::<u8>();
+      // SAFETY: `leaf` has room for the node SVG leaf; Discord copies `path`
+      // into its own string, and `push_svg` moves the leaf into the node and
+      // returns the node's handle, which may be a fresh clone.
+      unsafe {
+         svg_new(leaf, path.as_ptr(), path.len(), ICON_SIZE);
+         if let Some(argb) = color {
+            leaf.add(svg_color).cast::<u32>().write_unaligned(1);
+            leaf
+               .add(svg_color + 4)
+               .cast::<u32>()
+               .write_unaligned(accessories::argb_to_rgba(argb));
+         }
+         node = push_svg(node, leaf);
+      }
+      if node.is_null() {
+         break;
+      }
+   }
+   node
 }
 
 /// `child_node` adding the name wrapper, then the decorations' icons. The
@@ -203,33 +240,223 @@ unsafe extern "C" fn name_detour<const SITE: usize>(
       return node;
    };
    // SAFETY: forwards `child_node`'s own arguments.
-   let mut node = unsafe { (symbols.child_node)(node, child) };
+   let node = unsafe { (symbols.child_node)(node, child) };
    if !HEADERS.active() || node.is_null() || frame.is_null() {
       return node;
    }
    let Ok(icons) = std::panic::catch_unwind(|| icons(symbols, SITE, frame)) else {
       return node;
    };
-   for (path, color) in icons {
-      let mut leaf = [0u64; LEAF_WORDS];
-      let leaf = leaf.as_mut_ptr().cast::<u8>();
-      // SAFETY: `leaf` has room for the node SVG leaf; Discord copies `path`
-      // into its own string, and `push_svg` moves the leaf into the node and
-      // returns the node's handle, which may be a fresh clone.
-      unsafe {
-         (symbols.svg_new)(leaf, path.as_ptr(), path.len(), ICON_SIZE);
-         if let Some(argb) = color {
-            leaf.add(symbols.svg_color).cast::<u32>().write_unaligned(1);
-            leaf
-               .add(symbols.svg_color + 4)
-               .cast::<u32>()
-               .write_unaligned(accessories::argb_to_rgba(argb));
-         }
-         node = (symbols.push_svg)(node, leaf);
-      }
-      if node.is_null() {
-         break;
-      }
+   append_icons(
+      node,
+      symbols.svg_new,
+      symbols.push_svg,
+      symbols.svg_color,
+      icons,
+   )
+}
+
+/// Message header decorations on macOS arm64
+/// ([`phoenix_sigs::macos::message_header`]).
+#[cfg(target_os = "macos")]
+pub mod arm64 {
+   use std::{
+      cell::Cell,
+      ffi::c_void,
+      sync::OnceLock,
+   };
+
+   use phoenix_hook::image::{
+      Image,
+      sret_caller,
+   };
+
+   use super::{
+      ChildNodeFn,
+      HEADERS,
+      LEAF_WORDS,
+      PushSvgFn,
+      SvgNewFn,
+      accessories,
+      append_icons,
+      icons_for_message,
+   };
+
+   type NameProducerFn = unsafe extern "C" fn(
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      f64,
+      f64,
+      f64,
+      f64,
+      f64,
+      f64,
+      f64,
+      f64,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+      usize,
+   ) -> *mut c_void;
+
+   struct Symbols {
+      orig_name:  NameProducerFn,
+      orig_child: ChildNodeFn,
+      svg_new:    SvgNewFn,
+      push_svg:   PushSvgFn,
+      svg_color:  usize,
    }
-   node
+
+   static SYMBOLS: OnceLock<Symbols> = OnceLock::new();
+
+   std::thread_local! {
+      static LAST_NAME_NODE: Cell<usize> = const { Cell::new(0) };
+   }
+
+   /// Clears any pending name node so an unmatched row cannot leak its pointer
+   /// into a later row's `child_node` call.
+   pub fn clear_last_name_node() {
+      LAST_NAME_NODE.set(0);
+   }
+
+   pub fn install(image: &Image<'static>) {
+      let header = match phoenix_sigs::macos::message_header(image) {
+         Ok(header) => header,
+         Err(err) => {
+            log::warn!("desktop headers: {err}, skipping");
+            return;
+         },
+      };
+      if header.svg.size > LEAF_WORDS * 8 {
+         log::warn!(
+            "desktop headers: the node SVG leaf is {:#x} bytes, skipping",
+            header.svg.size
+         );
+         return;
+      }
+      let Some(svg_new_thunk) = sret_caller(header.svg.new) else {
+         log::warn!("desktop headers: no memory for svg_new thunk");
+         return;
+      };
+      // SAFETY: runs from `prepare` before Discord threads execute.
+      let Some(orig_name) = (unsafe {
+         crate::hook::<NameProducerFn>(
+            image,
+            |pro| pro.frame,
+            header.name_producer,
+            name_producer_detour as *const () as usize,
+            "desktop headers: name producer hook failed",
+         )
+      }) else {
+         return;
+      };
+      // SAFETY: runs from `prepare` before Discord threads execute.
+      let Some(orig_child) = (unsafe {
+         crate::hook::<ChildNodeFn>(
+            image,
+            |pro| pro.frame,
+            header.child_node,
+            child_node_detour as *const () as usize,
+            "desktop headers: child_node hook failed",
+         )
+      }) else {
+         return;
+      };
+      // SAFETY: `sret_caller` thunk and `push_svg` match Discord's signatures.
+      let symbols = unsafe {
+         Symbols {
+            orig_name,
+            orig_child,
+            svg_new: std::mem::transmute::<usize, SvgNewFn>(svg_new_thunk),
+            push_svg: std::mem::transmute::<usize, PushSvgFn>(header.svg.push),
+            svg_color: header.svg.color,
+         }
+      };
+      let _ = SYMBOLS.set(symbols);
+      log::info!(
+         "desktop headers: hooked name @ {:#x} and child_node @ {:#x}",
+         header.name_producer,
+         header.child_node
+      );
+   }
+
+   #[allow(clippy::too_many_arguments)]
+   unsafe extern "C" fn name_producer_detour(
+      a0: usize,
+      a1: usize,
+      a2: usize,
+      a3: usize,
+      a4: usize,
+      a5: usize,
+      a6: usize,
+      a7: usize,
+      f0: f64,
+      f1: f64,
+      f2: f64,
+      f3: f64,
+      f4: f64,
+      f5: f64,
+      f6: f64,
+      f7: f64,
+      s0: usize,
+      s1: usize,
+      s2: usize,
+      s3: usize,
+      s4: usize,
+      s5: usize,
+      s6: usize,
+      s7: usize,
+   ) -> *mut c_void {
+      let Some(symbols) = SYMBOLS.get() else {
+         return std::ptr::null_mut();
+      };
+      // SAFETY: forwards every register and stack word to the original builder.
+      let ret = unsafe {
+         (symbols.orig_name)(
+            a0, a1, a2, a3, a4, a5, a6, a7, f0, f1, f2, f3, f4, f5, f6, f7, s0, s1, s2, s3, s4, s5,
+            s6, s7,
+         )
+      };
+      if HEADERS.active() && !ret.is_null() {
+         LAST_NAME_NODE.set(ret as usize);
+      }
+      ret
+   }
+
+   unsafe extern "C" fn child_node_detour(node: *mut c_void, child: *mut c_void) -> *mut c_void {
+      let Some(symbols) = SYMBOLS.get() else {
+         return node;
+      };
+      // SAFETY: forwards `child_node`'s own arguments.
+      let node = unsafe { (symbols.orig_child)(node, child) };
+      let last = LAST_NAME_NODE.get();
+      if last == 0 || child as usize != last {
+         return node;
+      }
+      LAST_NAME_NODE.set(0);
+      if !HEADERS.active() || node.is_null() {
+         return node;
+      }
+      let message_id = accessories::current_rendering_message_id();
+      let Ok(icons) = std::panic::catch_unwind(|| icons_for_message(message_id)) else {
+         return node;
+      };
+      append_icons(
+         node,
+         symbols.svg_new,
+         symbols.push_svg,
+         symbols.svg_color,
+         icons,
+      )
+   }
 }

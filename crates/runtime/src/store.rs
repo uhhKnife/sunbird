@@ -192,11 +192,7 @@ pub fn sqlite(database: &Path, sql: &str, args: &[String]) -> Result<Rows, Store
    let conn = open(database)?;
    let _ = conn.busy_timeout(Duration::from_secs(3));
    let mut stmt = conn.prepare(sql)?;
-   let columns = stmt
-      .column_names()
-      .into_iter()
-      .map(str::to_owned)
-      .collect::<Vec<_>>();
+   let columns = stmt.column_names().map(str::to_owned).collect::<Vec<_>>();
    let col_count = columns.len();
 
    let mut cursor = stmt.query(params_from_iter(args.iter().map(String::as_str)))?;

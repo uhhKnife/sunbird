@@ -152,6 +152,17 @@ pub struct RcInner {
    action_id: u64,
 }
 
+/// An `Rc<u64>` whose counts never reach zero, so Discord never frees it:
+/// for when Discord's allocator isn't located (macOS, whose Rust heap may be
+/// its own malloc zone). Leaks 24 bytes.
+pub fn pinned_rc_u64(value: u64) -> *mut RcInner {
+   Box::into_raw(Box::new(RcInner {
+      strong:    usize::MAX / 4,
+      weak:      usize::MAX / 4,
+      action_id: value,
+   }))
+}
+
 #[repr(C)]
 pub struct RcFnVtbl {
    pub drop_in_place: *const c_void,
@@ -243,6 +254,9 @@ struct GpuiSymbols {
    div_child_div:    DivChildDivFn,
    div_child_button: DivChildBtnFn,
    div_into_any:     DivIntoAnyFn,
+   /// Raw Discord address of `Div::into_any_element` (before `sret_caller`
+   /// wrapping on arm64), for sibling locators like `crate::modal`.
+   div_into_any_raw: usize,
    div_push_any:     Option<DivPushAnyFn>,
    str_into_any:     Option<StrIntoAnyFn>,
    text_block:       TextBlockFn,
@@ -476,8 +490,8 @@ unsafe extern "C" fn button_callback(
                };
                match phoenix_runtime::install_file(&file_name, bytes) {
                   Ok(installed) => {
-                     log::info!("sunbird settings: installed {installed} from {file_name}");
-                     phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                     log::info!("sunbird settings: {installed} from {file_name}");
+                     phoenix_ui_desktop::toast(&installed.to_string());
                      crate::modal::force_redraw();
                   },
                   Err(err) => {
@@ -497,8 +511,8 @@ unsafe extern "C" fn button_callback(
             std::thread::spawn(move || {
                match update::install_listed(&name) {
                   Ok(installed) => {
-                     log::info!("sunbird settings: installed {installed}");
-                     phoenix_ui_desktop::toast(&format!("Installed {installed}"));
+                     log::info!("sunbird settings: {installed}");
+                     phoenix_ui_desktop::toast(&installed.to_string());
                   },
                   Err(err) => {
                      log::warn!("sunbird settings: install {name}: {err}");
@@ -519,10 +533,15 @@ pub fn locate(image: &Image<'static>) -> bool {
       return true;
    }
 
-   let found = desktop::gpui(image).and_then(|gpui| {
-      let layout = desktop::gpui_layouts(image, &gpui)?;
-      Ok((gpui, layout))
-   });
+   let found = if crate::X86_CODE {
+      desktop::gpui(image).and_then(|gpui| {
+         let layout = desktop::gpui_layouts(image, &gpui)?;
+         let raw = gpui.div_into_any;
+         Ok((gpui, layout, raw))
+      })
+   } else {
+      arm64_builders(image)
+   };
    let (
       desktop::Gpui {
          caller_loc,
@@ -544,6 +563,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          ..
       },
       found_layout,
+      div_into_any_raw,
    ) = match found {
       Ok(found) => found,
       Err(err) => {
@@ -564,6 +584,7 @@ pub fn locate(image: &Image<'static>) -> bool {
          div_child_div:    std::mem::transmute::<usize, DivChildDivFn>(div_child_div),
          div_child_button: std::mem::transmute::<usize, DivChildBtnFn>(div_child_button),
          div_into_any:     std::mem::transmute::<usize, DivIntoAnyFn>(div_into_any),
+         div_into_any_raw,
          div_push_any:     div_push_any
             .map(|addr| std::mem::transmute::<usize, DivPushAnyFn>(addr)),
          str_into_any:     str_into_any
@@ -587,6 +608,40 @@ pub fn locate(image: &Image<'static>) -> bool {
    true
 }
 
+/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
+/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// are called the x86 way, result slot first, like the types here say.
+#[cfg(target_os = "macos")]
+fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+   let gpui = phoenix_sigs::macos::gpui(image)?;
+   let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
+   let raw = gpui.div_into_any;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr).ok_or_else(|| "no memory for a thunk".to_owned())
+   };
+   let thunked = desktop::Gpui {
+      div_new: thunk(gpui.div_new)?,
+      div_flex: thunk(gpui.div_flex)?,
+      div_flex_col: thunk(gpui.div_flex_col)?,
+      div_child_div: thunk(gpui.div_child_div)?,
+      div_child_button: thunk(gpui.div_child_button)?,
+      div_into_any: thunk(gpui.div_into_any)?,
+      str_into_any: gpui.str_into_any.map(thunk).transpose()?,
+      text_block: thunk(gpui.text_block)?,
+      switch_new: thunk(gpui.switch_new)?,
+      switch_into_div: thunk(gpui.switch_into_div)?,
+      button_new: thunk(gpui.button_new)?,
+      action_row: thunk(gpui.action_row)?,
+      ..gpui
+   };
+   Ok((thunked, layout, raw))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+   Err("no arm64 builders off macOS".to_owned())
+}
+
 /// `div.f(..)` for a `Div` builder taking and returning it by value.
 fn chain(f: DivMutFn, mut div: RawDiv) -> RawDiv {
    let mut out = RawDiv::zeroed();
@@ -595,9 +650,21 @@ fn chain(f: DivMutFn, mut div: RawDiv) -> RawDiv {
    out
 }
 
+/// `size` bytes aligned to `align` from Discord's allocator, once the builders
+/// are located.
+pub fn host_alloc(size: usize, align: usize) -> Option<*mut u8> {
+   // SAFETY: Discord's own `alloc_or_oom`, which aborts rather than return null.
+   SYMBOLS.get().map(|sym| unsafe { (sym.alloc_or_oom)(align, size) })
+}
+
 /// The `GpuiLayout` decoded from this `Discord.exe`.
 pub fn layout() -> Option<&'static GpuiLayout> {
    SYMBOLS.get().map(|sym| &sym.layout)
+}
+
+/// Discord's `alloc_or_oom`, once the builders are located.
+pub fn alloc_or_oom_addr() -> Option<usize> {
+   SYMBOLS.get().map(|sym| sym.alloc_or_oom as usize)
 }
 
 /// A `Div`'s `StyleRefinement`, written through the decoded field offsets.
@@ -936,7 +1003,7 @@ impl Builder {
 /// Returns the resolved address of `Div::into_any_element` for sibling desktop
 /// locators (`crate::modal`).
 pub fn div_into_any_addr() -> Option<usize> {
-   SYMBOLS.get().map(|s| s.div_into_any as usize)
+   SYMBOLS.get().map(|s| s.div_into_any_raw)
 }
 
 pub fn raw_div() -> Option<RawDiv> {
@@ -1151,6 +1218,9 @@ pub fn wrap_with_accessories(
          s.hsla(s.at.text_color, hsla);
          s.length(s.at.border_widths[3], gpui_px(3.0));
          s.hsla(s.at.border_color, hsla);
+         // A faint wash of the tint behind the whole row.
+         let [h, sat, l, _] = hsla;
+         s.solid_background([h, sat, l, 0.12]);
       });
    }
    if !b.push_any(&mut outer, &mut orig) {
@@ -1216,7 +1286,12 @@ static SVG: OnceLock<SvgSymbols> = OnceLock::new();
 
 /// Resolves the `Svg` builders, after [`locate`].
 pub fn locate_svg(image: &Image<'static>) {
-   let found = match desktop::svg_builders(image) {
+   let located = if crate::X86_CODE {
+      desktop::svg_builders(image)
+   } else {
+      arm64_svg_builders(image)
+   };
+   let found = match located {
       Ok(found) => found,
       Err(err) => {
          log::warn!("desktop gpui: {err}, icons fall back to text");
@@ -1243,6 +1318,26 @@ pub fn locate_svg(image: &Image<'static>) {
    };
    let _ = SVG.set(symbols);
    log::info!("desktop gpui: resolved Svg builders {found:x?}");
+}
+
+#[cfg(target_os = "macos")]
+fn arm64_svg_builders(image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   let svg = phoenix_sigs::macos::svg_builders(image)?;
+   let thunk = |addr: usize| {
+      phoenix_hook::image::sret_caller(addr)
+         .ok_or_else(|| "no memory for an Svg thunk".to_owned())
+   };
+   Ok(desktop::SvgBuilders {
+      new: thunk(svg.new)?,
+      path: thunk(svg.path)?,
+      into_any: thunk(svg.into_any)?,
+      ..svg
+   })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn arm64_svg_builders(_image: &Image<'_>) -> Result<desktop::SvgBuilders, String> {
+   Err("no arm64 Svg builders off macOS".to_owned())
 }
 
 /// Whether icons can be drawn.
@@ -1463,9 +1558,10 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
 
    // 1. Header + Category Tab Bar
    let summary = format!(
-      "v{} · {enabled_count}/{} plugins active · Ctrl+Shift+I for DevTools",
+      "v{} · {enabled_count}/{} plugins active · {} for DevTools",
       update::VERSION,
-      plugins.len()
+      plugins.len(),
+      phoenix_ui_desktop::DEVTOOLS_SHORTCUT,
    );
    root = b.push_div(root, b.text_block("Sunbird", &summary));
 
@@ -1749,7 +1845,8 @@ fn render_plugins_tab(
          for setting in &plugin.settings {
             let sid = format!("sunbird-set-{}-{}", plugin.name, setting.key);
             let sdesc = setting.description.as_deref().unwrap_or("");
-            // A text, number or secret setting: its value, and Edit for an input.
+            // A text, number or secret setting: its value, and Edit for an
+            // input.
             let edit_row = |shown: &str, initial: String, kind: FieldKind| {
                let sub = if sdesc.is_empty() {
                   shown.to_owned()
@@ -2109,7 +2206,10 @@ fn render_general_tab(b: &Builder, mut root: RawDiv) -> RawDiv {
       b.action_row(
          "sunbird-open-devtools",
          "Runtime Console & DevTools",
-         "Evaluate JavaScript in QuickJS and view live runtime logs (Ctrl+Shift+I).",
+         &format!(
+            "Evaluate JavaScript in QuickJS and view live runtime logs ({}).",
+            phoenix_ui_desktop::DEVTOOLS_SHORTCUT
+         ),
          "Open DevTools",
          BtnVariant::Secondary,
          BtnSize::Medium,

@@ -97,6 +97,7 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    for id in take_owned(&registry.mounts, name) {
       patches::mount::unmount(id);
    }
+   crate::bridge::forget_haptics(name);
    patches::forget(name);
 }
 

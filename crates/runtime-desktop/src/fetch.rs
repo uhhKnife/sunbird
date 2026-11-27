@@ -1,8 +1,8 @@
 //! `send` for the platform's HTTP stack, with the OS's TLS certificates
 //! instead of a bundled TLS library. `WinHTTP` follows the system proxy,
-//! libcurl the `*_proxy` environment variables.
+//! libcurl (the system's own on macOS) the `*_proxy` environment variables.
 
-#[cfg(target_os = "linux")] mod curl;
+#[cfg(unix)] mod curl;
 #[cfg(windows)] mod winhttp;
 
 use phoenix_runtime::fetch::{
@@ -24,7 +24,7 @@ pub fn send(request: &Request) -> Result<Response, FetchError> {
          message: format!("header {name} has a line break or NUL"),
       });
    }
-   #[cfg(target_os = "linux")]
+   #[cfg(unix)]
    return curl::send(request);
    #[cfg(windows)]
    return winhttp::send(request);

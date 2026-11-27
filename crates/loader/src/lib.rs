@@ -1,6 +1,6 @@
 //! `libphoenix.so` / `phoenix.dll`, injected through `DT_NEEDED` on Android,
-//! as a dylib on iOS, or loaded into Desktop Phoenix on Windows, through
-//! `LD_PRELOAD` on Linux and through `DYLD_INSERT_LIBRARIES` on macOS.
+//! as a dylib on iOS, or loaded into Desktop Phoenix on Windows and, through
+//! `LD_PRELOAD` on Linux and `DYLD_INSERT_LIBRARIES` on macOS.
 //!
 //! On Unix the constructor runs once the host library is mapped and relocated.
 //! Desktop hooks Discord synchronously, from `DllMain` or the constructor, then
@@ -8,23 +8,20 @@
 //! come from the bundle stored beside this library (when present) plus
 //! `$PHOENIX_HOME/plugins`.
 
-#[cfg(any(test, not(target_os = "macos")))]
-use std::path::PathBuf;
-#[cfg(not(target_os = "macos"))]
 use std::{
    env,
    panic::{
       self,
       AssertUnwindSafe,
    },
+   path::PathBuf,
 };
 
-use phoenix_runtime::console::Tee;
-#[cfg(not(target_os = "macos"))]
 use phoenix_runtime::{
    Error,
    Plugin,
    Started,
+   console::Tee,
 };
 
 #[cfg(unix)]
@@ -67,15 +64,14 @@ extern "C" fn init() {
    if linux::claim() {
       desktop();
    }
+   #[cfg(target_os = "macos")]
+   if macos::claim() {
+      desktop();
+   }
    #[cfg(target_os = "ios")]
    {
       logging();
       ios::start_with_phoenix();
-   }
-   #[cfg(target_os = "macos")]
-   {
-      logging();
-      macos::open_access_gate();
    }
    #[cfg(not(any(
       target_os = "ios",
@@ -91,19 +87,26 @@ extern "C" fn init() {
 /// Hooks Discord before its own code runs, since Desktop Phoenix settles on
 /// the access gate and reads its HTTP vtables in its first frames, then starts
 /// phoenix on a thread.
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 fn desktop() {
    logging();
    if env::var_os("SUNBIRD_GATE_ONLY").is_some() {
-      match phoenix_runtime_desktop::open_gate_only() {
-         Ok(()) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
-         Err(err) => log::error!("phoenix could not open the access gate: {err}"),
+      match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::open_gate_only)) {
+         Ok(Ok(())) => log::info!("SUNBIRD_GATE_ONLY: only the access gate is open"),
+         Ok(Err(err)) => log::error!("phoenix could not open the access gate: {err}"),
+         Err(_) => log::error!("phoenix panicked while opening the access gate"),
       }
       return;
    }
    let started = std::time::Instant::now();
-   if let Err(err) = phoenix_runtime_desktop::prepare() {
-      log::error!("phoenix could not hook Discord: {err}");
+   match panic::catch_unwind(AssertUnwindSafe(phoenix_runtime_desktop::prepare)) {
+      Ok(Ok(())) => {},
+      Ok(Err(err)) => log::error!("phoenix could not hook Discord: {err}"),
+      Err(_) => log::error!("phoenix panicked while hooking Discord"),
    }
    log::info!("hooked Discord in {:?}", started.elapsed());
    let _ = std::thread::Builder::new()
@@ -111,7 +114,6 @@ fn desktop() {
       .spawn(run);
 }
 
-#[cfg(not(target_os = "macos"))]
 fn run() {
    // Unwinding out of a constructor aborts the host, so a bug here costs
    // plugins, not the app.
@@ -136,7 +138,11 @@ fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_mobile::start(home, bundled)
 }
 
-#[cfg(any(windows, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(any(
+   windows,
+   target_os = "macos",
+   all(target_os = "linux", target_arch = "x86_64")
+))]
 fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
    phoenix_runtime_desktop::start(home, bundled)
 }
@@ -152,7 +158,6 @@ fn start(_home: PathBuf, _bundled: Vec<Plugin>) -> Result<Started, Error> {
    Err(Error::NoTarget)
 }
 
-#[cfg(not(target_os = "macos"))]
 fn home() -> PathBuf {
    if let Some(home) = env::var_os("PHOENIX_HOME") {
       return PathBuf::from(home);
@@ -182,7 +187,25 @@ fn home() -> PathBuf {
       );
       data.join("sunbird")
    }
-   #[cfg(all(unix, not(any(target_os = "ios", target_os = "linux"))))]
+   #[cfg(target_os = "macos")]
+   {
+      // Sits directly under macOS Phoenix's data directory, which holds
+      // `app.lock`, `modules/` and `store/<account>/cache.sqlite`, so its
+      // parent is the `store` root.
+      let data = env::var_os("LIBDISCORD_DATA_DIR").map_or_else(
+         || {
+            env::var_os("HOME")
+               .map_or_else(env::temp_dir, PathBuf::from)
+               .join("Library/Application Support/libdiscord")
+         },
+         PathBuf::from,
+      );
+      data.join("sunbird")
+   }
+   #[cfg(all(
+      unix,
+      not(any(target_os = "ios", target_os = "macos", target_os = "linux"))
+   ))]
    {
       // /proc/self/cmdline starts with the package name, plus `:process` for
       // secondary processes.
@@ -207,7 +230,6 @@ fn home() -> PathBuf {
    }
 }
 
-#[cfg(not(target_os = "macos"))]
 #[cfg_attr(
    not(unix),
    allow(
@@ -232,7 +254,7 @@ fn bundled() -> Vec<Plugin> {
    }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(unix)]
 mod unix {
    use std::{
       collections::BTreeMap,
@@ -363,6 +385,68 @@ mod linux {
    }
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+   use std::{
+      env,
+      ffi::OsStr,
+      os::unix::ffi::OsStrExt,
+      path::Path,
+   };
+
+   /// macOS Phoenix's executable, `Discord.app/Contents/MacOS/Discord`. The
+   /// Electron client's has the same name, and its registry walk then fails.
+   const CLIENT: &str = "Discord";
+
+   /// Whether this process is the client, after its re-exec. If so, takes
+   /// this library out of `DYLD_INSERT_LIBRARIES` so the client's children
+   /// (the CEF helpers, `osascript`) never load it. dyld kills an arm64e
+   /// child that is handed this arm64 library when SIP is off.
+   pub fn claim() -> bool {
+      let client = env::current_exe().is_ok_and(|exe| {
+         exe.file_name() == Some(OsStr::new(CLIENT))
+            && exe
+               .parent()
+               .is_some_and(|dir| dir.ends_with("Contents/MacOS"))
+      });
+      // Discord re-execs itself unless its malloc settings are set, which
+      // replaces this image before its own code runs; the new one needs the
+      // library still inserted. Launch Services sets them, so nothing re-execs.
+      let last_image = env::var_os(phoenix_sigs::MACOS_REEXEC).is_some()
+         || env::var_os(phoenix_sigs::MACOS_MALLOC).is_some();
+      if !client || !last_image {
+         return false;
+      }
+      if let Some(path) = super::unix::library_path() {
+         uninsert(Path::new(OsStr::from_bytes(path.to_bytes())));
+      }
+      true
+   }
+
+   fn uninsert(ours: &Path) {
+      let Some(inserted) = env::var_os("DYLD_INSERT_LIBRARIES") else {
+         return;
+      };
+      let kept = inserted
+         .as_bytes()
+         .split(|&byte| byte == b':')
+         .filter(|entry| {
+            !entry.is_empty() && Path::new(OsStr::from_bytes(entry)).file_name() != ours.file_name()
+         })
+         .collect::<Vec<_>>()
+         .join(&b':');
+      // SAFETY: constructors run before `main`, while dyld is the only
+      // thread.
+      unsafe {
+         if kept.is_empty() {
+            env::remove_var("DYLD_INSERT_LIBRARIES");
+         } else {
+            env::set_var("DYLD_INSERT_LIBRARIES", OsStr::from_bytes(&kept));
+         }
+      }
+   }
+}
+
 #[cfg(target_os = "ios")]
 mod ios {
    use std::{
@@ -417,45 +501,9 @@ mod ios {
    }
 }
 
-/// Desktop Phoenix on macOS, where only the access gate opens: the Desktop
-/// plugin runtime's hooks decode x86-64, and the app is arm64 only.
-#[cfg(target_os = "macos")]
-mod macos {
-   use phoenix_runtime::Error;
-
-   /// `mov w0, #2; ret`
-   const NO_GATE: [u8; 8] = [0x40, 0x00, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6];
-
-   /// Makes the `ClientAccessGate` read answer "no gate". Runs from the
-   /// constructor, since Desktop Phoenix settles on the gate in its first
-   /// frames.
-   pub fn open_access_gate() {
-      let image = match phoenix_runtime::target() {
-         Ok(image) => image,
-         // The CEF helpers inherit `DYLD_INSERT_LIBRARIES` and have no gate.
-         Err(Error::NoTarget) => return,
-         Err(err) => {
-            log::error!("phoenix could not find Discord: {err}");
-            return;
-         },
-      };
-      let access = match phoenix_sigs::macos::access_gate(&image) {
-         Ok(access) => access,
-         Err(err) => {
-            log::warn!("{err}, leaving it");
-            return;
-         },
-      };
-      // SAFETY: Discord's own code, written from the constructor before it
-      // runs.
-      match unsafe { image.write_code(access, &NO_GATE) } {
-         Ok(()) => log::info!("access gate: open, plugins do not run on macOS yet"),
-         Err(err) => log::error!("access gate: {err}"),
-      }
-   }
-}
-
-#[cfg(target_os = "ios")]
+/// To the unified log, where `log stream --predicate 'process == "Discord"'`
+/// shows it, since a launched app's stderr goes nowhere.
+#[cfg(target_vendor = "apple")]
 fn logging() {
    struct Syslog;
 
@@ -500,7 +548,7 @@ fn logging() {
    }
 }
 
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
+#[cfg(not(any(target_os = "android", target_vendor = "apple")))]
 fn logging() {
    use std::io::Write as _;
 

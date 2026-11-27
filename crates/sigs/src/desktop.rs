@@ -35,7 +35,6 @@ use phoenix_hook::{
 
 use crate::{
    Found,
-   StaffField,
    one,
 };
 
@@ -85,7 +84,7 @@ pub fn windows_restart_script(image: &Image<'_>) -> Found<usize> {
 
 /// A function entry [`Image::hook_entry`] can displace: whole instructions
 /// with no RIP-relative operand, at least 14 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Prologue {
    pub pattern: Pattern,
    pub len:     usize,
@@ -174,9 +173,7 @@ impl Prologues {
                   len:     15,
                }),
                sticker_check:   Some(Prologue {
-                  pattern: Pattern::new(
-                     "41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ?? ?? ?? ??",
-                  ),
+                  pattern: Pattern::new("41 57 41 56 41 55 41 54 56 57 55 53 48 81 EC ?? ?? ?? ??"),
                   len:     19,
                }),
                stream_quality:  Some(Prologue {
@@ -259,15 +256,6 @@ fn test_self(register: Register) -> [Vec<u8>; 2] {
       1 => [vec![0x45, 0x84, modrm], vec![0x45, 0x85, modrm]],
       _ if number >= 4 => [vec![0x40, 0x84, modrm], vec![0x85, modrm]],
       _ => [vec![0x84, modrm], vec![0x85, modrm]],
-   }
-}
-
-/// `cmp r8, imm8` on a register's low byte.
-fn cmp_byte(register: Register, value: u8) -> Vec<u8> {
-   match reg(register) {
-      (number, 1) => vec![0x41, 0x80, 0xF8 | number, value],
-      (number, _) if number >= 4 => vec![0x40, 0x80, 0xF8 | number, value],
-      (number, _) => vec![0x80, 0xF8 | number, value],
    }
 }
 
@@ -365,6 +353,8 @@ fn literal(image: &Image<'_>, text: &[u8]) -> Vec<usize> {
 pub mod layout {
    /// Bytes reserved for a `gpui::Div`, which is moved by value everywhere.
    pub const DIV_CAP: usize = 0x100;
+   /// Bytes reserved for a `mana_gpui::components::motion::effects::ScaleFade`.
+   pub const SCALE_FADE_CAP: usize = 0x200;
    /// Bytes reserved for each other Mana struct (`Switch`, `Button`, `Modal`,
    /// `TextInput`, `TextArea`, `MenuItem`).
    pub const SCRATCH_CAP: usize = 0x800;
@@ -837,281 +827,26 @@ pub(crate) fn callees(image: &Image<'_>, start: usize, end: usize) -> Vec<usize>
    out
 }
 
-/// The function `ClientAccessGate` reads through, which the runtime makes
-/// answer "no gate". Its one small caller is `signed_in && access(..) != 2`.
-pub fn access_gate(image: &Image<'_>) -> Found<usize> {
-   // The `call`'s offset in each: SysV aligns the stack with `push rax` first.
-   let (caller, call) = match Abi::of(image) {
-      Abi::Win64 => {
-         (
-            Pattern::new("83 79 ?? 03 75 0C E8 ?? ?? ?? ?? 3C 02 0F 95 C0 EB 02 31 C0"),
-            6,
-         )
-      },
-      Abi::SysV => {
-         (
-            Pattern::new("83 7F ?? 03 75 ?? 50 E8 ?? ?? ?? ?? 3C 02 0F 95 C0 48 83 C4 08 C3"),
-            7,
-         )
-      },
-   };
-   let caller = one("access gate caller", &image.scan(caller))?;
-   let access = rel32_target(image, caller + call + 1).ok_or("access gate call does not decode")?;
-   if image.is_code(access) {
-      Ok(access)
-   } else {
-      Err(format!(
-         "access gate call at {:#x} leaves the code",
-         caller + call
-      ))
-   }
-}
-
-/// The `movzx eax, cl` that carries the `surfaces` notification provider's
-/// "mine" answer into its return, which the runtime rewrites so it declines.
+/// Where the runtime makes the `surfaces` notification provider decline.
 ///
-/// For a gated client `surfaces` claims every message alert and hands it back
-/// empty, so the real alert is never built and nothing reaches the OS. The
-/// alert planner walks its providers; for a message only `surfaces` answers,
-/// and its predicate maps an experiment-derived alert kind to 1 or 2 ("mine",
-/// which the planner turns into an empty alert) instead of 0 ("not mine"), which
-/// would let the planner's fallback build the real alert through `libdiscord`'s
-/// notification path. The map is `mov al, [kind]; cmp al, 1; mov cl, 2;
-/// sbb cl, 0; cmp al, 2; movzx eax, cl; cmove eax, esi` with `esi = 0`; the
-/// runtime overwrites the `movzx eax, cl` with `xor eax, eax` so the predicate
-/// always answers 0 and the real builder runs, as it does on the official app.
+/// On System V, `client_access::enforced`'s start, to return false. On Win64,
+/// where that leaf is not confirmed, the `movzx eax, cl` in the predicate's
+/// kind mapping, to zero; the `cmove eax, esi` after it moves an `esi` zeroed
+/// on entry.
 pub fn notification_gate(image: &Image<'_>) -> Found<usize> {
-   let map = Pattern::new("3C 01 B1 02 80 D9 00 3C 02 0F B6 C1 0F 44 C6");
-   let at = one("notification gate", &image.scan(map))?;
-   Ok(at + 9)
-}
+   /// `client_access::enforced`: `push rax; mov eax, state; add rax, [rdi];
+   /// mov rdi, rax; call read; mov al, [rax + flag]; xor al, 1; pop rcx; ret`.
+   const ENFORCED: Pattern = Pattern::new(
+      "50 B8 ?? ?? ?? ?? 48 03 07 48 89 C7 FF 15 ?? ?? ?? ?? 8A 80 ?? ?? ?? ?? 34 01 59 C3",
+   );
+   /// The predicate's kind-mapping; its `movzx eax, cl` is at offset 9.
+   const MAP: Pattern = Pattern::new("3C 01 B1 02 80 D9 00 3C 02 0F B6 C1 0F 44 C6");
 
-/// Phoenix's `getEmojiUnavailableReason`, `u8 f(&Emoji, &EmojiContext)`,
-/// where 0xFF is usable and 2 premium locked.
-#[derive(Clone, Copy, Debug)]
-pub struct EmojiCheck {
-   pub func:      usize,
-   /// `EmojiContext.intention`, 3 (`CHAT`) for the message box.
-   pub intention: usize,
-}
-
-/// The same leaf Android has, answering 3 for profiles first.
-///
-/// `movzx r, byte [ctx + intention]; mov al, 3; mov r2, r; or r2, 2;
-/// cmp r2, 14; jne; ret`. The intention's offset is read back from the
-/// `movzx`, which must address the context argument.
-pub fn emoji_check(image: &Image<'_>) -> Found<EmojiCheck> {
-   let abi = Abi::of(image);
-   // And where the `movzx`'s ModRM sits.
-   let (check, modrm) = match abi {
-      Abi::Win64 => {
-         (
-            Pattern::new("44 0F B6 ?? ?? B0 03 45 89 ?? 41 83 ?? 02 41 83 ?? 0E 75 01 C3"),
-            3,
-         )
-      },
-      Abi::SysV => {
-         (
-            Pattern::new("0F B6 ?? ?? B0 03 89 ?? 83 ?? 02 83 ?? 0E 75 01 C3"),
-            2,
-         )
-      },
-   };
-   let func = one("emoji check", &image.scan(check))?;
-   let (context, _) = reg(abi.arg(1));
-   match image.read(func + modrm, 2) {
-      Some(&[modrm, disp]) if modrm & 0xC7 == 0x40 | context => {
-         Ok(EmojiCheck {
-            func,
-            intention: usize::from(disp),
-         })
-      },
-      _ => Err(format!("emoji check at {func:#x} reads no context byte")),
+   match Abi::of(image) {
+      Abi::Win64 => Ok(one("notification gate", &image.scan(MAP))? + 9),
+      Abi::SysV => one("notification gate", &image.scan(ENFORCED)),
    }
 }
-
-/// Phoenix's Go Live stream quality check:
-/// `bool f(&User, has_guild, guild_tier, preset, resolution, fps)`.
-///
-/// Found from the static 18-entry `ApplicationStreamSettingRequirements` table
-/// (starting with Source at 60, 30, and 15 FPS, each requiring full Nitro). The
-/// check loads the table in each of its Nitro and guild branches.
-pub fn stream_quality(image: &Image<'_>) -> Found<usize> {
-   const TABLE_HEAD: [u8; 48] = [
-      0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00,
-      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00,
-      0x00, 0x00, 0x00,
-   ];
-   let tables = image.find_bytes(&TABLE_HEAD);
-   let mut counts: HashMap<usize, usize> = HashMap::new();
-   for sites in lea_refs_many(image, &tables).into_values() {
-      for site in sites {
-         if let Some((func, _)) = image.function_bounds(site) {
-            *counts.entry(func).or_default() += 1;
-         }
-      }
-   }
-   let candidates: Vec<usize> = counts
-      .into_iter()
-      .filter(|&(_, count)| count >= 2)
-      .map(|(func, _)| func)
-      .collect();
-   one("stream quality check", &candidates)
-}
-
-/// Phoenix's `canUsePremiumFeature(feature, tier, ..) -> bool`, and the
-/// feature the Go Live picker asks it for before HD.
-#[derive(Clone, Copy, Debug)]
-pub struct PremiumFeature {
-   pub func:        usize,
-   /// `STREAM_HIGH_QUALITY`: the HD preset, its upsell and the picker's Nitro
-   /// banner all ask for it.
-   pub stream_high: u8,
-   /// The feature User Settings, Appearance, App Icon asks for, when the tier
-   /// lists are the ones it was measured on.
-   pub app_icons:   Option<u8>,
-}
-
-/// Nitro Basic's and Classic's feature lists on the build where unlocking one
-/// feature at a time showed app icons as 0x17. No code passes the id as a
-/// constant, so it is trusted only while the lists around it stay the same: a
-/// new or renumbered feature changes them.
-const BASIC_FEATURES: [u8; 11] = [
-   0x00, 0x01, 0x05, 0x06, 0x08, 0x0B, 0x0D, 0x0F, 0x15, 0x16, 0x17,
-];
-const CLASSIC_FEATURES: [u8; 8] = [0x00, 0x01, 0x02, 0x08, 0x12, 0x15, 0x16, 0x17];
-const MEASURED_APP_ICONS: u8 = 0x17;
-
-/// The tier lists the check loads, each as `mov edx, len; lea r8, [list]`.
-fn tier_lists(image: &Image<'_>, func: usize) -> Vec<Vec<u8>> {
-   const BODY: usize = 0x120;
-   let load = Pattern::new("BA ?? 00 00 00 4C 8D 05 ?? ?? ?? ??");
-   let Some(body) = image.read(func, BODY) else {
-      return Vec::new();
-   };
-   load
-      .find_in(body)
-      .into_iter()
-      .filter_map(|at| {
-         let len = usize::from(body[at + 1]);
-         let list = rel32_target(image, func + at + 8)?;
-         Some(image.read(list, len)?.to_vec())
-      })
-      .collect()
-}
-
-/// The premium feature check and its stream feature.
-///
-/// The check keeps a static list of features per tier, Nitro's being every
-/// feature in order, `00 01 .. 1B`, and loads it in one place. The stream
-/// feature comes from the picker's "Stream in HD resolution" banner, which
-/// opens with a call to a gate doing `mov dl, feature; call`.
-pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
-   const BACK: usize = 0x100;
-   if Abi::of(image) != Abi::Win64 {
-      return Err("the stream feature gate is only decoded on Win64".to_owned());
-   }
-   // A leaf has no unwind entry, so its start is the prologue closest before
-   // the load, after `int3` padding. Other enums list `00 .. 1B` too, in
-   // functions that open differently.
-   let prologue = prologues(image)
-      .premium_feature
-      .ok_or("no premium feature prologue")?;
-   let every: Vec<u8> = (0..0x1C).collect();
-   let lists = image.find_bytes(&every);
-   let funcs: HashSet<usize> = lea_refs_many(image, &lists)
-      .into_values()
-      .flatten()
-      .filter_map(|site| {
-         let start = site.checked_sub(BACK)?;
-         let at = *prologue.pattern.find_in(image.read(start, BACK)?).last()?;
-         let func = start + at;
-         (image.read(func - 1, 1)? == [0xCC]).then_some(func)
-      })
-      .collect();
-   let func = one(
-      "premium feature check",
-      &funcs.into_iter().collect::<Vec<_>>(),
-   )?;
-
-   let banners: HashSet<usize> =
-      lea_refs_many(image, &image.find_bytes(b"Stream in HD resolution"))
-         .into_values()
-         .flatten()
-         .filter_map(|site| Some(image.function_bounds(site)?.0))
-         .collect();
-   let banner = one("HD stream banner", &banners.into_iter().collect::<Vec<_>>())?;
-   let gate = Pattern::new("B2 ?? E8");
-   let features: Vec<u8> = calls_in(image, banner, 0x60)
-      .into_iter()
-      .filter_map(|(_, callee)| {
-         let body = image.read(callee, 0x30)?;
-         let at = *gate.find_in(body).first()?;
-         Some(body[at + 1])
-      })
-      .collect();
-   let stream_high = *features
-      .first()
-      .ok_or("the HD stream banner opens with no feature gate")?;
-
-   let lists = tier_lists(image, func);
-   let measured = lists.len() == 3
-      && lists.contains(&every)
-      && lists.iter().any(|list| list.as_slice() == BASIC_FEATURES)
-      && lists.iter().any(|list| list.as_slice() == CLASSIC_FEATURES);
-   Ok(PremiumFeature {
-      func,
-      stream_high,
-      app_icons: measured.then_some(MEASURED_APP_ICONS),
-   })
-}
-
-/// The accessor that copies the account's premium perks out of Phoenix's
-/// store, `fn(out: &mut Perks, store) -> &mut Perks`, and the perks byte that
-/// unlocks Nitro color themes.
-#[derive(Clone, Copy, Debug)]
-pub struct ThemePerk {
-   pub accessor: usize,
-   pub field:    u8,
-}
-
-/// The premium perks accessor and the byte Appearance, Theme reads from it.
-///
-/// The section opens with `call accessor; mov r14b, [rbx + field]`, and picks
-/// between "Unlock more themes with Nitro" and the Nitro page on that byte.
-/// The perks hold the tier's upload limit and its booleans, built from the
-/// tier, not from `canUsePremiumFeature`.
-pub fn theme_perk(image: &Image<'_>) -> Found<ThemePerk> {
-   if Abi::of(image) != Abi::Win64 {
-      return Err("the theme perk is only decoded on Win64".to_owned());
-   }
-   let sections: HashSet<usize> =
-      lea_refs_many(image, &image.find_bytes(b"Unlock more themes with"))
-         .into_values()
-         .flatten()
-         .filter_map(|site| Some(image.function_bounds(site)?.0))
-         .collect();
-   let load = Pattern::new("E8 ?? ?? ?? ?? 44 8A 73 ??");
-   let found: Vec<(usize, u8)> = sections
-      .into_iter()
-      .filter_map(|section| {
-         let head = image.read(section, 0xC0)?;
-         let at = *load.find_in(head).first()?;
-         let accessor = rel32_target(image, section + at + 1)?;
-         Some((accessor, head[at + 8]))
-      })
-      .collect();
-   let (accessor, field) = one("theme perk load", &found)?;
-   let prologue = prologues(image).perks.ok_or("no perks accessor prologue")?;
-   if !prologue.at(image, accessor) {
-      return Err(format!("perks accessor at {accessor:#x} opens differently"));
-   }
-   Ok(ThemePerk { accessor, field })
-}
-
-/// Settings page 24's sidebar name, `Phoenix`, and its id,
-/// `DESKTOP_PHOENIX`, both relabeled in place.
 
 /// The id the DM list gives its pending friend requests badge.
 pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
@@ -1119,11 +854,12 @@ pub const FRIENDS_BADGE: &[u8] = b"dm-friends-badge";
 pub const MESSAGE_REQUESTS_BADGE: &[u8] = b"dm-message-requests-badge";
 
 /// What draws Phoenix's pending friend and message request counts.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PendingCounts {
    /// The DM list's row badge, `fn(out, id: &str, count: u32, _, _) -> out`,
-   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only.
-   pub badge:           usize,
+   /// which draws [`FRIENDS_BADGE`] and [`MESSAGE_REQUESTS_BADGE`] only. Linux
+   /// builds give each id its own copy of it.
+   pub badges:          Vec<usize>,
    /// `u32 f(&RelationshipStore)`, the incoming friend and game friend
    /// requests the DM list's Friends row and the inbox's Friends tab show.
    pub friend_requests: usize,
@@ -1135,11 +871,15 @@ pub struct PendingCounts {
 pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
    let (friends_call, badge) = badge_call(image, FRIENDS_BADGE)?;
    let (_, requests_badge) = badge_call(image, MESSAGE_REQUESTS_BADGE)?;
-   if badge != requests_badge {
+   let badges = if badge == requests_badge {
+      vec![badge]
+   } else if same_shape(image, badge, requests_badge) {
+      vec![badge, requests_badge]
+   } else {
       return Err(format!(
          "the DM badges are drawn by {badge:#x} and {requests_badge:#x}"
       ));
-   }
+   };
    let friend_requests = count_source(image, friends_call)?;
    function_code(image, friend_requests, "friend requests count")?;
    if !counts_incoming(image, friend_requests) {
@@ -1148,9 +888,28 @@ pub fn pending_counts(image: &Image<'_>) -> Found<PendingCounts> {
       ));
    }
    Ok(PendingCounts {
-      badge,
+      badges,
       friend_requests,
    })
+}
+
+/// Whether `first` and `second` run the same instructions, whatever they
+/// branch to or call. Each copy of a generic calls its own copies of others.
+fn same_shape(image: &Image<'_>, first: usize, second: usize) -> bool {
+   let shape = |func: usize| {
+      function_code(image, func, "").map(|code| {
+         phoenix_hook::x86::disasm(code, func, usize::MAX)
+            .into_iter()
+            .map(|line| {
+               match line.target {
+                  Some(_) => line.text.split(' ').next().unwrap_or_default().to_owned(),
+                  None => line.text,
+               }
+            })
+            .collect::<Vec<String>>()
+      })
+   };
+   matches!((shape(first), shape(second)), (Ok(first), Ok(second)) if first == second)
 }
 
 /// `u32 f(&RelationshipStore)`, the number on the Home button.
@@ -1277,8 +1036,8 @@ fn count_source(image: &Image<'_>, site: usize) -> Found<usize> {
       let before = lines[..at].iter().rev().find(|prev| prev.text != "nop");
       return match before {
          Some(call) if call.text.starts_with("call ") => {
-            call
-               .target
+            call_target(image, &code[call.addr - func..], call.addr)
+               .map(|(_, target)| target)
                .ok_or_else(|| format!("call at {:#x} has no target", call.addr))
          },
          _ => Err(format!("{reg} at {:#x} is no call's result", line.addr)),
@@ -1326,102 +1085,34 @@ pub fn entry_prologue(image: &Image<'_>, func: usize) -> Found<Prologue> {
    Err(format!("{func:#x} opens with less than a jump's bytes"))
 }
 
-/// Settings page 24's sidebar name, `Phoenix`, and the `PHOENIX` that ends
-/// its id, both relabeled in place.
-#[derive(Clone, Copy, Debug)]
-pub struct SettingsLabel {
-   pub name: usize,
-   pub id:   usize,
+/// How the runtime sends a function's calls to a detour.
+#[derive(Clone, Debug)]
+pub enum HookPoint {
+   /// Its opening instructions move to a trampoline.
+   Entry(Prologue),
+   /// Its opening cannot move, and code only reaches it through these slots.
+   /// The function itself stays callable as the original.
+   Slots(Vec<usize>),
 }
 
-/// Page 24's label, from its one loader: `lea rax, [name]` with length 7,
-/// then a load of the id.
-///
-/// The id is `DESKTOP_PHOENIX` through Linux build 2233 and `PHOENIX` after
-/// it. COFF builds keep name and id as one literal, `PhoenixDESKTOP_PHOENIX`;
-/// ELF builds place them apart.
-pub fn settings_label_parts(image: &Image<'_>) -> Found<SettingsLabel> {
-   const NAME: &[u8] = b"Phoenix";
-   const ID: &[u8] = b"PHOENIX";
-   const PREFIX: &[u8] = b"DESKTOP_";
-   let suffixes = image.find_bytes(ID);
-   let ids: Vec<usize> = suffixes
-      .iter()
-      .filter_map(|&suffix| {
-         let start = suffix.checked_sub(PREFIX.len())?;
-         (image.read(start, PREFIX.len())? == PREFIX).then_some(start)
-      })
-      .chain(suffixes.iter().copied())
-      .collect();
-   let mut found: Vec<(usize, usize)> = lea_refs_many(image, &ids)
-      .into_iter()
-      .flat_map(|(id, loads)| loads.into_iter().map(move |lea| (id, lea)))
-      .filter_map(|(id, lea)| {
-         let start = lea.checked_sub(0x30)?;
-         let window = image.read(start, 0x30)?;
-         let at = window
-            .windows(3)
-            .rposition(|w| w == lea_rip(Register::RAX))?;
-         let name = rel32_target(image, start + at + 3)?;
-         let suffix = if image.read(id, ID.len())? == ID {
-            id
-         } else {
-            id + PREFIX.len()
-         };
-         (image.read(name, NAME.len())? == NAME).then_some((name, suffix))
-      })
-      .collect();
-   found.sort_unstable();
-   found.dedup();
-   let (name, id) = one("settings label loader", &found)?;
-   Ok(SettingsLabel { name, id })
-}
-
-/// The `cmp <arg2>, 0xf` immediate in `is_page_visible`, which the runtime
-/// lowers so page 24 is always shown.
-pub fn settings_visibility(image: &Image<'_>) -> Found<usize> {
-   // `movzx ecx, <page>; mov al, 1; lea <arg2>, [rcx-9]; cmp <arg2>, 0xf; ja
-   // ...`
-   let (guard, imm) = match Abi::of(image) {
-      Abi::Win64 => {
-         (
-            Pattern::new("0F B6 C9 B0 01 44 8D 41 F7 41 83 F8 0F 77"),
-            12,
-         )
-      },
-      Abi::SysV => (Pattern::new("40 0F B6 CF B0 01 8D 51 F7 83 FA 0F 77"), 11),
+/// [`entry_prologue`], or else the slots every call to `func` reads.
+pub fn hook_point(image: &Image<'_>, func: usize) -> Found<HookPoint> {
+   let entry = match entry_prologue(image, func) {
+      Ok(prologue) => return Ok(HookPoint::Entry(prologue)),
+      Err(err) => err,
    };
-   Ok(one("settings visibility guard", &image.scan(guard))? + imm)
-}
-
-/// `host::section`, which renders a settings page, and where its state keeps
-/// the active page.
-pub struct Section {
-   pub func:        usize,
-   pub page_offset: usize,
-}
-
-pub fn settings_section(image: &Image<'_>) -> Found<Section> {
-   /// `mov bl, [r15 + disp32]`, loading `self.active_page`.
-   const ACTIVE_PAGE_LOAD: Pattern = Pattern::new("41 8A 9F ?? ?? ?? ??");
-   let anchor = one("account-loading", &image.find_bytes(b"account-loading"))?;
-   let lea = one("account-loading load", &lea_refs(image, anchor))?;
-   let (func, _) = image
-      .function_bounds(lea)
-      .ok_or("settings section has no unwind entry")?;
-   if !prologues(image).frame.at(image, func) {
-      return Err("settings section prologue changed".to_owned());
+   if !image.rip_refs(func..func + 1).is_empty() {
+      return Err(entry);
    }
-   let head = image
-      .read(func, 0x160)
-      .ok_or("settings section is unmapped")?;
-   let page_offset = ACTIVE_PAGE_LOAD
-      .find_in(head)
+   let slots = image
+      .pointers_to(func)
       .into_iter()
-      .filter_map(|at| imm32(image, func + at + 3))
-      .find(|disp| (0x100..=0x2000).contains(disp))
-      .ok_or("settings section active page load not found")?;
-   Ok(Section { func, page_offset })
+      .filter(|&slot| !image.rip_refs(slot..slot + 1).is_empty())
+      .collect::<Vec<usize>>();
+   if slots.is_empty() {
+      return Err(format!("{entry}, and no code reads a pointer to it"));
+   }
+   Ok(HookPoint::Slots(slots))
 }
 
 /// Discord's own GPUI and Mana builders the settings page calls.
@@ -1452,178 +1143,6 @@ pub struct Gpui {
    pub button_on_click:  usize,
 }
 
-/// The builders, from the Developer Mode row of page 16 and the
-/// `TesterUpdates` sign-in button, which call them in a fixed order.
-#[expect(clippy::too_many_lines, reason = "one block per builder call site")]
-pub fn gpui(image: &Image<'_>) -> Found<Gpui> {
-   let abi = Abi::of(image);
-   let dev = one(
-      "set-devmode",
-      &image.find_bytes(b"set-devmodeDeveloper Mode"),
-   )?;
-   let lea_dev = one("set-devmode load", &lea_refs(image, dev))?;
-   let before_dev = calls_in(image, lea_dev - 0x70, 0x70);
-   let after_dev = calls_in(image, lea_dev, 0x240);
-   if before_dev.len() < 3 || after_dev.len() < 9 {
-      return Err(format!(
-         "page 16 call counts changed ({}, {})",
-         before_dev.len(),
-         after_dev.len()
-      ));
-   }
-   let (div_new_call, div_new) = before_dev[0];
-   let caller_loc =
-      arg1_lea_before(image, abi, div_new_call).ok_or("div_new Location not found")?;
-   let switch_on_change = after_dev[7].1;
-   let alloc_or_oom = calls_in(image, switch_on_change, 0x50)
-      .first()
-      .ok_or("alloc_or_oom not found in Switch::on_change")?
-      .1;
-
-   let btn = one(
-      "tester-updates-sign-in",
-      &literal(image, b"tester-updates-sign-in"),
-   )?;
-   let lea_btn = one("tester-updates-sign-in load", &lea_refs(image, btn))?;
-   let after_btn = calls_in(image, lea_btn, 0x1D0);
-   if after_btn.len() < 6 {
-      return Err(format!(
-         "TesterUpdates call count changed ({})",
-         after_btn.len()
-      ));
-   }
-   // `ActionRow` is the callee that opens with `div_new` and `flex`,
-   // `Button::on_click` the call before it and `Div::into_any_element` the one
-   // after. ELF builds drop a temporary in between, so the order is all that
-   // holds.
-   let div_flex = before_dev[1].1;
-   let (row_at, ar_calls) = after_btn
-      .iter()
-      .enumerate()
-      .skip(1)
-      .find_map(|(at, &(_, callee))| {
-         let (start, end) = image.function_bounds(callee)?;
-         let calls = calls_in(image, start, end - start);
-         (calls.first().map(|&(_, first)| first) == Some(div_new)
-            && calls.iter().take(4).any(|&(_, callee)| callee == div_flex))
-         .then_some((at, calls))
-      })
-      .ok_or("ActionRow no longer calls div_new and flex first")?;
-   let action_row = after_btn[row_at].1;
-   let div_into_any = after_btn
-      .get(row_at + 1)
-      .ok_or("Div::into_any_element not found after ActionRow")?
-      .1;
-   // Two blocks, a `div_new` each, that end in `div_child_div`. The first
-   // builds its text column three calls before that; the second's child
-   // before it is the button.
-   let second = ar_calls[1..]
-      .iter()
-      .position(|&(_, callee)| callee == div_new)
-      .ok_or("ActionRow builds one Div")?
-      + 1;
-   let div_child_div = ar_calls[second - 1].1;
-   let last_child = ar_calls
-      .iter()
-      .rposition(|&(_, callee)| callee == div_child_div)
-      .filter(|&at| at > second + 1 && second >= 4)
-      .ok_or("ActionRow no longer adds its children with div_child_div")?;
-   let div_child_button = ar_calls[last_child - 1].1;
-   let text_block = ar_calls[second - 4].1;
-   // Every style setter fetches the style first, so `div_style_mut` is the
-   // first call most of the row's setters make.
-   let mut firsts: HashMap<usize, usize> = HashMap::new();
-   for &(_, callee) in &ar_calls[..second] {
-      if let Some(&(_, first)) = calls_in(image, callee, 0x40).first() {
-         *firsts.entry(first).or_default() += 1;
-      }
-   }
-   let mut ranked: Vec<(usize, usize)> = firsts
-      .into_iter()
-      .filter(|&(first, count)| first != div_new && count >= 2)
-      .map(|(first, count)| (count, first))
-      .collect();
-   ranked.sort_unstable_by(|a, b| b.cmp(a));
-   let div_style_mut = clear_winner("div_style_mut", &ranked, 2)?;
-
-   // `SmallVec::<[AnyElement; 2]>::push`, after `lea arg0, [div + 0x40]`.
-   let child_calls = calls_in(image, div_child_div, 0x60);
-   let div_push_any = (child_calls.len() >= 2
-      && image.read(div_child_div, 0x50).is_some_and(|code| {
-         (0..code.len()).any(|at| lea_disp8(&code[at..], abi.arg(0)) == Some(0x40))
-      }))
-   .then(|| child_calls[1].1);
-   // `SharedString::into_any_element`, beside `div_child_div`, drops the
-   // `SharedString` it moved: `cmp r8, 0xff; je ..; cmp r8, 0x19`, on whichever
-   // register the compiler loaded the tag into.
-   let tag_checks: Vec<(Vec<u8>, Vec<u8>)> = [
-      Register::RAX,
-      Register::RCX,
-      Register::RDX,
-      Register::RBX,
-      Register::RSI,
-      Register::RDI,
-      Register::R8,
-      Register::R9,
-      Register::R10,
-      Register::R11,
-      Register::R12,
-      Register::R13,
-      Register::R14,
-      Register::R15,
-   ]
-   .into_iter()
-   .map(|register| (cmp_byte(register, 0xFF), cmp_byte(register, 0x19)))
-   .collect();
-   let str_into_any = calls_in(image, div_child_div, 0x400)
-      .into_iter()
-      .map(|(_, target)| target)
-      .find(|&target| {
-         image.read(target, 0x100).is_some_and(|body| {
-            tag_checks.iter().any(|(none, arc)| {
-               body
-                  .windows(2 * none.len() + 2)
-                  .any(|w| w.starts_with(none) && w.ends_with(arc))
-            })
-         })
-      });
-
-   Ok(Gpui {
-      caller_loc,
-      div_new,
-      div_flex,
-      div_flex_col: before_dev[2].1,
-      div_style_mut,
-      div_child_div,
-      div_child_button,
-      div_into_any,
-      div_push_any,
-      str_into_any,
-      text_block,
-      switch_new: after_dev[0].1,
-      switch_into_div: after_dev[8].1,
-      button_new: after_btn[0].1,
-      action_row,
-      alloc_or_oom,
-      switch_label: after_dev[2].1,
-      switch_desc: after_dev[5].1,
-      switch_on_change,
-      button_on_click: after_btn[row_at - 1].1,
-   })
-}
-
-/// The target of the last `lea arg1, [rip + disp32]` in the 32 bytes before
-/// `call`.
-fn arg1_lea_before(image: &Image<'_>, abi: Abi, call: usize) -> Option<usize> {
-   let start = call.checked_sub(0x20)?;
-   let bytes = image.read(start, 0x20)?;
-   let lea = lea_rip(abi.arg(1));
-   (0..=bytes.len() - 7)
-      .rev()
-      .find(|&idx| bytes[idx..idx + 3] == lea)
-      .and_then(|idx| rel32_target(image, start + idx + 3))
-}
-
 /// `StyleRefinement` field offsets, read by name from its derived `Debug`.
 /// Edges are `[top, right, bottom, left]`, corners `[top_left, top_right,
 /// bottom_right, bottom_left]` and sizes `[width, height]`.
@@ -1637,6 +1156,7 @@ pub struct StyleOffsets {
    pub text_color:      usize,
    pub white_space:     usize,
    pub flex_shrink:     usize,
+   pub opacity:         usize,
    pub background:      usize,
    pub border_color:    usize,
    pub overflow_x:      usize,
@@ -1794,6 +1314,7 @@ pub(crate) fn style_from_fields(
       text_color: get("text.color")?,
       white_space: get("text.white_space")?,
       flex_shrink: get("flex_shrink")?,
+      opacity: get("opacity")?,
       background: get("background")?,
       border_color: get("border_color")?,
       overflow_x: get("overflow.x")?,
@@ -1825,6 +1346,7 @@ pub(crate) fn style_from_fields(
       (style.text_color, 20),
       (style.white_space, 1),
       (style.flex_shrink, 8),
+      (style.opacity, 8),
       (style.background, 0x48),
       (style.border_color, 20),
       (style.overflow_x, 1),
@@ -2046,131 +1568,6 @@ pub fn gpui_layouts(image: &Image<'_>, gpui: &Gpui) -> Found<GpuiLayout> {
       div,
       switch,
       button,
-   })
-}
-
-/// `MessageRow::render`, and where its message keeps the id.
-pub struct MessageRow {
-   pub func:          usize,
-   pub msg_id_offset: usize,
-}
-
-/// The one function calling every helper that formats `message-content-{id}`.
-/// Builds since November 2026 keep two copies of the template, one per helper.
-pub fn message_row(image: &Image<'_>) -> Found<MessageRow> {
-   /// `lea rax, [rcx + disp32]`, the id the template formats.
-   const MSG_ID_LEA: Pattern = Pattern::new("48 8D 81 ?? ?? ?? ??");
-   let anchors = image.find_bytes(b"\x10message-content-\xc0\x00");
-   if anchors.is_empty() {
-      return Err("message-content template not found".to_owned());
-   }
-   let leas = anchors
-      .into_iter()
-      .flat_map(|anchor| lea_refs(image, anchor))
-      .collect::<Vec<_>>();
-   if leas.is_empty() {
-      return Err("nothing loads the message-content template".to_owned());
-   }
-   let msg_id_offset = leas
-      .iter()
-      .find_map(|&lea| {
-         let start = lea.saturating_sub(0x60);
-         let window = image.read(start, lea - start)?;
-         MSG_ID_LEA
-            .find_in(window)
-            .into_iter()
-            .rev()
-            .filter_map(|at| imm32(image, start + at + 3))
-            .find(|disp| (0x100..=0x2000).contains(disp))
-      })
-      .ok_or("message id load not found near the template")?;
-   let helpers = leas
-      .iter()
-      .filter_map(|&lea| Some(image.function_bounds(lea)?.0))
-      .collect::<HashSet<_>>();
-   let common = helpers
-      .iter()
-      .map(|&helper| callers(image, helper))
-      .filter(|parents| !parents.is_empty())
-      .reduce(|common, parents| common.intersection(&parents).copied().collect())
-      .unwrap_or_default();
-   let func = one(
-      "MessageRow::render",
-      &common.into_iter().collect::<Vec<_>>(),
-   )?;
-   if !prologues(image).row.at(image, func) {
-      return Err("MessageRow::render prologue changed".to_owned());
-   }
-   Ok(MessageRow {
-      func,
-      msg_id_offset,
-   })
-}
-
-/// `build_message_body`, and where its message and row colors sit.
-pub struct MessageBody {
-   pub func:              usize,
-   pub msg_id_offset:     usize,
-   pub row_colors_offset: usize,
-}
-
-/// The function `MessageRow::render` calls that loads the `message-edited-`
-/// template. Its prologue is [`Prologues::row`], or [`Prologues::frame`]
-/// where its frame fits in a page, as in Windows build gb71ec80.
-pub fn message_body(image: &Image<'_>, render_row: usize) -> Found<MessageBody> {
-   // `mov rcx, [arg0 + disp32]`, loading the message id.
-   let mut msg_id_mov = rm_disp8(0x8B, Register::RCX, Abi::of(image).arg(0));
-   msg_id_mov[2] += 0x40;
-   let anchor = one(
-      "message-edited template",
-      &image.find_bytes(b"\x0fmessage-edited-\xc0\x00"),
-   )?;
-   let pro = prologues(image);
-   let mut found = lea_refs(image, anchor)
-      .into_iter()
-      .filter_map(|lea| Some(image.function_bounds(lea)?.0))
-      .filter(|&func| pro.row.at(image, func) || pro.frame.at(image, func))
-      .filter(|&func| callers(image, func).contains(&render_row))
-      .collect::<Vec<_>>();
-   found.sort_unstable();
-   found.dedup();
-   let func = one("message body builder", &found)?;
-   let head = image
-      .read(func, 0x120)
-      .ok_or("message body builder is unmapped")?;
-   let msg_id_offset = head[..0x100]
-      .windows(3)
-      .enumerate()
-      .filter(|(_, w)| *w == msg_id_mov)
-      .filter_map(|(at, _)| imm32(image, func + at + 3))
-      .find(|disp| (0x100..=0x800).contains(disp))
-      .ok_or("message body id load not found")?;
-   // Three `mov r32, imm32` with consecutive `RowColors` field offsets
-   // `+0xc`, `+0x8` and `+0x4`. Newer builds take `lea r64, [arg1 + RowColors]`
-   // and pick the fields with `push imm8; pop`.
-   let arg1 = number(Abi::of(image).arg(1));
-   let row_colors_offset = head
-      .windows(15)
-      .enumerate()
-      .filter(|(_, w)| [w[0], w[5], w[10]].iter().all(|&op| op & 0xF8 == 0xB8))
-      .find_map(|(at, _)| {
-         let (a, c, d) = (
-            imm32(image, func + at + 1)?,
-            imm32(image, func + at + 6)?,
-            imm32(image, func + at + 11)?,
-         );
-         (a == c + 4 && c == d + 4 && (0x100..=0x400).contains(&d)).then(|| d - 4)
-      })
-      .or_else(|| {
-         mem_operands(head, 0x8D)
-            .find(|&(_, base, disp)| base == arg1 && (0x100..=0x400).contains(&disp))
-            .map(|(_, _, disp)| disp)
-      })
-      .ok_or("message body row colors not found")?;
-   Ok(MessageBody {
-      func,
-      msg_id_offset,
-      row_colors_offset,
    })
 }
 
@@ -2741,8 +2138,9 @@ fn written(line: &phoenix_hook::x86::Line) -> Option<&str> {
    Some(operands.split_once(',')?.0)
 }
 
-/// Locates [`MessageHeader`]. `body` is [`message_body`]'s function, whose
-/// auto-moderation avatar fallback draws a node SVG leaf.
+/// Locates [`MessageHeader`]. `body` is the function
+/// [`crate::locate::message::message_body`] found, whose auto-moderation
+/// avatar fallback draws a node SVG leaf.
 ///
 /// Every row builder adds the name with `mov child,from; call child_node`,
 /// where `from`, a register or a frame slot, holds what one function called
@@ -3543,83 +2941,6 @@ fn toolbar_append(
    imm32(image, append_fn + at + 60)
 }
 
-/// `Store::delete_message`, the client's optimistic delete. It shares the map
-/// and index deletes with the `MESSAGE_DELETE` handler and takes a lock.
-pub fn optimistic_delete(image: &Image<'_>, message_delete: usize) -> Found<usize> {
-   let (del_start, del_end) = image
-      .function_bounds(message_delete)
-      .ok_or("MESSAGE_DELETE handler has no unwind entry")?;
-   let del_callees = callees(image, del_start, del_end)
-      .into_iter()
-      .collect::<HashSet<_>>();
-   let mut parents: HashMap<usize, HashSet<usize>> = HashMap::new();
-   for (site, callee) in call_sites(image, |callee| del_callees.contains(&callee)) {
-      if let Some((parent, _)) = image.function_bounds(site) {
-         parents.entry(callee).or_default().insert(parent);
-      }
-   }
-   let mut found = Vec::new();
-   for parents in parents.values() {
-      if parents.len() != 2 || !parents.contains(&del_start) {
-         continue;
-      }
-      let Some(&other) = parents.iter().find(|&&parent| parent != del_start) else {
-         continue;
-      };
-      if found.contains(&other) || !prologues(image).frame.at(image, other) {
-         continue;
-      }
-      // `lock cmpxchg [..], r64` taking the store's write lock, inline or, in
-      // ELF builds, in the first function the head calls.
-      let cmpxchg = |at: usize| {
-         image.read(at, 0x80).is_some_and(|head| {
-            head
-               .windows(4)
-               .any(|w| w[0] == 0xF0 && w[1] & 0xF8 == 0x48 && w[2..] == [0x0F, 0xB1])
-         })
-      };
-      let locks = cmpxchg(other)
-         || calls_in(image, other, 0x40)
-            .first()
-            .is_some_and(|&(_, lock)| cmpxchg(lock));
-      let Some((start, end)) = image.function_bounds(other) else {
-         continue;
-      };
-      // 6 shared callees on the builds seen, at most 2 for unrelated callers.
-      let shared = callees(image, start, end)
-         .into_iter()
-         .filter(|callee| del_callees.contains(callee))
-         .count();
-      if locks && shared >= 4 {
-         found.push(other);
-      }
-   }
-   one("optimistic delete", &found)
-}
-
-/// Phoenix's `getStickerSendability`, `u8 f(&StickerContext, &Sticker)`: 0
-/// sendable, 1 with Nitro, 2 not at all and 3 with a boosted server.
-///
-/// It opens `mov al, 2; cmp dword ptr [ctx], 1; jne; mov rax, [ctx + 8];
-/// mov [rsp + ..], rax; movzx r8d, byte ptr [sticker + kind]; mov al, 2;
-/// cmp r8d, 1`, after its prologue saves three `xmm` registers.
-pub fn sticker_check(image: &Image<'_>) -> Found<usize> {
-   const BODY: Pattern = Pattern::new(
-      "B0 02 83 39 01 0F 85 ?? ?? ?? ?? 48 8B 41 08 48 89 44 24 ?? 44 0F B6 82 ?? ?? ?? ?? B0 02 41 83 F8 01",
-   );
-   let prologue = prologues(image)
-      .sticker_check
-      .ok_or("the sticker check is only known on Win64")?;
-   let mut found = image
-      .scan(BODY)
-      .into_iter()
-      .filter_map(|at| Some(image.function_bounds(at)?.0))
-      .filter(|&func| prologue.at(image, func))
-      .collect::<Vec<_>>();
-   found.dedup();
-   one("sticker check", &found)
-}
-
 /// `serde_json::from_slice::<Ready>`, `fn(out, &mut SliceRead)`, the first
 /// call of the `READY` handler. Phoenix's session parses READY with it too,
 /// past the registry, so a hook here sees every READY.
@@ -3648,15 +2969,18 @@ pub fn ready_parse(image: &Image<'_>, ready: usize) -> Found<usize> {
 /// mov [rsp + 0x20], rdx; mov [rsp + 0x28], r8
 /// ```
 pub fn ready_text(image: &Image<'_>, parse: usize) -> Found<usize> {
-   const PROLOGUE: Pattern = Pattern::new("41 56 56 57 53 48 81 EC ?? ?? ?? ?? 4C 89 C7");
    const READER: Pattern = Pattern::new("48 89 54 24 20 4C 89 44 24 28");
+   let prologue = prologues(image)
+      .ready_text
+      .ok_or("READY's text parse is only known on Win64")?;
    let mut callers = call_sites(image, |callee| callee == parse)
       .into_iter()
       .filter_map(|(site, _)| Some(image.function_bounds(site)?.0))
       .filter(|&func| {
-         image.read(func, 0x40).is_some_and(|head| {
-            PROLOGUE.find_in(head).first() == Some(&0) && !READER.find_in(head).is_empty()
-         })
+         prologue.at(image, func)
+            && image
+               .read(func, 0x40)
+               .is_some_and(|head| !READER.find_in(head).is_empty())
       })
       .collect::<Vec<_>>();
    callers.sort_unstable();
@@ -3737,97 +3061,15 @@ pub fn ready_session(image: &Image<'_>, parse: usize) -> Found<ReadySession> {
    }
 }
 
-/// `flag_override` in `StoreState`, from the inlined
-/// `(user.flags | flag_override) & 1`:
-///
-/// ```text
-/// cmp dword ptr [base + tag], 1    ; (41) 83 B8..BF <tag> 01
-/// jne +0x0e
-/// mov r64, qword ptr [base + value] ; 48..4F 8B <modrm> <value>
-/// cmp reg2, 1; je +9; jmp +0xe; xor r32, r32; cmp reg2, 1; jne +7
-/// or r64, qword ptr [base + flags]  ; 48..4F 0B <modrm> <flags>
-/// ```
-///
-/// The Linux build reads it off `r15`, behind REX prefixes, and lays
-/// `StoreState` out differently, so the base register is decoded with them.
-/// Reads off `&RwLock<StoreState>` sit 0x10 bytes higher, behind the lock, so
-/// the lower pair is the one gateway handlers see.
-pub fn staff(image: &Image<'_>) -> Found<StaffField> {
-   const CHECK: Pattern = Pattern::new(
-      "83 ?? ?? ?? ?? ?? 01 75 0E ?? 8B ?? ?? ?? ?? ?? 83 ?? 01 74 09 EB 0E 31 ?? 83 ?? 01 75 07 \
-       ?? 0B ?? ?? ?? ?? ??",
-   );
-   const LOCK_HEADER: usize = 0x10;
-   // `[base + disp32]` with no SIB byte, as `base` with REX.B folded in.
-   let base = |rex: u8, modrm: u8| {
-      (modrm >> 6 == 0b10 && modrm & 7 != 4).then_some(modrm & 7 | (rex & 1) << 3)
-   };
-   let rex_w = |byte: u8| (0x48..=0x4F).contains(&byte).then_some(byte);
-   let mut found = image
-      .scan(CHECK)
-      .into_iter()
-      .filter_map(|at| {
-         let bytes = image.read(at, 37)?;
-         let cmp_rex = match at.checked_sub(1).and_then(|before| image.read(before, 1)) {
-            Some([0x41]) => 0x41,
-            _ => 0x40,
-         };
-         let cmp = (bytes[1] & 0x38 == 0x38).then(|| base(cmp_rex, bytes[1]))??;
-         let mov = base(rex_w(bytes[9])?, bytes[11])?;
-         let or = base(rex_w(bytes[30])?, bytes[32])?;
-         if cmp != mov || mov != or {
-            return None;
-         }
-         let (tag, value) = (imm32(image, at + 2)?, imm32(image, at + 12)?);
-         (value == tag + 8).then_some(StaffField { tag, value })
-      })
-      .collect::<Vec<_>>();
-   found.sort_unstable();
-   found.dedup();
-   match found[..] {
-      [only] => Ok(only),
-      [direct, locked]
-         if locked.tag == direct.tag + LOCK_HEADER
-            && locked.value == direct.value + LOCK_HEADER =>
-      {
-         Ok(direct)
-      },
-      _ => {
-         Err(format!(
-            "staff flag reads disagree ({} variants)",
-            found.len()
-         ))
-      },
-   }
-}
-
-/// `MessageContextMenu` builder and native `MenuItem` helpers for injecting
-/// `phoenix.ui.addMessageAction` entries into right-click and `...` menus.
-pub struct MessageContextMenu {
-   pub build_fn:          usize,
-   pub msg_ptr_offset:    usize,
-   pub msg_id_offset:     usize,
-   pub channel_id_offset: usize,
-   pub props_new:         usize,
-   pub with_id:           usize,
-   pub with_icon:         usize,
-   pub with_color:        usize,
-   pub vec_push:          usize,
-   pub layout:            MenuLayout,
-}
-
-/// `MenuItem` and its `Action` variant.
-#[derive(Debug, Clone, Copy)]
-pub struct MenuLayout {
-   pub size:         usize,
-   /// `MenuItemProps` inside `MenuItem::Action`.
-   pub props:        usize,
-   pub props_size:   usize,
-   pub action_tag:   u64,
-   /// The click handler `Rc<dyn Fn>`, and the word before it Discord zeroes.
-   pub on_click:     usize,
-   pub on_click_tag: usize,
-}
+/// Nitro Basic's and Classic's feature lists on the build where unlocking one
+/// feature at a time showed app icons as 0x17. No code passes the id as a
+/// constant, so it is trusted only while the lists around it stay the same: a
+/// new or renumbered feature changes them.
+const BASIC_FEATURES: [u8; 11] = [
+   0x00, 0x01, 0x05, 0x06, 0x08, 0x0B, 0x0D, 0x0F, 0x15, 0x16, 0x17,
+];
+const CLASSIC_FEATURES: [u8; 8] = [0x00, 0x01, 0x02, 0x08, 0x12, 0x15, 0x16, 0x17];
+const MEASURED_APP_ICONS: u8 = 0x17;
 
 /// `MenuItem::Submenu`, from the constructor Discord's own submenus ("Create
 /// Reminder", "Apps") go through.
@@ -3856,7 +3098,8 @@ pub struct SubmenuLayout {
 /// ```
 pub fn submenu_layout(image: &Image<'_>) -> Found<SubmenuLayout> {
    const TAIL: Pattern = Pattern::new(
-      "48 8D 7B ?? 48 8D 75 ?? B9 ?? ?? 00 00 F3 A4 48 C7 03 ?? 00 00 00 48 89 43 ?? 48 8D 05 ?? ?? ?? ?? 48 89 43 ?? 48 C7 43 ?? ?? 00 00 00",
+      "48 8D 7B ?? 48 8D 75 ?? B9 ?? ?? 00 00 F3 A4 48 C7 03 ?? 00 00 00 48 89 43 ?? 48 8D 05 ?? \
+       ?? ?? ?? 48 89 43 ?? 48 C7 43 ?? ?? 00 00 00",
    );
    let mut found: Vec<SubmenuLayout> = image
       .scan(TAIL)
@@ -3864,13 +3107,15 @@ pub fn submenu_layout(image: &Image<'_>) -> Found<SubmenuLayout> {
       .filter_map(|at| {
          let b = image.read(at, 45)?;
          let builder = usize::from(b[25]);
-         (usize::from(b[36]) == builder + 8).then(|| SubmenuLayout {
-            tag: u64::from(b[18]),
-            builder,
-            kind: usize::from(b[40]),
-            kind_value: u64::from(b[41]),
-            props: usize::from(b[3]),
-            props_size: usize::from(u16::from_le_bytes([b[9], b[10]])),
+         (usize::from(b[36]) == builder + 8).then(|| {
+            SubmenuLayout {
+               tag: u64::from(b[18]),
+               builder,
+               kind: usize::from(b[40]),
+               kind_value: u64::from(b[41]),
+               props: usize::from(b[3]),
+               props_size: usize::from(u16::from_le_bytes([b[9], b[10]])),
+            }
          })
       })
       .collect();
@@ -3878,8 +3123,234 @@ pub fn submenu_layout(image: &Image<'_>) -> Found<SubmenuLayout> {
    match found.as_slice() {
       [layout] => Ok(*layout),
       [] => Err("no MenuItem::submenu constructor".to_owned()),
-      layouts => Err(format!("MenuItem::submenu constructors disagree: {layouts:x?}")),
+      layouts => {
+         Err(format!(
+            "MenuItem::submenu constructors disagree: {layouts:x?}"
+         ))
+      },
    }
+}
+
+/// Phoenix's `getStickerSendability`, `u8 f(&StickerContext, &Sticker)`: 0
+/// sendable, 1 with Nitro, 2 not at all and 3 with a boosted server.
+///
+/// It opens `mov al, 2; cmp dword ptr [ctx], 1; jne; mov rax, [ctx + 8];
+/// mov [rsp + ..], rax; movzx r8d, byte ptr [sticker + kind]; mov al, 2;
+/// cmp r8d, 1`, after its prologue saves three `xmm` registers.
+pub fn sticker_check(image: &Image<'_>) -> Found<usize> {
+   const BODY: Pattern = Pattern::new(
+      "B0 02 83 39 01 0F 85 ?? ?? ?? ?? 48 8B 41 08 48 89 44 24 ?? 44 0F B6 82 ?? ?? ?? ?? B0 02 \
+       41 83 F8 01",
+   );
+   let prologue = prologues(image)
+      .sticker_check
+      .ok_or("the sticker check is only known on Win64")?;
+   let mut found = image
+      .scan(BODY)
+      .into_iter()
+      .filter_map(|at| Some(image.function_bounds(at)?.0))
+      .filter(|&func| prologue.at(image, func))
+      .collect::<Vec<_>>();
+   found.dedup();
+   one("sticker check", &found)
+}
+
+/// Phoenix's Go Live stream quality check:
+/// `bool f(&User, has_guild, guild_tier, preset, resolution, fps)`.
+///
+/// Found from the static 18-entry `ApplicationStreamSettingRequirements` table
+/// (starting with Source at 60, 30, and 15 FPS, each requiring full Nitro). The
+/// check loads the table in each of its Nitro and guild branches.
+pub fn stream_quality(image: &Image<'_>) -> Found<usize> {
+   const TABLE_HEAD: [u8; 48] = [
+      0x00, 0x00, 0x00, 0x00, 0x3C, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x01, 0x00,
+      0x00, 0x00, 0x00,
+   ];
+   let tables = image.find_bytes(&TABLE_HEAD);
+   let mut counts: HashMap<usize, usize> = HashMap::new();
+   for sites in lea_refs_many(image, &tables).into_values() {
+      for site in sites {
+         if let Some((func, _)) = image.function_bounds(site) {
+            *counts.entry(func).or_default() += 1;
+         }
+      }
+   }
+   let candidates: Vec<usize> = counts
+      .into_iter()
+      .filter(|&(_, count)| count >= 2)
+      .map(|(func, _)| func)
+      .collect();
+   one("stream quality check", &candidates)
+}
+
+/// Phoenix's `canUsePremiumFeature(feature, tier, ..) -> bool`, and the
+/// feature the Go Live picker asks it for before HD.
+#[derive(Clone, Copy, Debug)]
+pub struct PremiumFeature {
+   pub func:        usize,
+   /// `STREAM_HIGH_QUALITY`: the HD preset, its upsell and the picker's Nitro
+   /// banner all ask for it.
+   pub stream_high: u8,
+   /// The feature User Settings, Appearance, App Icon asks for, when the tier
+   /// lists are the ones it was measured on.
+   pub app_icons:   Option<u8>,
+}
+
+/// The premium feature check and its stream feature.
+///
+/// The check keeps a static list of features per tier, Nitro's being every
+/// feature in order, `00 01 .. 1B`, and loads it in one place. The stream
+/// feature comes from the picker's "Stream in HD resolution" banner, which
+/// opens with a call to a gate doing `mov dl, feature; call`.
+pub fn premium_feature(image: &Image<'_>) -> Found<PremiumFeature> {
+   const BACK: usize = 0x100;
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the stream feature gate is only decoded on Win64".to_owned());
+   }
+   // A leaf has no unwind entry, so its start is the prologue closest before
+   // the load, after `int3` padding. Other enums list `00 .. 1B` too, in
+   // functions that open differently.
+   let prologue = prologues(image)
+      .premium_feature
+      .ok_or("no premium feature prologue")?;
+   let every: Vec<u8> = (0..0x1C).collect();
+   let lists = image.find_bytes(&every);
+   let funcs: HashSet<usize> = lea_refs_many(image, &lists)
+      .into_values()
+      .flatten()
+      .filter_map(|site| {
+         let start = site.checked_sub(BACK)?;
+         let at = *prologue.pattern.find_in(image.read(start, BACK)?).last()?;
+         let func = start + at;
+         (image.read(func - 1, 1)? == [0xCC]).then_some(func)
+      })
+      .collect();
+   let func = one(
+      "premium feature check",
+      &funcs.into_iter().collect::<Vec<_>>(),
+   )?;
+
+   let banners: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Stream in HD resolution"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let banner = one("HD stream banner", &banners.into_iter().collect::<Vec<_>>())?;
+   let gate = Pattern::new("B2 ?? E8");
+   let features: Vec<u8> = calls_in(image, banner, 0x60)
+      .into_iter()
+      .filter_map(|(_, callee)| {
+         let body = image.read(callee, 0x30)?;
+         let at = *gate.find_in(body).first()?;
+         Some(body[at + 1])
+      })
+      .collect();
+   let stream_high = *features
+      .first()
+      .ok_or("the HD stream banner opens with no feature gate")?;
+
+   let lists = tier_lists(image, func);
+   let measured = lists.len() == 3
+      && lists.contains(&every)
+      && lists.iter().any(|list| list.as_slice() == BASIC_FEATURES)
+      && lists.iter().any(|list| list.as_slice() == CLASSIC_FEATURES);
+   Ok(PremiumFeature {
+      func,
+      stream_high,
+      app_icons: measured.then_some(MEASURED_APP_ICONS),
+   })
+}
+
+/// The tier lists the check loads, each as `mov edx, len; lea r8, [list]`.
+fn tier_lists(image: &Image<'_>, func: usize) -> Vec<Vec<u8>> {
+   const BODY: usize = 0x120;
+   let load = Pattern::new("BA ?? 00 00 00 4C 8D 05 ?? ?? ?? ??");
+   let Some(body) = image.read(func, BODY) else {
+      return Vec::new();
+   };
+   load
+      .find_in(body)
+      .into_iter()
+      .filter_map(|at| {
+         let len = usize::from(body[at + 1]);
+         let list = rel32_target(image, func + at + 8)?;
+         Some(image.read(list, len)?.to_vec())
+      })
+      .collect()
+}
+
+/// The accessor that copies the account's premium perks out of Phoenix's
+/// store, `fn(out: &mut Perks, store) -> &mut Perks`, and the perks byte that
+/// unlocks Nitro color themes.
+#[derive(Clone, Copy, Debug)]
+pub struct ThemePerk {
+   pub accessor: usize,
+   pub field:    u8,
+}
+
+/// The premium perks accessor and the byte Appearance, Theme reads from it.
+///
+/// The section opens with `call accessor; mov r14b, [rbx + field]`, and picks
+/// between "Unlock more themes with Nitro" and the Nitro page on that byte.
+/// The perks hold the tier's upload limit and its booleans, built from the
+/// tier, not from `canUsePremiumFeature`.
+pub fn theme_perk(image: &Image<'_>) -> Found<ThemePerk> {
+   if Abi::of(image) != Abi::Win64 {
+      return Err("the theme perk is only decoded on Win64".to_owned());
+   }
+   let sections: HashSet<usize> =
+      lea_refs_many(image, &image.find_bytes(b"Unlock more themes with"))
+         .into_values()
+         .flatten()
+         .filter_map(|site| Some(image.function_bounds(site)?.0))
+         .collect();
+   let load = Pattern::new("E8 ?? ?? ?? ?? 44 8A 73 ??");
+   let found: Vec<(usize, u8)> = sections
+      .into_iter()
+      .filter_map(|section| {
+         let head = image.read(section, 0xC0)?;
+         let at = *load.find_in(head).first()?;
+         let accessor = rel32_target(image, section + at + 1)?;
+         Some((accessor, head[at + 8]))
+      })
+      .collect();
+   let (accessor, field) = one("theme perk load", &found)?;
+   let prologue = prologues(image).perks.ok_or("no perks accessor prologue")?;
+   if !prologue.at(image, accessor) {
+      return Err(format!("perks accessor at {accessor:#x} opens differently"));
+   }
+   Ok(ThemePerk { accessor, field })
+}
+
+/// `MessageContextMenu` builder and native `MenuItem` helpers for injecting
+/// `phoenix.ui.addMessageAction` entries into right-click and `...` menus.
+pub struct MessageContextMenu {
+   pub build_fn:          usize,
+   pub msg_ptr_offset:    usize,
+   pub msg_id_offset:     usize,
+   pub channel_id_offset: usize,
+   pub props_new:         usize,
+   pub with_id:           usize,
+   pub with_icon:         usize,
+   pub with_color:        usize,
+   pub vec_push:          usize,
+   pub layout:            MenuLayout,
+}
+
+/// `MenuItem` and its `Action` variant.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuLayout {
+   pub size:         usize,
+   /// `MenuItemProps` inside `MenuItem::Action`.
+   pub props:        usize,
+   pub props_size:   usize,
+   pub action_tag:   u64,
+   /// The click handler `Rc<dyn Fn>`, and the word before it Discord zeroes.
+   pub on_click:     usize,
+   pub on_click_tag: usize,
 }
 
 /// `(reg, base, disp)` of `op r64, [base + disp]` (`REX.W op /r` with a
@@ -5408,61 +4879,254 @@ pub fn settings_layer(image: &Image<'_>) -> Found<usize> {
    Ok(func)
 }
 
-/// The `tracing::Callsite` static naming `"media_fetch"` /
-/// `"libdiscord_media::fetch"`, the same data on every platform.
-pub(crate) fn media_fetch_callsite(image: &Image<'_>) -> Found<usize> {
-   let name = one(
-      "media_fetch tracing name",
-      &image.find_bytes(b"media_fetchlibdiscord_media::fetch"),
-   )?;
-   let target = name + 11;
-   let name_bytes = name.to_le_bytes();
-
-   let mut callsites = Vec::new();
-   for seg in image.segments.iter().filter(|s| !s.executable) {
-      let mut pos = 0;
-      while pos + 8 <= seg.bytes.len() {
-         let Some(rel) = seg.bytes[pos..]
-            .as_chunks::<8>()
-            .0
-            .iter()
-            .position(|chunk| *chunk == name_bytes)
-         else {
-            break;
-         };
-         let off = pos + rel * 8;
-         let slot = seg.addr + off;
-         if image.read_usize(slot + 8) == Some(11)
-            && image.read_usize(slot + 0x10) == Some(target)
-            && image.read_usize(slot + 0x18) == Some(23)
-            && let Some(callsite) = image.read_usize(slot + 0x30)
-         {
-            callsites.push(callsite);
-         }
-         pos = off + 8;
-      }
-   }
-   one("media_fetch callsite", &callsites)
+/// Decoded layout of `mana_gpui::components::motion::effects::ScaleFade` and
+/// its `ElementId` field.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFadeLayout {
+   pub size:               usize,
+   pub child:              usize,
+   pub opacity_range:      usize,
+   pub label_none:         usize,
+   pub element_id:         usize,
+   pub element_id_tag_off: usize,
+   pub element_id_tag:     u8,
+   pub element_id_key:     usize,
+   pub element_id_str:     usize,
+   pub progress:           usize,
+   pub scale_from:         usize,
+   pub origin:             usize,
+   pub fade:               usize,
 }
 
-/// Locates `libdiscord_media::fetch` via its `tracing::Metadata` callsite.
-///
-/// The callsite static names `"media_fetch"` / `"libdiscord_media::fetch"`,
-/// and the desktop runtime hooks the function to unwrap custom badge icon
-/// URLs (`/badge-icons/phx_u_<hex>`).
-pub fn media_fetch(image: &Image<'_>) -> Found<usize> {
-   let callsite = media_fetch_callsite(image)?;
-   let mut funcs: Vec<usize> = lea_refs(image, callsite)
-      .into_iter()
-      .filter_map(|site| Some(image.function_bounds(site)?.0))
-      .collect();
-   funcs.sort_unstable();
-   funcs.dedup();
-   let func = one("libdiscord_media::fetch", &funcs)?;
-   if !prologues(image).media_fetch.at(image, func) {
-      return Err("libdiscord_media::fetch prologue changed".to_owned());
+/// Discord's `ScaleFade::into_any_element`, its `Location` static, and its
+/// decoded struct layout.
+#[derive(Debug, Clone, Copy)]
+pub struct ScaleFade {
+   pub into_any:   usize,
+   pub caller_loc: usize,
+   pub layout:     ScaleFadeLayout,
+}
+
+pub(crate) fn validate_scale_fade_layout(layout: ScaleFadeLayout) -> Found<ScaleFadeLayout> {
+   const ELEMENT_ID_SIZE: usize = 0x28;
+   if !(0x40..=layout::SCALE_FADE_CAP).contains(&layout.size) {
+      return Err(format!("ScaleFade size {:#x} out of bounds", layout.size));
    }
-   Ok(func)
+   let check_spans = |what: &str, cap: usize, spans: &[(usize, usize)]| -> Found<()> {
+      for (i, &(off, len)) in spans.iter().enumerate() {
+         let end = off
+            .checked_add(len)
+            .filter(|&end| end <= cap)
+            .ok_or_else(|| format!("{what} field +{off:#x}..+{len:#x} exceeds {cap:#x}"))?;
+         for &(other_off, other_len) in &spans[i + 1..] {
+            let other_end = other_off.saturating_add(other_len);
+            if off < other_end && other_off < end {
+               return Err(format!(
+                  "{what} fields +{off:#x} and +{other_off:#x} overlap"
+               ));
+            }
+         }
+      }
+      Ok(())
+   };
+   check_spans("ElementId", ELEMENT_ID_SIZE, &[
+      (layout.element_id_tag_off, 1),
+      (layout.element_id_key, 8),
+      (layout.element_id_str, 24),
+   ])?;
+   check_spans("ScaleFade", layout.size, &[
+      (layout.child, layout::ANY_ELEMENT),
+      (layout.opacity_range, 8),
+      (layout.label_none, 1),
+      (layout.element_id, ELEMENT_ID_SIZE),
+      (layout.progress, 4),
+      (layout.scale_from, 4),
+      (layout.origin, 4),
+      (layout.fade, 1),
+   ])?;
+   Ok(layout)
+}
+
+/// Shared call-graph search for [`animation_frame`] and
+/// [`crate::macos::animation_frame`]: runs bounded BFS from `"modal-layer-scrim"`
+/// callees to the 12-byte closure scheduler (`on_next_frame_notify`), then picks
+/// the unique short caller whose targets are a subset of the spring tick's.
+pub(crate) fn find_animation_frame(
+   roots: Vec<usize>,
+   func_targets: impl Fn(usize) -> Vec<usize>,
+   is_notify: impl Fn(usize) -> bool,
+   callers_of: impl Fn(usize) -> Vec<usize>,
+   is_short: impl Fn(usize) -> bool,
+) -> Found<usize> {
+   let mut visited = HashSet::new();
+   let mut queue = std::collections::VecDeque::new();
+   for root in roots {
+      if visited.insert(root) {
+         queue.push_back((root, 0usize));
+      }
+   }
+   let mut edges = Vec::new();
+   while let Some((func, depth)) = queue.pop_front() {
+      if depth >= 4 || visited.len() > 96 {
+         continue;
+      }
+      for target in func_targets(func) {
+         if is_notify(target) {
+            edges.push((func, target));
+            continue;
+         }
+         if visited.insert(target) {
+            queue.push_back((target, depth + 1));
+         }
+      }
+   }
+   edges.sort_unstable();
+   edges.dedup();
+   let mut notify_fns: Vec<usize> = edges.iter().map(|&(_, n)| n).collect();
+   notify_fns.sort_unstable();
+   notify_fns.dedup();
+   let notify_fn = one("on_next_frame_notify", &notify_fns)?;
+   let parent_set: HashSet<usize> = edges
+      .iter()
+      .filter(|&&(_, n)| n == notify_fn)
+      .map(|&(parent, _)| parent)
+      .collect();
+   let parent_callees: HashSet<usize> = parent_set
+      .iter()
+      .flat_map(|&parent| func_targets(parent))
+      .collect();
+
+   let candidates: Vec<usize> = callers_of(notify_fn)
+      .into_iter()
+      .filter(|caller| !parent_set.contains(caller) && is_short(*caller))
+      .filter(|&caller| {
+         let targets = func_targets(caller);
+         (3..=5).contains(&targets.len())
+            && targets.contains(&notify_fn)
+            && targets.iter().all(|t| parent_callees.contains(t))
+      })
+      .collect();
+   one("animation_frame", &candidates)
+}
+
+fn x86_callers(image: &Image<'_>, target: usize) -> Vec<usize> {
+   let mut callers: Vec<usize> = image
+      .rip_refs(target..target + 1)
+      .into_iter()
+      .filter(|&(field, _)| {
+         field
+            .checked_sub(1)
+            .and_then(|op| image.read(op, 1))
+            .is_some_and(|b| matches!(b, [0xE8 | 0xE9]))
+      })
+      .filter_map(|(field, _)| Some(image.function_bounds(field)?.0))
+      .collect();
+   for slot in image.pointers_to(target) {
+      for (field, _) in image.rip_refs(slot..slot + 1) {
+         if field
+            .checked_sub(2)
+            .and_then(|op| image.read(op, 2))
+            .is_some_and(|b| matches!(b, [0xFF, 0x15 | 0x25]))
+            && let Some((func, _)) = image.function_bounds(field)
+         {
+            callers.push(func);
+         }
+      }
+   }
+   callers.sort_unstable();
+   callers.dedup();
+   callers
+}
+
+/// GPUI's per-view next-frame scheduler, `fn(window: *mut c_void, app: *mut
+/// c_void)`.
+pub fn animation_frame(image: &Image<'_>) -> Found<usize> {
+   let abi = Abi::of(image);
+   let scrim = one("modal-layer-scrim", &image.find_bytes(b"modal-layer-scrim"))?;
+   let mut roots = Vec::new();
+   for site in lea_refs(image, scrim) {
+      let Some(code) = image.read(site, 0xA0) else {
+         continue;
+      };
+      for idx in 0..code.len() {
+         if let Some((_, target)) = call_target(image, &code[idx..], site + idx)
+            && image.is_function(target)
+         {
+            roots.push(target);
+         }
+      }
+   }
+   roots.sort_unstable();
+   roots.dedup();
+
+   let func_targets = |func: usize| -> Vec<usize> {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return Vec::new();
+      };
+      let mut out = callees(image, start, end);
+      if let Some(bytes) = image.read(start, end.saturating_sub(start)) {
+         for idx in 0..bytes.len() {
+            if let Some(target) = jump_target(image, &bytes[idx..], start + idx)
+               && target != func
+               && image.is_function(target)
+            {
+               out.push(target);
+            }
+         }
+      }
+      out.sort_unstable();
+      out.dedup();
+      out
+   };
+
+   let sizes = imm_loads(abi.arg(0), 12);
+   let aligns = imm_loads(abi.arg(1), 4);
+   let is_notify = |func: usize| -> bool {
+      let Some((start, end)) = image.function_bounds(func) else {
+         return false;
+      };
+      let len = end.saturating_sub(start);
+      let Some(bytes) = (80..=640)
+         .contains(&len)
+         .then(|| image.read(start, len))
+         .flatten()
+      else {
+         return false;
+      };
+      let near = |a: &[Vec<u8>], b: &[Vec<u8>]| {
+         (0..bytes.len()).any(|at| {
+            let Some(rest) = bytes.get(at..) else {
+               return false;
+            };
+            a.iter().any(|pa| {
+               rest.starts_with(pa)
+                  && rest
+                     .get(pa.len()..(pa.len() + 12).min(rest.len()))
+                     .is_some_and(|win| {
+                        (0..win.len()).any(|off| b.iter().any(|pb| win[off..].starts_with(pb)))
+                     })
+            })
+         })
+      };
+      if !near(&sizes, &aligns) && !near(&aligns, &sizes) {
+         return false;
+      }
+      phoenix_hook::x86::disasm(bytes, start, usize::MAX)
+         .iter()
+         .any(|line| line.text.starts_with("call qword ptr [") || line.text.starts_with("call r"))
+   };
+
+   find_animation_frame(
+      roots,
+      func_targets,
+      is_notify,
+      |notify_fn| x86_callers(image, notify_fn),
+      |func| {
+         image
+            .function_bounds(func)
+            .is_some_and(|(start, end)| end.saturating_sub(start) <= 260)
+      },
+   )
 }
 
 /// `serde_json::to_value::<Message>`, which Phoenix runs to store a message,

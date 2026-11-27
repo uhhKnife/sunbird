@@ -171,16 +171,34 @@ struct Page {
 
 /// The open Settings screen and what phoenix added to it.
 struct Screen {
-   list:       i32,
-   /// Rust's own rows in the list and pages on the navigator, kept current
-   /// from its batches.
-   rust_rows:  Option<Vec<i32>>,
-   search:     Option<i32>,
-   navigator:  Option<i32>,
+   list:      i32,
+   rows:      Option<Rows>,
+   navigator: Option<Navigator>,
+   header:    Option<Props>,
+   stack:     Vec<Page>,
+}
+
+/// Rust's own rows in the list and pages on the navigator, kept current
+/// from its batches.
+struct Rows {
+   rust:   Vec<i32>,
+   search: Option<i32>,
+   entry:  Entry,
+}
+
+struct Navigator {
+   id:         i32,
    rust_pages: Option<Vec<i32>>,
-   header:     Option<Props>,
-   entry:      Option<Entry>,
-   stack:      Vec<Page>,
+}
+
+impl Screen {
+   fn navigator_id(&self) -> Option<i32> {
+      self.navigator.as_ref().map(|navigator| navigator.id)
+   }
+
+   fn rust_pages(&self) -> Option<&[i32]> {
+      self.navigator.as_ref()?.rust_pages.as_deref()
+   }
 }
 
 struct Settings {

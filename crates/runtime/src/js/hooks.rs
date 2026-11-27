@@ -1,6 +1,8 @@
 //! Gateway hooks: `phoenix.on`, `hook`, `dispatch` and `enqueue`, and the
 //! `before` and `after` phases that run them.
 
+use std::sync::Arc;
+
 use phoenix_sigs::registry::EventId;
 use rquickjs::{
    CatchResultExt,
@@ -18,8 +20,15 @@ use crate::{
       Before,
       Engine,
       Registry,
-      drain,
+      foreign_host,
       js_error,
+      restart_budget,
+      rewrite_refused,
+      saw,
+   },
+   permissions::{
+      Links,
+      Permissions,
    },
 };
 
@@ -34,49 +43,64 @@ impl Engine {
    /// Runs the `before` hooks for `event`. Each sees the previous hook's
    /// payload.
    pub fn before(&self, event: EventId, name: &str, json: &str) -> Result<Before, Error> {
-      let result = self.context.with(|ctx| {
+      self.with(|ctx| {
          let hooks = registered(&ctx, event, |hook| hook.before.as_ref());
          if hooks.is_empty() {
             return Ok(Before::Keep);
          }
+         let mut known = Links::scan(json);
+         saw(&ctx, &known);
          let mut payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
+         let mut current = json.to_owned();
+         let what = format!("before {name}");
          for (plugin, before) in hooks {
+            restart_budget(&ctx);
             match before.call::<_, Value<'_>>((payload.clone(),)).catch(&ctx) {
                Ok(result) if result.as_bool() == Some(false) => return Ok(Before::Drop),
                Ok(result) if result.is_undefined() => {},
                Ok(result) => payload = result,
-               Err(err) => log::error!("[{plugin}] before {name}: {err}"),
+               Err(err) => log::error!("[{plugin}] {what}: {err}"),
+            }
+            let now = ctx
+               .json_stringify(payload.clone())
+               .catch(&ctx)
+               .map_err(js_error)?
+               .ok_or_else(|| Error::Js(format!("a {what} hook returned no JSON value")))?
+               .to_string()
+               .map_err(|err| Error::Js(err.to_string()))?;
+            if now == current {
+               continue;
+            }
+            let links = Links::scan(&now);
+            if rewrite_refused(&ctx, &plugin, &what, &known, &links) {
+               payload = ctx
+                  .json_parse(current.as_str())
+                  .catch(&ctx)
+                  .map_err(js_error)?;
+            } else {
+               current = now;
+               known = links;
             }
          }
-         let json = ctx
-            .json_stringify(payload)
-            .catch(&ctx)
-            .map_err(js_error)?
-            .ok_or_else(|| Error::Js(format!("a before {name} hook returned no JSON value")))?;
-         Ok(Before::Replace(
-            json.to_string().map_err(|err| Error::Js(err.to_string()))?,
-         ))
-      });
-      drain(&self.runtime);
-      result
+         Ok(Before::Replace(current))
+      })
    }
 
    pub fn after(&self, event: EventId, name: &str, json: &str, ok: bool) -> Result<(), Error> {
-      let result = self.context.with(|ctx| {
+      self.with(|ctx| {
          let hooks = registered(&ctx, event, |hook| hook.after.as_ref());
          if hooks.is_empty() {
             return Ok(());
          }
          let payload = ctx.json_parse(json).catch(&ctx).map_err(js_error)?;
          for (plugin, after) in hooks {
+            restart_budget(&ctx);
             if let Err(err) = after.call::<_, ()>((payload.clone(), ok)).catch(&ctx) {
                log::error!("[{plugin}] after {name}: {err}");
             }
          }
          Ok(())
-      });
-      drain(&self.runtime);
-      result
+      })
    }
 
    #[must_use]
@@ -86,7 +110,7 @@ impl Engine {
       op: u32,
       frame_json: &str,
    ) -> gateway::SendAction {
-      let action = self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return gateway::SendAction::Pass;
          };
@@ -120,6 +144,7 @@ impl Engine {
             .and_then(|s| s.to_string().ok());
          let mut replaced = false;
          for (plugin, function) in hooks {
+            restart_budget(&ctx);
             match function.call::<_, Value<'_>>((payload.clone(),)).catch(&ctx) {
                Ok(result) if result.as_bool() == Some(false) => {
                   return gateway::SendAction::Drop;
@@ -158,9 +183,7 @@ impl Engine {
                },
                gateway::SendAction::Replace,
             )
-      });
-      drain(&self.runtime);
-      action
+      })
    }
 }
 
@@ -183,24 +206,29 @@ fn registered<'js>(
       .collect()
 }
 
-fn event_of<'js>(ctx: &Ctx<'js>, sig: &Value<'js>) -> rquickjs::Result<EventId> {
+fn event_of<'js>(
+   ctx: &Ctx<'js>,
+   sig: &Value<'js>,
+   permissions: &Permissions,
+) -> rquickjs::Result<EventId> {
    ctx.userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
       .handles
       .iter()
-      .find(|(_, handle)| handle.as_value() == sig)
-      .map(|(event, _)| *event)
+      .find(|(_, name, handle)| handle.as_value() == sig && permissions.event(name))
+      .map(|(event, ..)| *event)
       .ok_or_else(|| Exception::throw_type(ctx, "expected a hook point from phoenix.gateway"))
 }
 
 fn register<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
+   permissions: &Permissions,
    sig: &Value<'js>,
    before: Option<Function<'js>>,
    after: Option<Function<'js>>,
 ) -> rquickjs::Result<()> {
-   let event = event_of(ctx, sig)?;
+   let event = event_of(ctx, sig, permissions)?;
    gateway::install(event);
    ctx.userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
@@ -220,37 +248,50 @@ pub fn add_gateway_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    api: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    api.set(
       "on",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, sig: Value<'js>, listener: Function<'js>| {
-            register(&ctx, &name, &sig, None, Some(listener))
+            register(&ctx, &name, &granted, &sig, None, Some(listener))
          },
       )?,
    )?;
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    api.set(
       "hook",
       Function::new(
          ctx.clone(),
          move |ctx: Ctx<'js>, sig: Value<'js>, hooks: Object<'js>| {
-            register(&ctx, &name, &sig, hooks.get("before")?, hooks.get("after")?)
+            register(
+               &ctx,
+               &name,
+               &granted,
+               &sig,
+               hooks.get("before")?,
+               hooks.get("after")?,
+            )
          },
       )?,
    )?;
+   let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "dispatch",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
-            let event = event_of(&ctx, &sig)?;
+         move |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
+            let event = event_of(&ctx, &sig, &granted)?;
             let json = ctx
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "dispatch needs a JSON payload"))?
                .to_string()?;
+            refuse_foreign(&ctx, &owner, &json)?;
             gateway::dispatch(event, &json).ok_or_else(|| {
                Exception::throw_message(&ctx, "dispatch runs only inside a gateway hook")
             })
@@ -258,16 +299,19 @@ pub fn add_gateway_api<'js>(
       )?,
    )?;
 
+   let granted = Arc::clone(permissions);
+   let owner = plugin.to_owned();
    api.set(
       "enqueue",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
-            let event = event_of(&ctx, &sig)?;
+         move |ctx: Ctx<'js>, sig: Value<'js>, payload: Value<'js>| {
+            let event = event_of(&ctx, &sig, &granted)?;
             let json = ctx
                .json_stringify(payload)?
                .ok_or_else(|| Exception::throw_type(&ctx, "enqueue needs a JSON payload"))?
                .to_string()?;
+            refuse_foreign(&ctx, &owner, &json)?;
             gateway::enqueue(event, json);
             Ok::<_, rquickjs::Error>(())
          },
@@ -276,17 +320,34 @@ pub fn add_gateway_api<'js>(
    Ok(())
 }
 
-pub fn gateway_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
-   let base_gateway = ctx
+/// Refuses a `dispatch` or `enqueue` payload pointing Discord at a host the
+/// plugin has no grant for and Discord never sent.
+fn refuse_foreign(ctx: &Ctx<'_>, plugin: &str, json: &str) -> rquickjs::Result<()> {
+   foreign_host(ctx, plugin, json).map_or(Ok(()), |host| {
+      Err(Exception::throw_type(
+         ctx,
+         &format!("{host}: add it to the plugin's // @fetch line"),
+      ))
+   })
+}
+
+pub fn gateway_object<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   permissions: &Arc<Permissions>,
+) -> rquickjs::Result<Object<'js>> {
+   let gateway = Object::new(ctx.clone())?;
+   for (_, name, handle) in &ctx
       .userdata::<Registry<'js>>()
       .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
-      .gateway
-      .clone();
+      .handles
+   {
+      if permissions.event(name) {
+         gateway.set(name.as_str(), handle.clone())?;
+      }
+   }
    let object_ctor = ctx.globals().get::<_, Object>("Object")?;
-   let gateway: Object<'js> = object_ctor
-      .get::<_, Function>("assign")?
-      .call((Object::new(ctx.clone())?, base_gateway))?;
-   add_gateway_send_api(ctx, plugin, &gateway)?;
+   add_gateway_send_api(ctx, plugin, &gateway, permissions)?;
    object_ctor
       .get::<_, Function>("freeze")?
       .call((gateway,))
@@ -296,8 +357,10 @@ pub fn add_gateway_send_api<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    gateway_obj: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let name = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    let on_send = Function::new(
       ctx.clone(),
       move |ctx: Ctx<'js>, op: f64, handler: Function<'js>| {
@@ -321,6 +384,12 @@ pub fn add_gateway_send_api<'js>(
             return Err(Exception::throw_type(
                &ctx,
                "Identify (2) and Resume (6) carry credentials and cannot be hooked",
+            ));
+         }
+         if !granted.gateway_send(op) {
+            return Err(Exception::throw_type(
+               &ctx,
+               &format!("add {op} to the plugin's // @gateway-send line"),
             ));
          }
          let id = gateway::register_send_hook(&name, op);
@@ -366,7 +435,7 @@ mod tests {
    fn run_plugin(engine: &Engine, plugin: &str, code: &str) -> Result<bool, String> {
       engine.with(|ctx| {
          let run = || -> rquickjs::Result<bool> {
-            let gw = gateway_object(&ctx, plugin)?;
+            let gw = gateway_object(&ctx, plugin, &Arc::new(Permissions::Console))?;
             let wrapped = format!("(function (gateway) {{\n{code}\n}})");
             let val: Value<'_> = ctx.eval::<Function<'_>, _>(wrapped)?.call((gw,))?;
             Ok(val.as_bool().unwrap_or(true))

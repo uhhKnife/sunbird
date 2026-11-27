@@ -1,0 +1,25 @@
+export default {
+   description: "Strips profile themes, effects, avatar decorations, and name styles",
+   version: "0.2.1",
+   author: "amaanq",
+   permissions: {
+      gateway: [
+         "readySupplemental",
+         "initialGuild",
+         "guildCreate",
+         "messageCreate",
+         "messageUpdate",
+         "guildMemberAdd",
+         "guildMemberUpdate",
+         "guildMembersChunk",
+         "guildMemberListUpdate",
+         "presenceUpdate",
+         "presencesReplace",
+         "threadMembersUpdate",
+         "channelCreate",
+         "relationshipAdd",
+         "relationshipUpdate",
+      ],
+      discord: ["GET /users/@me", "GET /users/*/profile", "GET /channels/*/messages"],
+   },
+} satisfies Phoenix.Manifest;

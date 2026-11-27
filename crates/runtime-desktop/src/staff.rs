@@ -18,7 +18,13 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::StaffField as Field;
+use phoenix_sigs::{
+   StaffField as Field,
+   index::{
+      Index,
+      Isa,
+   },
+};
 
 const STAFF: u64 = 1;
 
@@ -27,23 +33,20 @@ static LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Scans Discord synchronously from `prepare` so `flag_override` is ready
 /// before the first gateway event fires.
-pub fn prepare(image: &Image<'_>) {
-   LOCATED.get_or_init(|| locate(image));
+pub fn prepare(ix: &Index<'_>) {
+   LOCATED.get_or_init(|| locate(ix));
 }
 
+/// Locates on its own index when [`prepare`] did not run.
 pub fn start(image: &'static Image<'static>) {
-   LOCATED.get_or_init(|| locate(image));
+   LOCATED.get_or_init(|| locate(&Index::new(image, Isa::HOST)));
 }
 
-fn locate(image: &Image<'_>) -> Option<Field> {
-   let located = if crate::X86_CODE {
-      phoenix_sigs::desktop::staff(image)
-   } else {
-      phoenix_sigs::macos::staff(image)
-   };
-   let field = located
+fn locate(ix: &Index<'_>) -> Option<Field> {
+   let field = phoenix_sigs::locate::staff::staff(ix)
       .inspect_err(|err| log::warn!("staff: {err}, leaving flag_override as is"))
-      .ok()?;
+      .ok()?
+      .field;
    log::info!(
       "staff: located flag_override at tag={:#x} value={:#x}",
       field.tag,

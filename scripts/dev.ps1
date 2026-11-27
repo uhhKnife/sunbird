@@ -147,20 +147,13 @@ if ($Tree) {
 if ($HotReload) {
    $entry = Join-Path $RepoRoot "plugins\$HotReload\src\index.ts"
    if (-not (Test-Path $entry)) { throw "Plugin entry not found: $entry" }
-   $esbuild = Find-Esbuild
-   $tmp = Join-Path ([System.IO.Path]::GetTempPath()) "phoenix-hot-$HotReload.js"
+   $env:ESBUILD = Find-Esbuild
+   $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "phoenix-hot"
+   $tmp = Join-Path $tmpDir "$HotReload.js"
    try {
-      $headerLines = Get-Content $entry | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" }
-      $banner = @()
-      foreach ($line in $headerLines) {
-         if ($line.StartsWith("//")) { $banner += $line } else { break }
-      }
-      & $esbuild $entry --bundle --format=iife --target=es2020 --outfile=$tmp
+      & node (Join-Path $RepoRoot "web\tools\bundle-plugins.ts") --out $tmpDir $HotReload
       if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       $body = [System.IO.File]::ReadAllText($tmp)
-      if ($banner.Count -gt 0) {
-         $body = ($banner -join "`n") + "`n" + $body
-      }
       Forward-DebugShell
       $resp = Invoke-RestMethod -Uri "http://127.0.0.1:4242/plugins/$HotReload" -Method Put -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) -ContentType "text/javascript; charset=utf-8" -Headers (Get-DebugHeaders)
       Write-Host "Hot-reloaded $HotReload`: $($resp | ConvertTo-Json -Compress)"

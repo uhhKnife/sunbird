@@ -47,10 +47,7 @@ use std::{
          AtomicU64,
          Ordering,
       },
-      mpsc::{
-         self,
-         Sender,
-      },
+      mpsc::Sender,
    },
    thread,
    time::Instant,
@@ -77,7 +74,7 @@ use crate::{
    patches::{
       banners::{
          BannerAction,
-         BannerSpec,
+         BannerQueue,
       },
       commands::Command,
       nodes::NodeMatch,
@@ -90,9 +87,9 @@ use crate::{
       },
       worker::{
          Job,
-         WORKER,
          queue,
          run,
+         take_jobs,
       },
    },
 };
@@ -377,74 +374,70 @@ struct Slot {
 
 #[derive(Default)]
 struct Patches {
-   mirror:                 Mirror,
-   templates:              Templates,
-   seen:                   Seen,
-   contributions:          Vec<Contribution>,
-   commands:               Vec<Command>,
-   interceptors:           usize,
-   pickers:                usize,
-   event_hooks:            Vec<EventHookMeta>,
-   node_watchers:          Vec<NodeWatcher>,
-   prop_rules:             Vec<PropPatch>,
+   mirror:         Mirror,
+   templates:      Templates,
+   seen:           Seen,
+   contributions:  Vec<Contribution>,
+   commands:       Vec<Command>,
+   interceptors:   usize,
+   pickers:        usize,
+   event_hooks:    Vec<EventHookMeta>,
+   node_watchers:  Vec<NodeWatcher>,
+   prop_rules:     Vec<PropPatch>,
    /// Live lists discovered for each `PatchTarget::List` prop patch (by patch
    /// id).
-   patched_lists:          HashMap<i32, HashSet<u64>>,
-   slots:                  Vec<Slot>,
-   anchors:                HashMap<Target, HashSet<i32>>,
-   handlers:               HashMap<i32, Handler>,
-   results:                HashMap<(ContributionId, Place), Outcome>,
-   pending:                HashSet<(ContributionId, Place)>,
-   next_id:                i32,
+   patched_lists:  HashMap<i32, HashSet<u64>>,
+   slots:          Vec<Slot>,
+   anchors:        HashMap<Target, HashSet<i32>>,
+   handlers:       HashMap<i32, Handler>,
+   results:        HashMap<(ContributionId, Place), Outcome>,
+   pending:        HashSet<(ContributionId, Place)>,
+   next_id:        i32,
    /// The channel last seen open.
-   channel:                Option<String>,
-   suggestions:            commands::Suggestions,
+   channel:        Option<String>,
+   suggestions:    commands::Suggestions,
    /// Sends plugins already saw, let through once when Rust gets them back.
-   resent:                 Vec<Vec<u8>>,
+   resent:         Vec<Vec<u8>>,
    /// The user a member or header decoration's place is about, once the
    /// worker read it from Phoenix's cache.
-   users:                  HashMap<Place, Option<String>>,
+   users:          HashMap<Place, Option<String>>,
    /// Member slots that take the room a stretched name had, by parent.
-   grown:                  HashSet<i32>,
+   grown:          HashSet<i32>,
    /// Ops for Phoenix's own nodes, sent after the batch that creates them.
-   late:                   Vec<Op>,
+   late:           Vec<Op>,
    /// Message text color plugins asked for, by message id.
-   tints:                  HashMap<String, i64>,
+   tints:          HashMap<String, i64>,
    /// Phoenix's author and content text nodes: their message and props as
    /// Phoenix set them.
-   texts:                  HashMap<i32, (String, Props)>,
+   texts:          HashMap<i32, (String, Props)>,
    /// The plugin tab open on each profile pager.
-   shown:                  HashMap<i32, ContributionId>,
+   shown:          HashMap<i32, ContributionId>,
    /// The height Rust last gave each pager.
-   rust_heights:           HashMap<i32, Value>,
+   rust_heights:   HashMap<i32, Value>,
    /// The height of each plugin page, by pager.
-   page_heights:           HashMap<(i32, ContributionId), f64>,
+   page_heights:   HashMap<(i32, ContributionId), f64>,
    /// What is typed in the text boxes of plugin pages, so a redraw keeps it.
-   typed:                  HashMap<(ContributionId, Place, u32), String>,
+   typed:          HashMap<(ContributionId, Place, u32), String>,
    /// A plugin tab's text and bar, by the tab.
-   tab_parts:              HashMap<i32, (i32, i32)>,
+   tab_parts:      HashMap<i32, (i32, i32)>,
    /// Open menu sheets and who waits for them.
-   menus:                  HashMap<u32, Sender<i32>>,
+   menus:          HashMap<u32, Sender<i32>>,
    /// Pagers whose own tab labels we color, since a plugin tab was opened:
    /// their animation stops at Phoenix's last tab and would light it up.
-   static_tabs:            HashSet<i32>,
+   static_tabs:    HashSet<i32>,
    /// Accessibility ids hidden by `phoenix.ui.hide`, with active refcount.
-   hidden:                 HashMap<String, usize>,
+   hidden:         HashMap<String, usize>,
    /// `(handle, plugin, aid)` entries for `phoenix.ui.hide`.
-   hidden_entries:         Vec<(u64, String, String)>,
+   hidden_entries: Vec<(u64, String, String)>,
    /// Node ids on which `phoenix.ui.hide` currently holds `hidden: true`
    /// (`View.GONE`). Reconciled on every batch so dynamic swaps (like
    /// `"Record Voice Message"` -> `"send"` inside the same wrapper) restore
    /// visibility automatically.
-   hidden_nodes:           HashSet<i32>,
-   /// When the root view first became ready, so cold-start banners wait for
-   /// the splash screen to clear.
-   root_ready_at:          Option<Instant>,
+   hidden_nodes:   HashSet<i32>,
    /// Banners waiting for the root view / cold-start settle delay.
-   pending_banners:        Vec<BannerSpec>,
-   banner_flush_scheduled: bool,
+   banner_queue:   BannerQueue,
    /// Tap actions for currently visible in-app notification banners, by id.
-   banner_actions:         HashMap<u32, BannerAction>,
+   banner_actions: HashMap<u32, BannerAction>,
 }
 
 static ROOT_ID: AtomicI32 = AtomicI32::new(0);
@@ -483,11 +476,10 @@ fn patches() -> MutexGuard<'static, Patches> {
 
 /// Hooks the UI bridge and starts the worker that runs plugin callbacks.
 pub fn start() {
-   let (sender, receiver) = mpsc::channel::<Job>();
-   if WORKER.set(sender).is_err() {
+   let Some(receiver) = take_jobs() else {
       log::warn!("patches: already started");
       return;
-   }
+   };
    emoji::install();
    bridge::install(Box::new(PatchSink));
    // The chat header and message box are built once, before the first

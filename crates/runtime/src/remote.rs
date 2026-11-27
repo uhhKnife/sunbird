@@ -22,12 +22,9 @@ use std::{
    sync::{
       LazyLock,
       Mutex,
+      MutexGuard,
       OnceLock,
       PoisonError,
-      atomic::{
-         AtomicBool,
-         Ordering,
-      },
    },
    thread,
    time::Duration,
@@ -55,9 +52,8 @@ pub const ADDR: &str = "127.0.0.1:4242";
 const MAX_BODY: usize = 4 << 20;
 const MAX_EVENTS_LOG: usize = 256;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
-static RUNNING: AtomicBool = AtomicBool::new(false);
-static BOUND_ADDR: OnceLock<String> = OnceLock::new();
+static SHELL: Mutex<Shell> = Mutex::new(Shell::Off);
+
 static EVENTS: Ring = Ring::new(MAX_EVENTS_LOG);
 
 /// The last entries of a debug log, as JSON.
@@ -157,19 +153,46 @@ pub fn clear_events() {
    EVENTS.clear();
 }
 
-#[must_use]
-pub fn enabled() -> bool {
-   ENABLED.load(Ordering::Relaxed)
+/// The user's switch and the listener thread together. `Armed` is on without a
+/// listener, `Stopping` is off with the listener thread still running. Only
+/// that thread leaves `Stopping`, so turning the shell back on before it
+/// notices keeps the same listener.
+enum Shell {
+   Off,
+   Armed,
+   Listening(SocketAddr),
+   Stopping(SocketAddr),
 }
 
+fn shell() -> MutexGuard<'static, Shell> {
+   SHELL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[must_use]
+pub fn enabled() -> bool {
+   matches!(*shell(), Shell::Armed | Shell::Listening(_))
+}
+
+/// Flips the switch without starting a listener.
 pub fn set_flag(on: bool) {
-   ENABLED.store(on, Ordering::Relaxed);
+   let mut state = shell();
+   *state = match (on, &*state) {
+      (true, Shell::Off | Shell::Armed) => Shell::Armed,
+      (true, Shell::Listening(addr) | Shell::Stopping(addr)) => Shell::Listening(*addr),
+      (false, Shell::Off | Shell::Armed) => Shell::Off,
+      (false, Shell::Listening(addr) | Shell::Stopping(addr)) => Shell::Stopping(*addr),
+   };
 }
 
 pub fn set_enabled(on: bool) {
-   ENABLED.store(on, Ordering::Relaxed);
-   if on {
-      ensure_started();
+   set_flag(on);
+   ensure_started();
+}
+
+fn bound() -> Option<SocketAddr> {
+   match *shell() {
+      Shell::Listening(addr) | Shell::Stopping(addr) => Some(addr),
+      Shell::Off | Shell::Armed => None,
    }
 }
 
@@ -203,10 +226,7 @@ fn write_token_file() {
    let (Some(token), Some(token_file)) = (TOKEN.get(), TOKEN_FILE.get()) else {
       return;
    };
-   let owns_port = BOUND_ADDR
-      .get()
-      .and_then(|addr| addr.parse::<SocketAddr>().ok())
-      .is_some_and(|addr| addr.port() == SHELL_PORT);
+   let owns_port = bound().is_some_and(|addr| addr.port() == SHELL_PORT);
    if !owns_port {
       return;
    }
@@ -230,7 +250,10 @@ fn write_token_file() {
 /// The dashboard's URL, with the token when one is required.
 #[must_use]
 pub fn dashboard_url() -> String {
-   let url = format!("http://{}/ui", bound_addr());
+   let url = bound().map_or_else(
+      || format!("http://{ADDR}/ui"),
+      |addr| format!("http://{addr}/ui"),
+   );
    match TOKEN.get() {
       Some(token) => format!("{url}?token={token}"),
       None => url,
@@ -285,13 +308,6 @@ fn token_given(req: &Request, token: &str) -> (bool, bool) {
    (in_query || elsewhere, in_query)
 }
 
-/// Returns the actual bound `host:port` of the localhost server, falling back
-/// to [`ADDR`] if not started yet.
-#[must_use]
-pub fn bound_addr() -> &'static str {
-   BOUND_ADDR.get().map_or(ADDR, String::as_str)
-}
-
 fn bind_localhost() -> std::io::Result<(TcpListener, SocketAddr)> {
    for port in SHELL_PORT..=SHELL_PORT + 10 {
       if let Ok(listener) = TcpListener::bind(("127.0.0.1", port))
@@ -306,28 +322,31 @@ fn bind_localhost() -> std::io::Result<(TcpListener, SocketAddr)> {
 }
 
 pub fn ensure_started() {
-   if !enabled() {
-      return;
-   }
-   if RUNNING.swap(true, Ordering::AcqRel) {
+   let mut state = shell();
+   if !matches!(*state, Shell::Armed) {
       return;
    }
    let (listener, addr) = match bind_localhost() {
       Ok(bound) => bound,
       Err(err) => {
          log::error!("remote shell: bind 127.0.0.1 failed: {err}");
-         RUNNING.store(false, Ordering::Release);
          return;
       },
    };
-   let addr_str = addr.to_string();
-   let _ = BOUND_ADDR.set(addr_str.clone());
+   *state = Shell::Listening(addr);
+   drop(state);
    write_token_file();
    let _ = listener.set_nonblocking(true);
-   log::info!("debug shell listening on http://{addr_str}");
+   log::info!("debug shell listening on http://{addr}");
 
    thread::spawn(move || {
-      while enabled() {
+      loop {
+         let mut state = shell();
+         if matches!(*state, Shell::Stopping(_)) {
+            *state = Shell::Off;
+            break;
+         }
+         drop(state);
          match listener.accept() {
             Ok((stream, _)) => {
                thread::spawn(move || handle(stream));
@@ -342,7 +361,6 @@ pub fn ensure_started() {
          }
       }
       log::info!("remote shell stopped");
-      RUNNING.store(false, Ordering::Release);
    });
 }
 
@@ -670,6 +688,13 @@ struct PluginJson<'a> {
    author:      Option<&'a str>,
    description: Option<&'a str>,
    settings:    Vec<SettingJson<'a>>,
+   permissions: Vec<GrantJson>,
+}
+
+#[derive(Serialize)]
+struct GrantJson {
+   label: &'static str,
+   value: String,
 }
 
 #[derive(Serialize)]
@@ -752,13 +777,23 @@ impl<'a> From<&'a PluginInfo> for PluginJson<'a> {
    fn from(plugin: &'a PluginInfo) -> Self {
       Self {
          name:        &plugin.name,
-         enabled:     plugin.enabled,
+         enabled:     plugin.state.is_on(),
          installed:   plugin.installed,
-         error:       plugin.error.as_deref(),
+         error:       plugin.state.error(),
          version:     plugin.header.version.as_deref(),
          author:      plugin.header.author.as_deref(),
          description: plugin.header.description.as_deref(),
          settings:    plugin.settings.iter().map(SettingJson::from).collect(),
+         permissions: plugin
+            .permissions
+            .iter()
+            .map(|grant| {
+               GrantJson {
+                  label: grant.label(),
+                  value: grant.to_string(),
+               }
+            })
+            .collect(),
       }
    }
 }

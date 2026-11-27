@@ -1,7 +1,3 @@
-// @description Translates messages from the message menu, or every message in selected channels, using Kagi or Google
-// @version 0.3.0
-// @author amaanq
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

@@ -13,7 +13,6 @@ use crate::{
    js::{
       Engine,
       Registry,
-      drain,
       http::response_object,
    },
    store,
@@ -23,7 +22,7 @@ impl Engine {
    /// Settles promise `id` with what its worker thread produced, and runs what
    /// awaited it.
    pub fn settle(&self, id: u64, settlement: Settlement) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some((resolve, reject)) = ctx
             .userdata::<Registry<'_>>()
             .and_then(|registry| registry.pending.borrow_mut().remove(&id))
@@ -63,7 +62,6 @@ impl Engine {
             log::error!("settling promise {id}: {err}");
          }
       });
-      drain(&self.runtime);
    }
 }
 

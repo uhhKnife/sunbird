@@ -22,6 +22,7 @@ use std::{
 use memchr::memmem;
 use phoenix_runtime::update::{
    self,
+   Slot,
    Update,
 };
 
@@ -38,79 +39,61 @@ const LOADER_ASSET: &str = if cfg!(target_arch = "x86_64") {
 };
 
 /// Stages `update`'s plugins for loader `version`, then installs it.
-pub fn install(version: &str, update: &Update) {
-   update::set_status(Some("Downloading plugins...".to_owned()));
+pub fn install(slot: Slot, version: &str, update: &Update) {
+   slot.step("Downloading plugins...");
    let _ = update::stage_plugins(version, update);
-   run_loader_self_update();
+   run_loader_self_update(slot);
 }
 
 /// Runs the in-app loader self-update directly against the site's current
 /// `libphoenix-*.so` (also exposed to the gated localhost debug shell).
 pub fn self_update_from_site() {
-   if !update::begin() {
+   let Some(slot) = update::begin("Downloading loader...") else {
       log::info!("self-update: already running");
       return;
-   }
-   thread::spawn(run_loader_self_update);
+   };
+   thread::spawn(move || run_loader_self_update(slot));
 }
 
-fn run_loader_self_update() {
-   update::set_status(Some("Downloading loader...".to_owned()));
+fn run_loader_self_update(slot: Slot) {
+   match self_update(&slot) {
+      Ok(()) => slot.finish(None),
+      Err(message) => {
+         log::error!("self-update: {message}");
+         slot.finish(Some(message.clone()));
+         let _ = crate::picker::toast(&message);
+      },
+   }
+}
+
+fn self_update(slot: &Slot) -> Result<(), String> {
+   slot.step("Downloading loader...");
    let _ = crate::picker::toast("Downloading Phoenix Unlock update...");
 
    let url = format!("{}{LOADER_ASSET}", update::ASSETS);
-   let bytes = match phoenix_runtime::fetch::get(&url) {
-      Ok(bytes) => bytes,
-      Err(err) => {
-         fail_self_update(&format!("Download failed: {err}"));
-         return;
-      },
-   };
+   let bytes =
+      phoenix_runtime::fetch::get(&url).map_err(|err| format!("Download failed: {err}"))?;
    if !bytes.starts_with(b"\x7fELF") || memmem::find(&bytes, b"phoenix-version:").is_none() {
-      fail_self_update("Downloaded loader is invalid");
-      return;
+      return Err("Downloaded loader is invalid".to_owned());
    }
 
-   let loader = match patcher::Library::new(patcher::LOADER, bytes) {
-      Ok(loader) => loader,
-      Err(err) => {
-         fail_self_update(&format!("Downloaded loader is invalid: {err}"));
-         return;
-      },
-   };
-   let base = match crate::host::base_apk() {
-      Ok(base) => base,
-      Err(err) => {
-         fail_self_update(&format!("Self-update failed: {err}"));
-         return;
-      },
-   };
+   let loader = patcher::Library::new(patcher::LOADER, bytes)
+      .map_err(|err| format!("Downloaded loader is invalid: {err}"))?;
+   let base = crate::host::base_apk().map_err(|err| format!("Self-update failed: {err}"))?;
    if installed_from_splits(&base) {
-      fail_self_update("Split APK install, update from the site");
       let _ = crate::picker::open(update::SITE);
-      return;
+      return Err("Split APK install, update from the site".to_owned());
    }
 
-   update::set_status(Some("Signing the update...".to_owned()));
-   let Some(state) = phoenix_runtime::state() else {
-      fail_self_update("Self-update failed: phoenix has not started");
-      return;
-   };
+   slot.step("Signing the update...");
+   let state = phoenix_runtime::state().ok_or("Self-update failed: phoenix has not started")?;
    let files = crate::install::files_dir().unwrap_or_else(|| state.files_dir());
-   if let Err(err) = fs::create_dir_all(&files) {
-      fail_self_update(&format!("Self-update failed: {}: {err}", files.display()));
-      return;
-   }
+   fs::create_dir_all(&files)
+      .map_err(|err| format!("Self-update failed: {}: {err}", files.display()))?;
    let path = files.join(UPDATE_APK);
-   if let Err(err) = write_update(&base, &loader, &path) {
-      fail_self_update(&format!("Self-update failed: {err}"));
-      return;
-   }
-   update::set_status(Some("Opening Android's installer...".to_owned()));
-   match crate::install::open(&path) {
-      Ok(()) => update::finish(None),
-      Err(err) => fail_self_update(&format!("Self-update failed: {err}")),
-   }
+   write_update(&base, &loader, &path).map_err(|err| format!("Self-update failed: {err}"))?;
+   slot.step("Opening Android's installer...");
+   crate::install::open(&path).map_err(|err| format!("Self-update failed: {err}"))
 }
 
 /// Whether the app runs from split APKs, which sit next to `base`.
@@ -151,10 +134,4 @@ pub fn forget_update(files: &Path) {
    {
       let _ = fs::remove_file(real.join(UPDATE_APK));
    }
-}
-
-fn fail_self_update(message: &str) {
-   log::error!("self-update: {message}");
-   update::finish(Some(message.to_owned()));
-   let _ = crate::picker::toast(message);
 }

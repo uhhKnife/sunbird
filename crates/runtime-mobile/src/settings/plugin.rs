@@ -3,6 +3,7 @@
 use phoenix_runtime::{
    Control,
    PluginInfo,
+   PluginState,
 };
 use phoenix_ui_mobile::Prop;
 use phoenix_wire::Value;
@@ -28,21 +29,17 @@ use crate::settings::{
 };
 
 pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
-   let subtitle = plugin
-      .error
-      .as_deref()
-      .map(|error| format!("Failed: {error}"));
-   let status = match (&plugin.error, plugin.enabled) {
-      (Some(_), _) => "failed",
-      (None, true) => "running",
-      (None, false) => "off",
+   let (subtitle, status) = match &plugin.state {
+      PluginState::Failed(error) => (Some(format!("Failed: {error}")), "failed"),
+      PluginState::On => (None, "running"),
+      PluginState::Off => (None, "off"),
    };
    let (rows, fields) = setting_controls(index, plugin);
    let mut sections = vec![section("", vec![switch_row(
       Some(ICON_PLUGIN),
       "Enabled",
       subtitle.as_deref(),
-      plugin.enabled,
+      plugin.state.is_on(),
       Press::Toggle(index),
       Press::Toggle(index),
    )])];
@@ -88,6 +85,16 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
       }
    }
    info.push(value_row("Status", status));
+   let permissions = if plugin.permissions.is_empty() {
+      vec![value_row("Reaches", "its own settings and storage only")]
+   } else {
+      plugin
+         .permissions
+         .iter()
+         .map(|grant| value_row(grant.label(), &grant.to_string()))
+         .collect()
+   };
+   sections.push(section("Permissions", permissions));
    sections.push(section("Info", info));
    sections
 }

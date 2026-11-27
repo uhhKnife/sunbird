@@ -1,7 +1,3 @@
-// @description Lists the users behind normal and super reactions from the message menu
-// @version 1.0.0
-// @author sh-ayu
-
 const snowflake = /^\d{1,20}$/;
 const pageSize = 50;
 

@@ -1,7 +1,3 @@
-// @description Rewrites X/Twitter, Instagram, TikTok, and custom links for working embeds
-// @version 1.2.1
-// @author cmdr-chara
-
 const settings = phoenix.settings.define({
   twitter: {
     type: "switch",

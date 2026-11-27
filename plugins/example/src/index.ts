@@ -1,9 +1,3 @@
-// @description Demo plugin covering settings, UI patches, and slash commands
-// @version 0.1.1
-// @author amaanq
-// @enabled false
-// @unlisted
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

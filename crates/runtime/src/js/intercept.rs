@@ -22,7 +22,13 @@ use crate::{
    js::{
       Engine,
       Registry,
-      drain,
+      restart_budget,
+      rewrite_refused,
+      saw,
+   },
+   permissions::{
+      Links,
+      Permissions,
    },
 };
 
@@ -37,7 +43,7 @@ impl Engine {
       path: &str,
       body: &[u8],
    ) -> discord::RequestAction {
-      let action = self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return discord::RequestAction::Pass;
          };
@@ -58,6 +64,7 @@ impl Engine {
          let mut current_body = String::from_utf8_lossy(body).into_owned();
          let mut changed = false;
          for (plugin, function) in hooks {
+            restart_budget(&ctx);
             let Ok(req) = Object::new(ctx.clone()) else {
                break;
             };
@@ -99,9 +106,7 @@ impl Engine {
          } else {
             discord::RequestAction::Pass
          }
-      });
-      drain(&self.runtime);
-      action
+      })
    }
 
    /// Runs matching `phoenix.discord.onResponse` hooks (sync or async) on an
@@ -123,8 +128,10 @@ impl Engine {
          body,
          done,
       };
-      self.context.with(|ctx| run_response_chain(&ctx, pending));
-      drain(&self.runtime);
+      self.with(|ctx| {
+         saw(&ctx, &Links::scan(&String::from_utf8_lossy(&pending.body)));
+         run_response_chain(&ctx, pending);
+      });
    }
 }
 
@@ -133,6 +140,11 @@ fn json_parser_fn<'js>(ctx: &Ctx<'js>, source: String) -> rquickjs::Result<Funct
       ctx.json_parse(source.as_str())
          .unwrap_or_else(|_| Value::new_null(ctx))
    })
+}
+
+fn body_refused(ctx: &Ctx<'_>, plugin: &str, before: &[u8], after: &[u8]) -> bool {
+   let scan = |body: &[u8]| Links::scan(&String::from_utf8_lossy(body));
+   before != after && rewrite_refused(ctx, plugin, "onResponse", &scan(before), &scan(after))
 }
 
 /// Extracts a replacement body from `{ body: string | object }` returned by
@@ -157,7 +169,11 @@ fn extract_hook_body<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> Option<Vec<u8>>
 /// `onResponse`: lets a hook turn a Discord 404 into a 200 with a body of its
 /// own. Out-of-range values leave the reply's status alone.
 fn extract_hook_status(value: &Value<'_>) -> Option<i32> {
-   let status = value.as_object()?.get::<_, Value<'_>>("status").ok()?.as_int()?;
+   let status = value
+      .as_object()?
+      .get::<_, Value<'_>>("status")
+      .ok()?
+      .as_int()?;
    (100..=599).contains(&status).then_some(status)
 }
 
@@ -201,6 +217,7 @@ fn run_response_chain<'js>(ctx: &Ctx<'js>, mut pending: Pending) {
       if let Ok(json_fn) = json_parser_fn(ctx, body_str) {
          let _ = res_obj.set("json", json_fn);
       }
+      restart_budget(ctx);
       let result = match function.call::<_, Value<'js>>((res_obj,)).catch(ctx) {
          Ok(result) => result,
          Err(err) => {
@@ -209,7 +226,9 @@ fn run_response_chain<'js>(ctx: &Ctx<'js>, mut pending: Pending) {
          },
       };
       let Some(promise) = result.as_promise() else {
-         if let Some(next_body) = extract_hook_body(ctx, &result) {
+         if let Some(next_body) = extract_hook_body(ctx, &result)
+            && !body_refused(ctx, &plugin, &pending.body, &next_body)
+         {
             pending.body = next_body;
          }
          if let Some(next_status) = extract_hook_status(&result) {
@@ -220,11 +239,14 @@ fn run_response_chain<'js>(ctx: &Ctx<'js>, mut pending: Pending) {
 
       let shared = Arc::new(Mutex::new(Some(pending)));
       let ok_shared = Arc::clone(&shared);
+      let ok_plugin = plugin.clone();
       let ok = Function::new(ctx.clone(), move |value: Value<'_>| {
          let Some(mut rest) = take_pending(&ok_shared) else {
             return;
          };
-         if let Some(next_body) = extract_hook_body(value.ctx(), &value) {
+         if let Some(next_body) = extract_hook_body(value.ctx(), &value)
+            && !body_refused(value.ctx(), &ok_plugin, &rest.body, &next_body)
+         {
             rest.body = next_body;
          }
          if let Some(next_status) = extract_hook_status(&value) {
@@ -259,8 +281,10 @@ pub fn add_discord_hooks<'js>(
    ctx: &Ctx<'js>,
    plugin: &str,
    object: &Object<'js>,
+   permissions: &Arc<Permissions>,
 ) -> rquickjs::Result<()> {
    let owner = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    object.set(
       "onRequest",
       Function::new(
@@ -279,7 +303,7 @@ pub fn add_discord_hooks<'js>(
                .request_hooks
                .borrow_mut()
                .insert(id, (owner.clone(), handler));
-            discord::add_request_hook(id, owner.clone(), parsed);
+            discord::add_request_hook(id, owner.clone(), parsed, Arc::clone(&granted));
             Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
                if let Some(registry) = ctx.userdata::<Registry<'js>>() {
                   registry.request_hooks.borrow_mut().remove(&id);
@@ -290,6 +314,7 @@ pub fn add_discord_hooks<'js>(
       )?,
    )?;
    let owner_res = plugin.to_owned();
+   let granted = Arc::clone(permissions);
    object.set(
       "onResponse",
       Function::new(
@@ -308,7 +333,7 @@ pub fn add_discord_hooks<'js>(
                .response_hooks
                .borrow_mut()
                .insert(id, (owner_res.clone(), handler));
-            discord::add_response_hook(id, owner_res.clone(), parsed);
+            discord::add_response_hook(id, owner_res.clone(), parsed, Arc::clone(&granted));
             Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
                if let Some(registry) = ctx.userdata::<Registry<'js>>() {
                   registry.response_hooks.borrow_mut().remove(&id);

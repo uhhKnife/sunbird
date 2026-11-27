@@ -18,13 +18,12 @@ use crate::{
    js::{
       Engine,
       Registry,
-      drain,
    },
 };
 
 impl Engine {
    pub fn set_setting(&self, plugin: &str, key: &str, value: Chosen) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let js_value = match &value {
             Chosen::Switch(on) => Ok(Value::new_bool(ctx.clone(), *on)),
             Chosen::Number(number) => Ok(Value::new_float(ctx.clone(), *number)),
@@ -54,12 +53,11 @@ impl Engine {
             log::error!("[{plugin}] {key} onChange: {err}");
          }
       });
-      drain(&self.runtime);
       self.save_choices();
    }
 
    pub fn press(&self, plugin: &str, key: &str) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let handler = ctx.userdata::<Registry<'_>>().and_then(|registry| {
             registry
                .defined
@@ -80,7 +78,6 @@ impl Engine {
             log::error!("[{plugin}] {key}: {err}");
          }
       });
-      drain(&self.runtime);
    }
 }
 

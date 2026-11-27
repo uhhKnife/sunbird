@@ -1539,6 +1539,74 @@ impl Image<'_> {
          .any(|segment| segment.executable && segment.contains(addr))
    }
 
+   /// Every function the unwind table lists, as sorted `[start, end)`. A table
+   /// that stores starts only ends each function at the next start.
+   #[must_use]
+   pub fn functions(&self) -> Vec<(usize, usize)> {
+      let mut found = Vec::new();
+      let starts: Vec<usize> = if let Some(starts) = &self.function_starts {
+         starts.starts(self).to_vec()
+      } else if let Some((image_base, base, len)) = self.pdata {
+         let field = |at: usize| self.read_u32(at).map(|value| value as usize);
+         for index in 0..len / 12 {
+            if let (Some(start), Some(end)) =
+               (field(base + index * 12), field(base + index * 12 + 4))
+            {
+               found.push((image_base + start, image_base + end));
+            }
+         }
+         found.sort_unstable();
+         return found;
+      } else if let Some((base, len)) = self.arm_exidx {
+         (0..len / 8)
+            .filter_map(|index| {
+               let at = base + index * 8;
+               let prel31 = (self.read_u32(at)? << 1).cast_signed() >> 1;
+               at.checked_add_signed(prel31 as isize)
+            })
+            .collect()
+      } else if let Some(hdr) = self.eh_frame_hdr {
+         let word = |at: usize| Some(i32::from_ne_bytes(self.read(at, 4)?.try_into().ok()?));
+         let field = |at: usize| word(at).and_then(|rel| hdr.checked_add_signed(rel as isize));
+         let count = word(hdr + 8).and_then(|count| usize::try_from(count).ok());
+         for index in 0..count.unwrap_or(0) {
+            let (Some(start), Some(fde)) =
+               (field(hdr + 12 + index * 8), field(hdr + 16 + index * 8))
+            else {
+               continue;
+            };
+            if let Some(end) = self
+               .fde_range(fde, start)
+               .and_then(|len| start.checked_add(len))
+            {
+               found.push((start, end));
+            }
+         }
+         found.sort_unstable();
+         return found;
+      } else {
+         return found;
+      };
+      let section_end = |start: usize| {
+         self
+            .segments
+            .iter()
+            .find(|segment| segment.executable && segment.contains(start))
+            .map(|segment| segment.addr + segment.bytes.len())
+      };
+      let mut starts = starts;
+      starts.sort_unstable();
+      starts.dedup();
+      for (index, &start) in starts.iter().enumerate() {
+         let Some(limit) = section_end(start) else {
+            continue;
+         };
+         let end = starts.get(index + 1).copied().unwrap_or(limit).min(limit);
+         found.push((start, end));
+      }
+      found
+   }
+
    /// Whether an unwind table starts a function at `addr`. Linkers often put
    /// `.rodata` in the executable segment, so [`Image::is_code`] alone accepts
    /// pointers to strings. Images without a search table fall back to it.

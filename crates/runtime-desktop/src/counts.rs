@@ -25,6 +25,7 @@ use phoenix_sigs::{
    desktop::{
       self,
       FRIENDS_BADGE,
+      HookPoint,
       MESSAGE_REQUESTS_BADGE,
    },
 };
@@ -41,7 +42,10 @@ const STATE_NONE: u32 = 0;
 
 static HIDE_FRIEND_REQUESTS: AtomicBool = AtomicBool::new(false);
 static HIDE_MESSAGE_REQUESTS: AtomicBool = AtomicBool::new(false);
-static BADGE: OnceLock<BadgeFn> = OnceLock::new();
+/// Linux builds draw each DM badge through its own copy of the badge.
+const BADGES: usize = 2;
+static BADGE: [OnceLock<BadgeFn>; BADGES] = [const { OnceLock::new() }; BADGES];
+const BADGE_DETOURS: [BadgeFn; BADGES] = [badge::<0>, badge::<1>];
 static FRIEND_REQUESTS: OnceLock<CountFn> = OnceLock::new();
 static HOME_COUNT: OnceLock<CountFn> = OnceLock::new();
 /// The Home badge's trampoline, which [`home_badge_shim`] calls.
@@ -80,11 +84,14 @@ pub fn install(image: &Image<'static>) {
    let home = desktop::home_count(image, found.friend_requests);
    let home_state = desktop::home_badge(image, found.friend_requests);
 
-   // SAFETY: runs before Discord's threads, and the detour has the badge's ABI.
-   if let Some(original) = unsafe { hook(image, Ok(found.badge), badge as *const () as usize) } {
-      // SAFETY: the trampoline replays the displaced instructions and
-      // continues in the badge.
-      let _ = BADGE.set(unsafe { std::mem::transmute::<usize, BadgeFn>(original) });
+   for (index, &func) in found.badges.iter().take(BADGES).enumerate() {
+      // SAFETY: runs before Discord's threads, and the detour has the badge's
+      // ABI.
+      if let Some(original) = unsafe { hook(image, Ok(func), BADGE_DETOURS[index] as usize) } {
+         // SAFETY: the trampoline replays the displaced instructions and
+         // continues in the badge.
+         let _ = BADGE[index].set(unsafe { std::mem::transmute::<usize, BadgeFn>(original) });
+      }
    }
    // SAFETY: as above, for the count's ABI.
    if let Some(original) = unsafe {
@@ -109,17 +116,29 @@ pub fn install(image: &Image<'static>) {
    }
 }
 
-/// Sends `func` to `detour` and returns the trampoline to the original.
+/// Sends `func` to `detour` and returns what runs the original.
 ///
 /// # Safety
 ///
-/// As for [`Image::hook_entry`].
+/// As for [`Image::hook_entry`] and [`Image::swap_words`].
 unsafe fn hook(image: &Image<'static>, func: Found<usize>, detour: usize) -> Option<usize> {
    let hooked = func.and_then(|func| {
-      let prologue = desktop::entry_prologue(image, func)?;
-      // SAFETY: forwarded from the caller.
-      unsafe { image.hook_entry(func, prologue.pattern, prologue.len, detour) }
-         .map(|trampoline| (func, trampoline))
+      let original = match desktop::hook_point(image, func)? {
+         // SAFETY: forwarded from the caller.
+         HookPoint::Entry(prologue) => unsafe {
+            image.hook_entry(func, prologue.pattern, prologue.len, detour)
+         },
+         HookPoint::Slots(slots) => {
+            let writes = slots
+               .iter()
+               .map(|&slot| (slot, detour))
+               .collect::<Vec<(usize, usize)>>();
+            // SAFETY: forwarded from the caller.
+            unsafe { image.swap_words(&writes) }.map(|_| func)
+         },
+      };
+      original
+         .map(|original| (func, original))
          .map_err(|err| format!("{func:#x}: {err}"))
    });
    match hooked {
@@ -150,7 +169,7 @@ pub fn hide(hidden: impl IntoIterator<Item = Count>) {
    }
 }
 
-extern "C" fn badge(
+extern "C" fn badge<const N: usize>(
    out: *mut u8,
    id: *const u8,
    id_len: usize,
@@ -159,7 +178,7 @@ extern "C" fn badge(
    window: usize,
 ) -> *mut u8 {
    // The jump is written just before `BADGE` is set, all before Discord runs.
-   let original = *BADGE.wait();
+   let original = *BADGE[N].wait();
    // SAFETY: Phoenix passes the id as a live `&str`.
    let id_bytes = unsafe { std::slice::from_raw_parts(id, id_len) };
    let hidden = id_bytes == FRIENDS_BADGE && HIDE_FRIEND_REQUESTS.load(Ordering::Acquire)

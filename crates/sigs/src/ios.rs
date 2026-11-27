@@ -204,20 +204,6 @@ fn swift_string<'a>(image: &'a Image<'_>, low: [u8; 8], high: [u8; 8]) -> Option
       .map(Cow::Borrowed)
 }
 
-/// The two `ClientAccessGate` evaluators the launch gate reads before running
-/// Phoenix. Each starts 8 bytes before this body, which loads the gate and
-/// walks the experiment table. Both must become `mov w0, #1; ret` to open the
-/// gate: patching only one crashes the client, since they share a lock.
-///
-/// Read on 357.0 (build 124398). The experiment-table reference locates one of
-/// them, so the body is the anchor that also catches its twin. The two loads'
-/// field offsets are wildcards: the `ldrb` moved from 0x42d to 0x83d on the
-/// 2026-11-24 build while the code around it stayed the same.
-const ACCESS_GATE: Pattern = Pattern::new(
-   "09 01 40 F9 3F 09 00 F1 C0 00 00 54 08 ?? ?? F9 1F 05 00 B1 60 00 00 54 08 ?? ?? 39 68 00 00 \
-    36",
-);
-
 /// The first bytes of a Hermes bytecode bundle like `main.jsbundle`.
 pub const HERMES_MAGIC: [u8; 8] = 0x1F19_03C1_03BC_1FC6_u64.to_le_bytes();
 
@@ -251,18 +237,4 @@ pub fn switch_entrypoint(bundle: &[u8]) -> Found<SwitchEntrypoint> {
       default_config: at + 12,
       enabled_config: at + 32,
    })
-}
-
-/// The two access-gate evaluators' entry points, which open the gate when both
-/// return `Some(true)`.
-pub fn access_gate(image: &Image<'_>) -> Found<[usize; 2]> {
-   match image.scan(ACCESS_GATE)[..] {
-      [a, b] => Ok([a - 8, b - 8]),
-      ref hits => {
-         Err(format!(
-            "access gate: expected 2 evaluators, found {}",
-            hits.len()
-         ))
-      },
-   }
 }

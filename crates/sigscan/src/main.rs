@@ -43,13 +43,22 @@ use phoenix_sigs::{
    },
    gateway_send::DesktopGatewaySend,
    http::DesktopHttpTransport,
+   index::{
+      Index,
+      Isa,
+   },
    ios,
-   mobile,
+   locate::{
+      self,
+      Family,
+      LOCATORS,
+   },
    registry::GatewayRegistry,
 };
 
 const USAGE: &str = "usage: sigscan <library.so | Discord.exe | Discord | PhoenixFatClient | \
-                     main.jsbundle> [check | strings <text> | refs <addr> | dis <addr> [count]]";
+                     main.jsbundle> [check | strings <text> | refs <addr> | dis <addr> [count] | \
+                     explain <addr> | ops <addr> [count] | source <path suffix>]";
 
 fn main() -> misstep::Result<()> {
    misstep::install_panic_hook();
@@ -81,11 +90,54 @@ fn main() -> misstep::Result<()> {
    match args.get(1).map(String::as_str) {
       None => dump(image),
       Some("check") => {
-         check(
-            image,
-            parsed.machine(),
-            matches!(parsed, BinaryFile::MachO(_)),
-         )
+         let macho = matches!(parsed, BinaryFile::MachO(_));
+         let family = if parsed.machine() == Machine::X86_64
+            || macho && !image.find_bytes(MACOS_DESKTOP).is_empty()
+         {
+            Family::Desktop
+         } else {
+            Family::Mobile
+         };
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         check(image, &ix, family, parsed.machine(), macho)
+      },
+      Some("ops") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         let at = addr(2)?;
+         let count = args
+            .get(3)
+            .map_or(Ok(24), |count| count.parse::<usize>())
+            .context(USAGE)?;
+         let end = ix.function(at).map_or(at + count * 4, |func| func.end);
+         for step in phoenix_sigs::index::op::decode(image, ix.isa, at, end)
+            .iter()
+            .take(count)
+         {
+            println!("{:#x}  {:?}", step.at, step.op);
+         }
+         Ok(())
+      },
+      Some("source") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         for func in ix.source(args.get(2).context(USAGE)?) {
+            let callees = func
+               .calls()
+               .iter()
+               .map(|at| format!("{at:#x}"))
+               .collect::<Vec<String>>();
+            println!(
+               "{func:?} {} bytes, {} callers, calls {}",
+               func.size(),
+               func.callers().len(),
+               callees.join(" ")
+            );
+         }
+         Ok(())
+      },
+      Some("explain") => {
+         let ix = Index::new(image, isa_of(image, parsed.machine()));
+         explain(&ix, addr(2)?, base);
+         Ok(())
       },
       Some("strings") => tools.strings(args.get(2).context(USAGE)?),
       Some("scan") => tools.scan(&args[2..].join(" ")),
@@ -111,13 +163,87 @@ fn main() -> misstep::Result<()> {
    }
 }
 
+const fn isa_of(image: &Image<'_>, machine: Machine) -> Isa {
+   match machine {
+      Machine::X86_64 => {
+         Isa::X86_64 {
+            win64: image.pdata.is_some(),
+         }
+      },
+      Machine::Aarch64 => Isa::Aarch64,
+      Machine::Arm => Isa::Thumb2,
+   }
+}
+
+/// What the function holding `addr` is reachable from: the panic locations,
+/// literals and callsites it loads, and its callers and callees.
+fn explain(ix: &Index<'_>, addr: usize, base: usize) {
+   let Some(func) = ix.function(addr) else {
+      println!("{addr:#x} is in no function");
+      return;
+   };
+   let locations = ix
+      .locations()
+      .map(|loc| {
+         (
+            loc.file.slot,
+            format!("{}:{}", ix.str_of(loc.file), loc.line),
+         )
+      })
+      .collect::<HashMap<usize, String>>();
+   let describe = |target: usize| -> String {
+      if let Some(location) = locations.get(&target) {
+         return format!("panic {location}");
+      }
+      let bytes = ix.image.read(target, 48).unwrap_or_default();
+      let text = bytes
+         .iter()
+         .take_while(|byte| byte.is_ascii_graphic() || **byte == b' ')
+         .map(|&byte| char::from(byte))
+         .collect::<String>();
+      if text.len() >= 4 {
+         format!("str {text:?}")
+      } else if ix.image.is_code(target) {
+         "code".to_owned()
+      } else {
+         "data".to_owned()
+      }
+   };
+   let rva = |at: usize| at.wrapping_sub(base);
+   let callers = func.callers();
+   println!(
+      "{:#x} (+{:#x}), {} bytes, {} callers, {} calls",
+      func.start,
+      rva(func.start),
+      func.size(),
+      callers.len(),
+      func.calls().len(),
+   );
+   for caller in callers.iter().take(8) {
+      println!("  caller {:#x}, {} bytes", caller.start, caller.size());
+   }
+   for target in func.loads() {
+      println!("  loads {target:#x} {}", describe(target));
+   }
+   for callee in func.calls() {
+      let size = ix.function(callee).map_or(0, |callee| callee.size());
+      println!("  calls {callee:#x}, {size} bytes");
+   }
+}
+
 /// A string only the desktop clients carry, which tells macOS Phoenix from
 /// iOS's `PhoenixFatClient`; both are arm64 Mach-O.
 const MACOS_DESKTOP: &[u8] = b"DESKTOP_ACCESS_GATE_TITLE";
 
 /// Runs every locator for `machine` and prints what each found.
 #[expect(clippy::too_many_lines, reason = "one report per locator")]
-fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()> {
+fn check(
+   image: &Image<'_>,
+   ix: &Index<'_>,
+   family: Family,
+   machine: Machine,
+   macho: bool,
+) -> misstep::Result<()> {
    let mut missed = 0;
    let mut report = |name: &str, found: Found<String>| {
       match found {
@@ -199,7 +325,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             },
          );
          report("settings layer", desktop::settings_layer(image).map(at));
-         report("access gate", desktop::access_gate(image).map(at));
+         report("animation frame", desktop::animation_frame(image).map(at));
          report("notification gate", desktop::notification_gate(image).map(at));
          if abi == x86::Abi::SysV {
             report(
@@ -228,43 +354,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                }),
             );
          }
-         report(
-            "staff flag",
-            desktop::staff(image).map(|field| format!("{field:x?}")),
-         );
-         report(
-            "settings label",
-            desktop::settings_label_parts(image)
-               .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
-         );
-         report(
-            "settings visibility",
-            desktop::settings_visibility(image).map(at),
-         );
-         report(
-            "settings section",
-            desktop::settings_section(image)
-               .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
-         );
-         let gpui = desktop::gpui(image);
-         // The runtime skips message accessories without the text and push
-         // primitives, so a miss here is a miss of the builders.
-         report(
-            "gpui builders",
-            gpui.as_ref().map_err(Clone::clone).and_then(|gpui| {
-               match (gpui.div_push_any, gpui.str_into_any) {
-                  (Some(push), Some(text)) => {
-                     Ok(format!(
-                        "{} (push_any {}, str_into_any {})",
-                        at(gpui.div_new),
-                        at(push),
-                        at(text)
-                     ))
-                  },
-                  (push, text) => Err(format!("push_any {push:x?}, str_into_any {text:x?}")),
-               }
-            }),
-         );
+         let gpui = locate::gpui::gpui(ix);
          let layouts = gpui
             .as_ref()
             .map_err(|_| "needs the builders".to_owned())
@@ -316,38 +406,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             desktop::svg_builders(image).map(|svg| format!("{svg:x?}")),
          );
          report("asset loader", desktop::asset_load(image).map(at));
-         let row = desktop::message_row(image);
-         report(
-            "message row",
-            row.as_ref()
-               .map(|row| format!("{} (id +{:#x})", at(row.func), row.msg_id_offset))
-               .map_err(Clone::clone),
-         );
-         report(
-            "message body",
-            row.as_ref()
-               .map_err(|_| "needs the message row".to_owned())
-               .and_then(|row| desktop::message_body(image, row.func))
-               .map(|body| {
-                  format!(
-                     "{} (id +{:#x}, colors +{:#x})",
-                     at(body.func),
-                     body.msg_id_offset,
-                     body.row_colors_offset
-                  )
-               }),
-         );
-         report(
-            "optimistic delete",
-            registry
-               .as_ref()
-               .map_err(|_| "needs the registry".to_owned())
-               .and_then(|registry| {
-                  let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
-                  desktop::optimistic_delete(image, registry.entry(id).handler)
-               })
-               .map(at),
-         );
+         let row = locate::message::message_row(ix);
          report(
             "menu submenu",
             desktop::submenu_layout(image).map(|layout| format!("{layout:x?}")),
@@ -355,38 +414,6 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "sticker check",
             desktop::sticker_check(image).map(at),
-         );
-         report(
-            "ready text",
-            registry
-               .as_ref()
-               .map_err(|_| "needs the registry".to_owned())
-               .and_then(|registry| {
-                  let id = registry.id("READY").ok_or("no READY")?;
-                  desktop::ready_parse(image, registry.entry(id).handler)
-                     .and_then(|parse| desktop::ready_text(image, parse))
-               })
-               .map(at),
-         );
-         report(
-            "ready session",
-            registry
-               .as_ref()
-               .map_err(|_| "needs the registry".to_owned())
-               .and_then(|registry| {
-                  let id = registry.id("READY").ok_or("no READY")?;
-                  desktop::ready_parse(image, registry.entry(id).handler)
-                     .and_then(|parse| desktop::ready_session(image, parse))
-               })
-               .map(|session| {
-                  format!(
-                     "{} (kind +{:#x} = {}, raw +{:#x})",
-                     at(session.func),
-                     session.kind,
-                     session.raw_kind,
-                     session.raw
-                  )
-               }),
          );
          report(
             "message context menu",
@@ -445,9 +472,40 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                )
             }),
          );
-         report("media fetch", desktop::media_fetch(image).map(at));
          report("composer gift", desktop::composer_gift(image).map(at));
          if abi == x86::Abi::Win64 {
+            report(
+               "ready text",
+               registry
+                  .as_ref()
+                  .map_err(|_| "needs the registry".to_owned())
+                  .and_then(|registry| {
+                     let id = registry.id("READY").ok_or("no READY")?;
+                     desktop::ready_parse(image, registry.entry(id).handler)
+                        .and_then(|parse| desktop::ready_text(image, parse))
+                  })
+                  .map(at),
+            );
+            report(
+               "ready session",
+               registry
+                  .as_ref()
+                  .map_err(|_| "needs the registry".to_owned())
+                  .and_then(|registry| {
+                     let id = registry.id("READY").ok_or("no READY")?;
+                     desktop::ready_parse(image, registry.entry(id).handler)
+                        .and_then(|parse| desktop::ready_session(image, parse))
+                  })
+                  .map(|session| {
+                     format!(
+                        "{} (kind +{:#x} = {}, raw +{:#x})",
+                        at(session.func),
+                        session.kind,
+                        session.raw_kind,
+                        session.raw
+                     )
+                  }),
+            );
             report(
                "channel toolbar",
                desktop::channel_toolbar(image).map(|toolbar| {
@@ -486,27 +544,30 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
                }),
             );
          }
-         report(
-            "emoji check",
-            desktop::emoji_check(image).and_then(|check| {
-               prologues
-                  .emoji_check
-                  .at(image, check.func)
-                  .then(|| format!("{} (intention +{:#x})", at(check.func), check.intention))
-                  .ok_or_else(|| "prologue changed".to_owned())
-            }),
-         );
          let pending = desktop::pending_counts(image);
          let moved = |func: usize| {
-            desktop::entry_prologue(image, func)
-               .map(|prologue| format!("{} ({} bytes moved)", at(func), prologue.len))
+            desktop::hook_point(image, func).map(|point| {
+               match point {
+                  desktop::HookPoint::Entry(prologue) => {
+                     format!("{} ({} bytes moved)", at(func), prologue.len)
+                  },
+                  desktop::HookPoint::Slots(slots) => {
+                     format!("{} (through slots {slots:x?})", at(func))
+                  },
+               }
+            })
          };
          report(
             "pending counts",
             pending.as_ref().map_err(Clone::clone).and_then(|found| {
+               let badges = found
+                  .badges
+                  .iter()
+                  .map(|&badge| moved(badge))
+                  .collect::<Found<Vec<String>>>()?;
                Ok(format!(
-                  "badge {}, friend requests {}",
-                  moved(found.badge)?,
+                  "badges {}, friend requests {}",
+                  badges.join(", "),
                   moved(found.friend_requests)?
                ))
             }),
@@ -581,7 +642,7 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "message header",
             row.as_ref()
                .map_err(|_| "needs the message row".to_owned())
-               .and_then(|row| desktop::message_body(image, row.func))
+               .and_then(|row| locate::message::message_body(ix, row.func))
                .and_then(|body| desktop::message_header(image, body.func))
                .map(|header| {
                   let sites = header
@@ -666,33 +727,10 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             }),
          );
          report(
-            "settings label",
-            phoenix_sigs::macos::settings_label_parts(image)
-               .map(|label| format!("{} (id {})", at(label.name), at(label.id))),
-         );
-         report(
-            "settings visibility",
-            phoenix_sigs::macos::settings_visibility(image)
-               .map(|guards| guards.into_iter().map(at).collect::<Vec<_>>().join(", ")),
-         );
-         report(
-            "settings section",
-            phoenix_sigs::macos::settings_section(image)
-               .map(|section| format!("{} (page +{:#x})", at(section.func), section.page_offset)),
-         );
-         report(
-            "staff flag",
-            phoenix_sigs::macos::staff(image).map(|field| format!("{field:x?}")),
-         );
-         report(
             "message context menu",
             phoenix_sigs::macos::message_context_menu(image).map(|menu| format!("{menu:x?}")),
          );
-         let gpui = phoenix_sigs::macos::gpui(image);
-         report(
-            "gpui builders",
-            gpui.clone().map(|gpui| format!("{gpui:x?}")),
-         );
+         let gpui = locate::gpui::gpui(ix);
          report(
             "host allocator",
             gpui
@@ -715,6 +753,21 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "settings layer",
             phoenix_sigs::macos::settings_layer(image).map(at),
+         );
+         report(
+            "animation frame",
+            phoenix_sigs::macos::animation_frame(image).map(at),
+         );
+         report(
+            "scale fade",
+            phoenix_sigs::macos::scale_fade(image).map(|sf| {
+               format!(
+                  "{} (loc {}) {:x?}",
+                  at(sf.into_any),
+                  at(sf.caller_loc),
+                  sf.layout
+               )
+            }),
          );
          report(
             "native modal",
@@ -775,40 +828,9 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
             "dm row",
             phoenix_sigs::macos::dm_row(image).map(|row| format!("{row:x?}")),
          );
-         let row = phoenix_sigs::macos::message_row(image);
-         report(
-            "message row",
-            row.as_ref()
-               .map(|row| format!("{row:x?}"))
-               .map_err(Clone::clone),
-         );
-         report(
-            "message body",
-            row.and_then(|row| phoenix_sigs::macos::message_body(image, row.func))
-               .map(|body| format!("{body:x?}")),
-         );
-         report(
-            "media fetch",
-            phoenix_sigs::macos::media_fetch(image).map(at),
-         );
-         report(
-            "optimistic delete",
-            registry
-               .as_ref()
-               .map_err(|_| "needs the registry".to_owned())
-               .and_then(|registry| {
-                  let id = registry.id("MESSAGE_DELETE").ok_or("no MESSAGE_DELETE")?;
-                  phoenix_sigs::macos::optimistic_delete(image, registry.entry(id).handler)
-               })
-               .map(|funcs| funcs.into_iter().map(at).collect::<Vec<_>>().join(", ")),
-         );
          report(
             "message json",
             phoenix_sigs::macos::message_writer(image).map(|found| format!("{found:x?}")),
-         );
-         report(
-            "access gate",
-            phoenix_sigs::macos::access_gate(image).map(at),
          );
          report(
             "access enforced",
@@ -819,10 +841,6 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          report(
             "pages under frame",
             phoenix_sigs::macos::pages_under_frame(image).map(at),
-         );
-         report(
-            "emoji check",
-            phoenix_sigs::macos::emoji_check(image).map(|found| format!("{found:x?}")),
          );
          report(
             "relaunch script",
@@ -850,20 +868,17 @@ fn check(image: &Image<'_>, machine: Machine, macho: bool) -> misstep::Result<()
          });
          report(
             "access gate",
-            ios::access_gate(image).map(|[a, b]| format!("{a:#x}, {b:#x}")),
+            locate::mobile::access_gate(ix)
+               .map(|[first, second]| format!("{first:#x}, {second:#x}")),
          );
       },
-      Machine::Aarch64 => {
-         report(
-            "staff flag",
-            mobile::staff_aarch64(image).map(|field| format!("{field:x?}")),
-         );
-         report("emoji check", mobile::emoji_aarch64(image).map(at));
-      },
-      Machine::Arm => {
-         report("staff check", mobile::staff_arm(image).map(at));
-         report("emoji check", mobile::emoji_arm(image).map(at));
-      },
+      Machine::Aarch64 | Machine::Arm => {},
+   }
+   for locator in LOCATORS
+      .iter()
+      .filter(|locator| locator.families.contains(&family))
+   {
+      report(locator.name, (locator.run)(ix));
    }
    if missed > 0 {
       return Err(misstep::Report::msg(format!(

@@ -1,7 +1,3 @@
-// @description Opens a message's raw text and JSON in a viewer
-// @version 1.2.1
-// @author cmdr-chara
-
 const show = (msg: Phoenix.Message) => {
   const json = JSON.stringify(msg, null, 2) ?? "null";
   const raw = msg.content ?? "";

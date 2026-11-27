@@ -1,7 +1,3 @@
-// @description Shows someone's roles and permissions on a server and in a channel
-// @version 1.0.0
-// @author yuax
-
 import { EVERYONE, GROUPS, NAMES, type Granted, has, known, load } from "./permissions";
 
 const sql = phoenix.stores.sql.bind(phoenix.stores);

@@ -2,20 +2,40 @@ pub mod background;
 mod hooks;
 pub mod http;
 mod intercept;
+mod lockdown;
 pub mod messages;
 mod settings;
 mod storage;
 
 use std::{
    borrow::Cow,
-   cell::RefCell,
+   cell::{
+      Cell,
+      RefCell,
+   },
    collections::{
       BTreeMap,
       BTreeSet,
       HashMap,
+      HashSet,
    },
    fs,
+   hash::{
+      BuildHasher,
+      RandomState,
+   },
    io::ErrorKind,
+   sync::{
+      Arc,
+      atomic::{
+         AtomicU64,
+         Ordering,
+      },
+   },
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
 use log::Level;
@@ -46,6 +66,7 @@ use crate::{
    Header,
    Plugin,
    PluginInfo,
+   PluginState,
    STATE,
    Setting,
    State,
@@ -62,6 +83,7 @@ use crate::{
          discord_object,
          start_fetch,
       },
+      lockdown::lockdown,
       messages::messages_object,
       settings::{
          Definition,
@@ -72,32 +94,123 @@ use crate::{
          stores_object,
       },
    },
+   permissions::{
+      Links,
+      Permissions,
+      UrlHost,
+      url_host,
+   },
+   update::outdated,
 };
 
+/// How long one plugin callback or promise job runs before `QuickJS`
+/// interrupts it. The hooks run on Discord's own threads, so a spinning plugin
+/// freezes the app for this long.
+const BUDGET: Duration = Duration::from_secs(1);
+
+/// The heap every plugin shares. Past it allocations throw, so a runaway
+/// plugin fails before Android kills Discord for its memory.
+const HEAP_LIMIT: usize = 128 << 20;
+
+/// Drains in a row that may run out of budget before [`Engine::starve`] runs.
+const OVERRUNS: u32 = 3;
+
+const SEEN_URLS: usize = 32_768;
+
+/// The exact URLs Discord's own payloads carried. Anyone can post a link, so a
+/// host seen once vouches for nothing, and a plugin may hand back only a URL
+/// Discord sent. Kept by keyed hash in two generations of [`SEEN_URLS`], so a
+/// flood ages old URLs out without locking new ones out.
+#[derive(Default)]
+struct SeenUrls {
+   keys:     RandomState,
+   current:  HashSet<u64>,
+   previous: HashSet<u64>,
+}
+
+impl SeenUrls {
+   fn insert(&mut self, url: &str) {
+      if self.current.len() >= SEEN_URLS {
+         self.previous = std::mem::take(&mut self.current);
+      }
+      self.current.insert(self.keys.hash_one(url));
+   }
+
+   fn contains(&self, url: &str) -> bool {
+      let key = self.keys.hash_one(url);
+      self.current.contains(&key) || self.previous.contains(&key)
+   }
+}
+
+/// The name the debug shell's `phoenix` object goes by, which no plugin may
+/// take, since grants are looked up by name.
+const CONSOLE: &str = "console";
+
 pub struct Engine {
-   runtime: Runtime,
-   context: Context,
-   plugins: BTreeMap<String, Loaded>,
+   runtime:  Runtime,
+   context:  Context,
+   /// The debug shell's prompt, a realm of its own so its unrestricted
+   /// `phoenix` never sits in the plugins' frozen globals.
+   console:  Context,
+   budget:   Arc<Budget>,
+   /// Drains in a row that ran out of budget with jobs left.
+   overruns: Cell<u32>,
+   plugins:  BTreeMap<String, Loaded>,
+}
+
+/// The deadline `QuickJS`'s interrupt handler checks, which every entry into
+/// the engine and every plugin callback pushes out to [`BUDGET`] from now.
+struct Budget {
+   origin:   Instant,
+   deadline: AtomicU64,
+}
+
+impl Budget {
+   fn nanos(&self) -> u64 {
+      u64::try_from(self.origin.elapsed().as_nanos()).unwrap_or(u64::MAX)
+   }
+
+   fn restart(&self) {
+      let budget = u64::try_from(BUDGET.as_nanos()).unwrap_or(u64::MAX);
+      self
+         .deadline
+         .store(self.nanos().saturating_add(budget), Ordering::Relaxed);
+   }
+
+   fn spent(&self) -> bool {
+      self.nanos() > self.deadline.load(Ordering::Relaxed)
+   }
 }
 
 struct Loaded {
-   source:    String,
-   /// The bundled source an installed copy replaced, put back when the copy
-   /// is uninstalled.
-   bundled:   Option<String>,
-   enabled:   bool,
-   error:     Option<String>,
+   source: String,
+   origin: Origin,
+   state:  PluginState,
+}
+
+enum Origin {
+   Bundled,
    /// Read from `home/plugins`, so the user can delete it.
-   installed: bool,
+   Installed,
+   /// Installed over a bundled plugin, whose source is put back when the copy
+   /// is uninstalled.
+   Replacing(String),
 }
 
 impl Loaded {
+   const fn new(source: String, origin: Origin) -> Self {
+      Self {
+         source,
+         origin,
+         state: PluginState::Off,
+      }
+   }
+
    fn install(&mut self, source: String) {
       let old = std::mem::replace(&mut self.source, source);
-      if !self.installed {
-         self.bundled = Some(old);
+      if matches!(self.origin, Origin::Bundled) {
+         self.origin = Origin::Replacing(old);
       }
-      self.installed = true;
    }
 }
 
@@ -143,23 +256,27 @@ pub enum Before {
 /// Callbacks stay JS values owned by the runtime, and the only thing plugins
 /// can reach is their own `phoenix` object.
 pub struct Registry<'js> {
-   gateway:          Object<'js>,
-   handles:          Vec<(EventId, Object<'js>)>,
-   hooks:            RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
-   defined:          RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
+   budget:             Arc<Budget>,
+   handles:            Vec<(EventId, String, Object<'js>)>,
+   hooks:              RefCell<HashMap<EventId, Vec<Hook<'js>>>>,
+   defined:            RefCell<BTreeMap<String, Vec<Definition<'js>>>>,
    /// Kept across unloads, so a reloaded plugin sees what the user chose.
-   chosen:           RefCell<ChosenMap>,
+   chosen:             RefCell<ChosenMap>,
    /// `phoenix.onUnload` callbacks, run when the plugin is turned off,
    /// reloaded or removed.
-   unloads:          RefCell<HashMap<String, Vec<Function<'js>>>>,
+   unloads:            RefCell<HashMap<String, Vec<Function<'js>>>>,
    /// The resolve and reject of each promise a worker thread will settle, by
    /// id.
-   pending:          RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
+   pending:            RefCell<HashMap<u64, (Function<'js>, Function<'js>)>>,
    /// `phoenix.discord.onRequest` interceptors, by id.
-   request_hooks:    RefCell<HashMap<u64, (String, Function<'js>)>>,
+   request_hooks:      RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.discord.onResponse` interceptors, by id.
    response_hooks:     RefCell<HashMap<u64, (String, Function<'js>)>>,
    gateway_send_hooks: RefCell<HashMap<u64, (String, Function<'js>)>>,
+   /// What each loaded plugin may reach, for the checks platform code makes by
+   /// plugin name.
+   granted:            RefCell<HashMap<String, Arc<Permissions>>>,
+   seen:               RefCell<SeenUrls>,
    /// `phoenix.messages.onSend` interceptors in registration order, by id.
    pub interceptors:   RefCell<Vec<(u64, String, Function<'js>)>>,
 }
@@ -169,11 +286,15 @@ unsafe impl<'js> JsLifetime<'js> for Registry<'js> {
    type Changed<'to> = Registry<'to>;
 }
 
-/// A plugin's source as a function of its `phoenix` object, which the engine
-/// calls to load it.
-#[must_use]
-pub fn wrap(source: &str) -> String {
-   format!("(function (phoenix) {{\n{source}\n}})")
+/// A plugin's source as the body of a function of its `phoenix` object.
+///
+/// The realm's `Function` constructor parses it as a function body, so the
+/// source cannot close the function early and declare script-level bindings
+/// every other plugin's free names would resolve to.
+pub fn compile<'js>(ctx: &Ctx<'js>, source: &str) -> rquickjs::Result<Function<'js>> {
+   ctx.globals()
+      .get::<_, Function<'js>>("Function")?
+      .call(("phoenix", source))
 }
 
 #[expect(clippy::needless_pass_by_value, reason = "used as a map_err callback")]
@@ -197,19 +318,38 @@ impl Engine {
    pub fn new(events: &GatewayRegistry) -> Result<Self, Error> {
       let runtime = Runtime::new().map_err(|err| Error::Js(err.to_string()))?;
       runtime.set_max_stack_size(512 * 1024);
+      runtime.set_memory_limit(HEAP_LIMIT);
+      let budget = Arc::new(Budget {
+         origin:   Instant::now(),
+         deadline: AtomicU64::new(0),
+      });
+      let watched = Arc::clone(&budget);
+      runtime.set_interrupt_handler(Some(Box::new(move || watched.spent())));
       let context = Context::full(&runtime).map_err(|err| Error::Js(err.to_string()))?;
+      let console = Context::full(&runtime).map_err(|err| Error::Js(err.to_string()))?;
+      budget.restart();
       context.with(|ctx| {
-         let registry = registry(&ctx, events).catch(&ctx).map_err(js_error)?;
+         let registry = registry(&ctx, events, Arc::clone(&budget))
+            .catch(&ctx)
+            .map_err(js_error)?;
+         let handles = registry
+            .handles
+            .iter()
+            .map(|(.., handle)| handle.clone().into_value())
+            .collect();
          ctx.store_userdata(registry)
             .map_err(|err| Error::Js(err.to_string()))?;
          if let Some(platform) = crate::platform() {
             platform.init(&ctx).catch(&ctx).map_err(js_error)?;
          }
-         Ok::<_, Error>(())
+         lockdown(&ctx, handles).catch(&ctx).map_err(js_error)
       })?;
       Ok(Self {
          runtime,
          context,
+         console,
+         budget,
+         overruns: Cell::new(0),
          plugins: BTreeMap::new(),
       })
    }
@@ -217,9 +357,55 @@ impl Engine {
    /// Runs `work` in the engine's context, then the promise reactions it
    /// queued.
    pub fn with<R>(&self, work: impl FnOnce(Ctx<'_>) -> R) -> R {
+      self.budget.restart();
       let result = self.context.with(work);
-      drain(&self.runtime);
+      self.drain();
       result
+   }
+
+   /// Runs promise reactions until none are left. `QuickJS` queues them, and
+   /// nothing else runs the queue. They share one budget, and the jobs left
+   /// when it runs out wait for the next entry. Only a queue still growing
+   /// after [`OVERRUNS`] entries is starved, since starving fails every
+   /// plugin's pending jobs.
+   fn drain(&self) {
+      self.budget.restart();
+      while !self.budget.spent() {
+         match self.runtime.execute_pending_job() {
+            Ok(true) => {},
+            Ok(false) => {
+               self.overruns.set(0);
+               return;
+            },
+            Err(err) => log::error!("a promise job threw: {err}"),
+         }
+      }
+      let overruns = self.overruns.get() + 1;
+      if overruns < OVERRUNS {
+         self.overruns.set(overruns);
+         log::warn!("promise jobs ran past {BUDGET:?}, the rest wait for the next call");
+         return;
+      }
+      self.overruns.set(0);
+      self.starve();
+   }
+
+   /// Runs out the queue with every allocation failing. A job that would
+   /// queue another cannot, so the queue only shrinks, where a promise that
+   /// queues two more on every run would outgrow the budget forever. A cap at
+   /// the heap's current size let each job reuse what the last one freed.
+   fn starve(&self) {
+      self.runtime.set_memory_limit(1);
+      let mut failed = 0_u64;
+      loop {
+         match self.runtime.execute_pending_job() {
+            Ok(true) => {},
+            Ok(false) => break,
+            Err(_) => failed += 1,
+         }
+      }
+      self.runtime.set_memory_limit(HEAP_LIMIT);
+      log::error!("promise jobs ran past {BUDGET:?}, {failed} more failed to finish");
    }
 
    #[must_use]
@@ -227,9 +413,18 @@ impl Engine {
       self.plugins.get(name).map(|loaded| loaded.source.clone())
    }
 
+   /// The bundled copy an installed one replaced.
+   #[must_use]
+   pub fn bundled(&self, name: &str) -> Option<String> {
+      match &self.plugins.get(name)?.origin {
+         Origin::Replacing(bundled) => Some(bundled.clone()),
+         Origin::Bundled | Origin::Installed => None,
+      }
+   }
+
    #[must_use]
    pub fn plugins(&self) -> Vec<PluginInfo> {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let registry = ctx.userdata::<Registry<'_>>();
          let defined = registry.as_ref().map(|registry| registry.defined.borrow());
          let chosen = registry.as_ref().map(|registry| registry.chosen.borrow());
@@ -257,11 +452,14 @@ impl Engine {
                   .collect();
                PluginInfo {
                   name: name.clone(),
-                  enabled: loaded.enabled,
-                  error: loaded.error.clone(),
-                  installed: loaded.installed,
+                  state: loaded.state.clone(),
+                  installed: !matches!(loaded.origin, Origin::Bundled),
                   header: Header::from(loaded.source.as_str()),
                   settings,
+                  permissions: loaded
+                     .source
+                     .parse::<Permissions>()
+                     .map_or_else(|_| Vec::new(), |permissions| permissions.grants()),
                }
             })
             .collect()
@@ -270,26 +468,44 @@ impl Engine {
 
    /// Evaluates `name` with a fresh `phoenix` object, recording any error.
    fn eval(&mut self, name: &str) {
+      let Some(loaded) = self.plugins.get(name) else {
+         return;
+      };
+      let source = loaded.source.as_str();
+      let outcome = (name != CONSOLE)
+         .then_some(source)
+         .ok_or_else(|| Error::Js(format!("the name {CONSOLE} belongs to the debug shell")))
+         .and_then(|source| {
+            if let Some(min) = Header::from(source).min_sunbird.filter(|min| outdated(min)) {
+               return Err(Error::Js(format!(
+                  "needs Sunbird {min}, update Phoenix Unlock first"
+               )));
+            }
+            source
+               .parse::<Permissions>()
+               .map_err(|err| Error::Js(err.to_string()))
+         })
+         .and_then(|permissions| {
+            let permissions = Arc::new(permissions);
+            self.with(|ctx| {
+               let run = || -> rquickjs::Result<()> {
+                  let phoenix = api(&ctx, name, &permissions)?;
+                  compile(&ctx, source)?.call((phoenix,))
+               };
+               run().catch(&ctx).map_err(js_error)
+            })
+         });
       let Some(loaded) = self.plugins.get_mut(name) else {
          return;
       };
-      let outcome = self.context.with(|ctx| {
-         let run = || -> rquickjs::Result<()> {
-            let phoenix = api(&ctx, name)?;
-            ctx.eval::<Function<'_>, _>(wrap(&loaded.source))?
-               .call((phoenix,))
-         };
-         run().catch(&ctx).map_err(js_error)
-      });
-      drain(&self.runtime);
       match outcome {
          Ok(()) => {
             log::info!("loaded plugin {name}");
-            loaded.error = None;
+            loaded.state = PluginState::On;
          },
          Err(err) => {
             log::error!("plugin {name} failed to load: {err}");
-            loaded.error = Some(err.to_string());
+            loaded.state = PluginState::Failed(err.to_string());
          },
       }
    }
@@ -297,7 +513,7 @@ impl Engine {
    /// Drops every hook `name` registered, and turns off events nobody else
    /// listens to.
    pub(super) fn unload(&self, name: &str) {
-      self.context.with(|ctx| {
+      self.with(|ctx| {
          let Some(registry) = ctx.userdata::<Registry<'_>>() else {
             return;
          };
@@ -312,6 +528,7 @@ impl Engine {
             }
          }
          registry.defined.borrow_mut().remove(name);
+         registry.granted.borrow_mut().remove(name);
          registry
             .request_hooks
             .borrow_mut()
@@ -343,18 +560,16 @@ impl Engine {
          }
          hooks.retain(|_, list| !list.is_empty());
       });
-      drain(&self.runtime);
    }
 
    pub fn set_enabled(&mut self, name: &str, enabled: bool) {
       let Some(loaded) = self.plugins.get_mut(name) else {
          return;
       };
-      if loaded.enabled == enabled {
+      if loaded.state.is_on() == enabled {
          return;
       }
-      loaded.enabled = enabled;
-      loaded.error = None;
+      loaded.state = PluginState::from_switch(enabled);
       if enabled {
          self.eval(name);
       } else {
@@ -368,15 +583,11 @@ impl Engine {
    pub fn install(&mut self, name: &str, source: String) {
       let enabled = if let Some(loaded) = self.plugins.get_mut(name) {
          loaded.install(source);
-         loaded.enabled
+         loaded.state.is_on()
       } else {
-         self.plugins.insert(name.to_owned(), Loaded {
-            source,
-            bundled: None,
-            enabled: true,
-            error: None,
-            installed: true,
-         });
+         let mut loaded = Loaded::new(source, Origin::Installed);
+         loaded.state = PluginState::On;
+         self.plugins.insert(name.to_owned(), loaded);
          true
       };
       if enabled {
@@ -390,10 +601,13 @@ impl Engine {
    pub fn uninstall(&mut self, name: &str) -> crate::Uninstalled {
       self.unload(name);
       let restored = self.plugins.get_mut(name).and_then(|loaded| {
-         loaded.source = loaded.bundled.take()?;
-         loaded.installed = false;
-         loaded.error = None;
-         Some(loaded.enabled)
+         let Origin::Replacing(bundled) = std::mem::replace(&mut loaded.origin, Origin::Bundled)
+         else {
+            return None;
+         };
+         loaded.source = bundled;
+         loaded.state = PluginState::from_switch(loaded.state.is_on());
+         Some(loaded.state.is_on())
       });
       let outcome = if let Some(enabled) = restored {
          if enabled {
@@ -402,7 +616,7 @@ impl Engine {
          crate::Uninstalled::RestoredBundled
       } else {
          self.plugins.remove(name);
-         self.context.with(|ctx| {
+         self.with(|ctx| {
             if let Some(registry) = ctx.userdata::<Registry<'_>>() {
                registry.chosen.borrow_mut().remove(name);
             }
@@ -414,7 +628,11 @@ impl Engine {
    }
 
    pub fn reload(&mut self, name: &str) {
-      if self.plugins.get(name).is_some_and(|loaded| loaded.enabled) {
+      if self
+         .plugins
+         .get(name)
+         .is_some_and(|loaded| loaded.state.is_on())
+      {
          self.unload(name);
          self.eval(name);
       }
@@ -424,15 +642,15 @@ impl Engine {
       let (mut disabled, mut enabled) = (BTreeSet::new(), BTreeSet::new());
       for (name, loaded) in &self.plugins {
          if Header::from(loaded.source.as_str()).default_off {
-            if loaded.enabled {
+            if loaded.state.is_on() {
                enabled.insert(name.clone());
             }
-         } else if !loaded.enabled {
+         } else if !loaded.state.is_on() {
             disabled.insert(name.clone());
          }
       }
       let remote_shell = crate::remote_shell_enabled();
-      let json = self.context.with(|ctx| {
+      let json = self.with(|ctx| {
          let registry = ctx.userdata::<Registry<'_>>();
          let chosen = registry.as_ref().map(|registry| registry.chosen.borrow());
          let empty = BTreeMap::new();
@@ -457,10 +675,11 @@ impl Engine {
    /// The result as JSON when it has a JSON form, else as `String(result)`.
    /// The prompt sees a `phoenix` object of its own, named "console".
    pub fn evaluate(&self, code: &str) -> Result<String, Error> {
-      let result = self.context.with(|ctx| {
+      self.budget.restart();
+      let result = self.console.with(|ctx| {
          let run = || -> rquickjs::Result<String> {
             if !ctx.globals().contains_key("phoenix")? {
-               let phoenix = api(&ctx, "console")?;
+               let phoenix = api(&ctx, CONSOLE, &Arc::new(Permissions::Console))?;
                if let Some(platform) = crate::platform() {
                   platform.console(&ctx, &phoenix)?;
                }
@@ -481,31 +700,101 @@ impl Engine {
          };
          run().catch(&ctx).map_err(js_error)
       });
-      drain(&self.runtime);
+      self.drain();
       result
    }
 }
 
-/// Runs promise reactions until none are left. `QuickJS` queues them, and
-/// nothing else runs the queue.
-pub fn drain(runtime: &Runtime) {
-   loop {
-      match runtime.execute_pending_job() {
-         Ok(true) => {},
-         Ok(false) => break,
-         Err(err) => log::error!("a promise job threw: {err}"),
+/// What `plugin` may reach, `None` for a plugin not loaded.
+#[must_use]
+pub fn granted(ctx: &Ctx<'_>, plugin: &str) -> Option<Arc<Permissions>> {
+   ctx.userdata::<Registry<'_>>()
+      .and_then(|registry| registry.granted.borrow().get(plugin).cloned())
+}
+
+/// Whether `plugin` may draw an image from `uri`, false for a plugin not
+/// loaded.
+#[must_use]
+pub fn image_allowed(ctx: &Ctx<'_>, plugin: &str, uri: &str) -> bool {
+   granted(ctx, plugin).is_some_and(|permissions| permissions.image(uri))
+}
+
+/// Whether `plugin`'s rewrite of `before` into `after` adds a URL reaching a
+/// host it may not point Discord at, logging the refusal.
+#[must_use]
+pub fn rewrite_refused(
+   ctx: &Ctx<'_>,
+   plugin: &str,
+   what: &str,
+   before: &Links,
+   after: &Links,
+) -> bool {
+   let Some(host) = granted(ctx, plugin).map_or(Some(UrlHost::Unreadable), |permissions| {
+      permissions.added(before, after)
+   }) else {
+      return false;
+   };
+   log::error!("[{plugin}] {what}: dropped a rewrite adding {host}, not on its // @fetch line");
+   true
+}
+
+/// Remembers the URLs in a payload from Discord.
+pub fn saw(ctx: &Ctx<'_>, links: &Links) {
+   if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+      let mut seen = registry.seen.borrow_mut();
+      for url in links.urls() {
+         seen.insert(url);
       }
    }
 }
 
-/// One frozen handle per live registry entry. Plugins compare nothing and parse
-/// nothing, the runtime recognizes a handle by identity.
-fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<Registry<'js>> {
-   let freeze = ctx
-      .globals()
-      .get::<_, Object>("Object")?
-      .get::<_, Function>("freeze")?;
-   let gateway = Object::new(ctx.clone())?;
+/// The first host a URL in `payload` reaches that `plugin` may not hand
+/// Discord, since neither its grants nor Discord's own payloads vouch for it.
+#[must_use]
+pub fn foreign_host(ctx: &Ctx<'_>, plugin: &str, payload: &str) -> Option<UrlHost> {
+   let (Some(permissions), Some(registry)) = (granted(ctx, plugin), ctx.userdata::<Registry<'_>>())
+   else {
+      return Some(UrlHost::Unreadable);
+   };
+   let seen = registry.seen.borrow();
+   permissions.foreign(&Links::scan(payload), |url| seen.contains(url))
+}
+
+/// `icon` when `plugin` may draw it, else a `TypeError` naming the fix.
+pub fn checked_icon(
+   ctx: &Ctx<'_>,
+   plugin: &str,
+   icon: Option<String>,
+) -> rquickjs::Result<Option<String>> {
+   match icon {
+      Some(uri) if !image_allowed(ctx, plugin, &uri) => {
+         Err(Exception::throw_type(
+            ctx,
+            &format!(
+               "{}: images load only from Discord's CDN or a host on the plugin's // @fetch line",
+               url_host(&uri).as_deref().unwrap_or("icon")
+            ),
+         ))
+      },
+      icon => Ok(icon),
+   }
+}
+
+/// Gives the plugin callback about to run a budget of its own, so one that
+/// spins does not take the next plugin's time.
+pub fn restart_budget(ctx: &Ctx<'_>) {
+   if let Some(registry) = ctx.userdata::<Registry<'_>>() {
+      registry.budget.restart();
+   }
+}
+
+/// One handle per live registry entry, frozen by [`lockdown`]. Plugins compare
+/// nothing and parse nothing, the runtime recognizes a handle by identity.
+fn registry<'js>(
+   ctx: &Ctx<'js>,
+   events: &GatewayRegistry,
+   budget: Arc<Budget>,
+) -> rquickjs::Result<Registry<'js>> {
    let mut handles = Vec::new();
    for (event, entry) in events.iter() {
       let key = camel_case(&entry.name);
@@ -515,13 +804,10 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
          "toString",
          Function::new(ctx.clone(), move || label.clone())?,
       )?;
-      let handle = freeze.call::<_, Object<'js>>((handle,))?;
-      gateway.set(key, handle.clone())?;
-      handles.push((event, handle));
+      handles.push((event, key, handle));
    }
-   let gateway = freeze.call((gateway,))?;
    Ok(Registry {
-      gateway,
+      budget,
       handles,
       hooks: RefCell::default(),
       defined: RefCell::default(),
@@ -531,6 +817,8 @@ fn registry<'js>(ctx: &Ctx<'js>, events: &GatewayRegistry) -> rquickjs::Result<R
       request_hooks: RefCell::default(),
       response_hooks: RefCell::default(),
       gateway_send_hooks: RefCell::default(),
+      granted: RefCell::default(),
+      seen: RefCell::default(),
       interceptors: RefCell::default(),
    })
 }
@@ -551,18 +839,30 @@ fn camel_case(name: &str) -> String {
       .collect()
 }
 
-/// The `phoenix` object one plugin receives.
-fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+/// The `phoenix` object one plugin receives, holding only what `permissions`
+/// grants.
+fn api<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   permissions: &Arc<Permissions>,
+) -> rquickjs::Result<Object<'js>> {
+   ctx.userdata::<Registry<'js>>()
+      .ok_or_else(|| Exception::throw_internal(ctx, "no registry"))?
+      .granted
+      .borrow_mut()
+      .insert(plugin.to_owned(), Arc::clone(permissions));
    let api = Object::new(ctx.clone())?;
-   api.set("gateway", gateway_object(ctx, plugin)?)?;
+   api.set("gateway", gateway_object(ctx, plugin, permissions)?)?;
 
-   add_gateway_api(ctx, plugin, &api)?;
+   add_gateway_api(ctx, plugin, &api, permissions)?;
 
    let messages = messages_object(ctx)?;
    if let Some(platform) = crate::platform() {
-      platform.api(ctx, plugin, &api, &messages)?;
+      platform.api(ctx, plugin, permissions, &api, &messages)?;
    }
-   api.set("messages", messages)?;
+   if permissions.messages() {
+      api.set("messages", messages)?;
+   }
    api.set("log", log_object(ctx, plugin)?)?;
    api.set("storage", storage(ctx, plugin)?)?;
    api.set("settings", settings_object(ctx, plugin)?)?;
@@ -580,13 +880,27 @@ fn api<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
          Ok::<_, rquickjs::Error>(())
       })?,
    )?;
-   api.set("stores", stores_object(ctx)?)?;
-   api.set("discord", discord_object(ctx, plugin)?)?;
+   if permissions.stores() {
+      api.set("stores", stores_object(ctx)?)?;
+   }
+   api.set("discord", discord_object(ctx, plugin, permissions)?)?;
+   let granted = Arc::clone(permissions);
    api.set(
       "fetch",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, url: String, init: Opt<Object<'js>>| start_fetch(&ctx, url, init.0),
+         move |ctx: Ctx<'js>, url: String, init: Opt<Object<'js>>| {
+            if !granted.fetch(&url) {
+               return Err(Exception::throw_message(
+                  &ctx,
+                  &format!(
+                     "{}: add this host to the plugin's // @fetch line",
+                     url_host(&url).as_deref().unwrap_or("fetch")
+                  ),
+               ));
+            }
+            start_fetch(&ctx, url, init.0)
+         },
       )?,
    )?;
    Ok(api)
@@ -652,13 +966,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    let mut plugins = bundled
       .into_iter()
       .map(|plugin| {
-         (plugin.name, Loaded {
-            source:    plugin.source,
-            bundled:   None,
-            enabled:   false,
-            error:     None,
-            installed: false,
-         })
+         (plugin.name, Loaded::new(plugin.source, Origin::Bundled))
       })
       .collect::<BTreeMap<String, Loaded>>();
    let paths = match fs::read_dir(&dir) {
@@ -682,29 +990,24 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
       match plugins.get_mut(name) {
          Some(loaded) => loaded.install(source),
          None => {
-            plugins.insert(name.to_owned(), Loaded {
-               source,
-               bundled: None,
-               enabled: false,
-               error: None,
-               installed: true,
-            });
+            plugins.insert(name.to_owned(), Loaded::new(source, Origin::Installed));
          },
       }
    }
    for (name, loaded) in &mut plugins {
-      loaded.enabled = if Header::from(loaded.source.as_str()).default_off {
+      let enabled = if Header::from(loaded.source.as_str()).default_off {
          choices.enabled.contains(name)
       } else {
          !choices.disabled.contains(name)
       };
+      loaded.state = PluginState::from_switch(enabled);
    }
 
    let mut engine = state
       .js
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner);
-   engine.context.with(|ctx| {
+   engine.with(|ctx| {
       if let Some(registry) = ctx.userdata::<Registry<'_>>() {
          *registry.chosen.borrow_mut() = choices.settings.into_owned();
       }
@@ -713,7 +1016,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
    let enabled = engine
       .plugins
       .iter()
-      .filter(|(_, loaded)| loaded.enabled)
+      .filter(|(_, loaded)| loaded.state.is_on())
       .map(|(name, _)| name.clone())
       .collect::<Vec<String>>();
    for name in &enabled {
@@ -725,7 +1028,7 @@ pub fn load_plugins(state: &'static State, bundled: Vec<Plugin>) -> Result<Vec<S
          engine
             .plugins
             .get(name)
-            .is_some_and(|loaded| loaded.error.is_none())
+            .is_some_and(|loaded| matches!(loaded.state, PluginState::On))
       })
       .collect())
 }

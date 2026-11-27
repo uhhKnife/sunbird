@@ -15,7 +15,11 @@ use phoenix_hook::{
    image::Image,
    x86::Abi,
 };
-use phoenix_sigs::desktop;
+use phoenix_sigs::{
+   desktop,
+   index::Index,
+   locate,
+};
 
 /// `getEmojiUnavailableReason(&Emoji, &EmojiContext) -> u8`.
 type CheckFn = unsafe extern "C" fn(*const u8, *const u8) -> u8;
@@ -30,13 +34,8 @@ static UNLOCKED: AtomicBool = AtomicBool::new(false);
 static CHECK: OnceLock<(CheckFn, usize)> = OnceLock::new();
 
 /// Hooks the check from [`crate::prepare`], before Discord's threads run.
-pub fn install(image: &Image<'static>) {
-   let located = if crate::X86_CODE {
-      desktop::emoji_check(image)
-   } else {
-      phoenix_sigs::macos::emoji_check(image)
-   };
-   let found = match located {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
+   let found = match locate::emoji_check(ix) {
       Ok(found) => found,
       Err(err) => {
          log::warn!("emoji check: {err}, Nitro-locked emojis stay locked");

@@ -1,7 +1,3 @@
-// @description Stops your replies from pinging the person you reply to
-// @version 0.1.0
-// @author amaanq
-
 interface AllowedMentions {
    parse?: string[];
    users?: string[];

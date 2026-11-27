@@ -4,11 +4,10 @@ use std::{
    ptr,
    sync::{
       Mutex,
+      MutexGuard,
       PoisonError,
       atomic::{
-         AtomicBool,
          AtomicU32,
-         AtomicUsize,
          Ordering,
       },
    },
@@ -61,11 +60,21 @@ const TRAY_UID: u32 = 0x5342_5244; // "SBRD"
 const BI_RGB: u32 = 0;
 const DIB_RGB_COLORS: u32 = 0;
 
-static TRAY_STARTED: AtomicBool = AtomicBool::new(false);
-static TRAY_HWND: AtomicUsize = AtomicUsize::new(0);
-static TRAY_ICON: AtomicUsize = AtomicUsize::new(0);
+static TRAY: Mutex<Tray> = Mutex::new(Tray::Idle(Vec::new()));
 static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
-static PENDING_BALLOONS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Balloons wait in `Idle` and `Starting` until the icon is up. The handles
+/// are kept as addresses so the state is `Send`.
+enum Tray {
+   Idle(Vec<(String, String)>),
+   Starting(Vec<(String, String)>),
+   Ready { hwnd: usize, icon: usize },
+   Gone,
+}
+
+fn tray() -> MutexGuard<'static, Tray> {
+   TRAY.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[repr(C)]
 struct WndClassExW {
@@ -412,8 +421,12 @@ unsafe fn add_tray_icon(hwnd: *mut c_void, icon: *mut c_void) -> bool {
 
 fn start_tray() {
    crate::webview::start_window_hook();
-   if TRAY_STARTED.swap(true, Ordering::AcqRel) {
-      return;
+   {
+      let mut state = tray();
+      let Tray::Idle(pending) = &mut *state else {
+         return;
+      };
+      *state = Tray::Starting(std::mem::take(pending));
    }
    let _ = thread::Builder::new()
       .name("sunbird-tray".to_owned())
@@ -470,27 +483,28 @@ fn run_tray_loop() {
             "tray: CreateWindowExW failed: {}",
             std::io::Error::last_os_error()
          );
+         *tray() = Tray::Gone;
          return;
       }
 
       let icon = create_sunbird_icon();
-      TRAY_ICON.store(icon as usize, Ordering::Release);
-
       if !add_tray_icon(hwnd, icon) {
          log::warn!("tray: Shell_NotifyIconW(NIM_ADD) failed");
+         *tray() = Tray::Gone;
          DestroyWindow(hwnd);
          DestroyIcon(icon);
-         TRAY_ICON.store(0, Ordering::Release);
          return;
       }
-      TRAY_HWND.store(hwnd as usize, Ordering::Release);
 
       // Flush any startup notifications queued before the tray HWND was ready.
-      let pending = std::mem::take(
-         &mut *PENDING_BALLOONS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner),
-      );
+      let before = std::mem::replace(&mut *tray(), Tray::Ready {
+         hwnd: hwnd as usize,
+         icon: icon as usize,
+      });
+      let pending = match before {
+         Tray::Idle(pending) | Tray::Starting(pending) => pending,
+         Tray::Ready { .. } | Tray::Gone => Vec::new(),
+      };
       for (t, b) in pending {
          send_balloon(hwnd, icon, &t, &b);
       }
@@ -508,11 +522,10 @@ fn run_tray_loop() {
          DispatchMessageW(&raw const msg);
       }
 
-      TRAY_HWND.store(0, Ordering::Release);
+      *tray() = Tray::Gone;
       let mut del = empty_nid(hwnd);
       Shell_NotifyIconW(NIM_DELETE, &raw mut del);
       DestroyIcon(icon);
-      TRAY_ICON.store(0, Ordering::Release);
    }
 }
 
@@ -530,19 +543,19 @@ fn send_balloon(hwnd: *mut c_void, icon: *mut c_void, title: &str, body: &str) {
 }
 
 fn balloon(title: &str, body: &str) {
-   let raw = TRAY_HWND.load(Ordering::Acquire);
-   if raw == 0 {
-      let mut queue = PENDING_BALLOONS
-         .lock()
-         .unwrap_or_else(PoisonError::into_inner);
-      if queue.len() < 8 {
-         queue.push((title.to_owned(), body.to_owned()));
-      }
-      drop(queue);
-      return;
-   }
-   let icon = TRAY_ICON.load(Ordering::Acquire) as *mut c_void;
-   send_balloon(raw as *mut c_void, icon, title, body);
+   let mut state = tray();
+   let (hwnd, icon) = match &mut *state {
+      Tray::Idle(pending) | Tray::Starting(pending) => {
+         if pending.len() < 8 {
+            pending.push((title.to_owned(), body.to_owned()));
+         }
+         return;
+      },
+      Tray::Ready { hwnd, icon } => (*hwnd, *icon),
+      Tray::Gone => return,
+   };
+   drop(state);
+   send_balloon(hwnd as *mut c_void, icon as *mut c_void, title, body);
 }
 
 fn run_menu_action(cmd: usize) {
@@ -565,11 +578,12 @@ unsafe extern "system" fn tray_wnd_proc(
 ) -> isize {
    let taskbar_msg = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
    if taskbar_msg != 0 && msg == taskbar_msg {
-      let icon = TRAY_ICON.load(Ordering::Acquire) as *mut c_void;
-      if !icon.is_null() {
-         // SAFETY: re-registering tray icon after explorer.exe restart.
-         unsafe { add_tray_icon(hwnd, icon) };
-      }
+      let icon = match *tray() {
+         Tray::Ready { icon, .. } => icon as *mut c_void,
+         Tray::Idle(_) | Tray::Starting(_) | Tray::Gone => return 0,
+      };
+      // SAFETY: re-registering tray icon after explorer.exe restart.
+      unsafe { add_tray_icon(hwnd, icon) };
       return 0;
    }
 

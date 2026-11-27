@@ -3,7 +3,8 @@ name: check
 # builds, so an update that breaks one shows up here before users hit it.
 # Android builds are the tracker's latest alpha, the channel Phoenix ships on.
 # Desktop Phoenix sits behind Discord's tester access, so it is checked only when
-# the DISCORD_EXE_URL repository variable points at a copy of its Discord.exe.
+# the DISCORD_EXE_URL and DISCORD_APPIMAGE_URL repository variables point at
+# copies of its Discord.exe and Linux AppImage.
 on:
   pull_request:
     paths: ['crates/hook/**', 'crates/sigs/**', 'crates/sigscan/**', 'crates/loader/**', 'Cargo.*', 'flake.*', '.github/workflows/check.yml']
@@ -27,6 +28,7 @@ jobs:
       - name: sigscan check
         env:
           DESKTOP: ${{ vars.DISCORD_EXE_URL }}
+          LINUX: ${{ vars.DISCORD_APPIMAGE_URL }}
         run: |
           missed=0
           check() {
@@ -42,9 +44,17 @@ jobs:
           done
           if [ -n "$DESKTOP" ]; then
             curl -fsSL "$DESKTOP" -o Discord.exe
-            check desktop Discord.exe
+            check windows Discord.exe
           else
-            echo "::notice::DISCORD_EXE_URL is unset, desktop skipped"
+            echo "::notice::DISCORD_EXE_URL is unset, windows skipped"
+          fi
+          if [ -n "$LINUX" ]; then
+            curl -fsSL "$LINUX" -o discord.AppImage
+            chmod +x discord.AppImage
+            ./discord.AppImage --appimage-extract usr/bin/discord-phoenix > /dev/null
+            check linux squashfs-root/usr/bin/discord-phoenix
+          else
+            echo "::notice::DISCORD_APPIMAGE_URL is unset, linux skipped"
           fi
           exit $missed
   # The macOS loader opens Desktop Phoenix's access gate by rewriting signed

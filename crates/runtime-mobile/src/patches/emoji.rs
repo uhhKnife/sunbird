@@ -114,17 +114,14 @@ mod check {
       Inline,
    };
 
-   /// `EmojiContext.intention`, and its value for the message box (`CHAT`).
-   #[cfg(target_arch = "aarch64")]
-   const INTENTION: usize = 0x24;
-   #[cfg(target_arch = "arm")]
-   const INTENTION: usize = 0x1C;
+   /// `EmojiContext.intention`'s value for the message box.
    const CHAT: u8 = 3;
    const PREMIUM_LOCKED: u8 = 2;
    const USABLE: u8 = 0xFF;
 
    static UNLOCKED: AtomicBool = AtomicBool::new(false);
-   static CHECK: OnceLock<Option<Inline>> = OnceLock::new();
+   /// The hook and `EmojiContext.intention`'s offset.
+   static CHECK: OnceLock<Option<(Inline, usize)>> = OnceLock::new();
 
    pub fn install() {
       CHECK.get_or_init(hook_check);
@@ -134,27 +131,23 @@ mod check {
       UNLOCKED.store(on, Ordering::Release);
    }
 
-   fn hook_check() -> Option<Inline> {
+   fn hook_check() -> Option<(Inline, usize)> {
       let image = &phoenix_runtime::state()?.image;
-      #[cfg(target_arch = "aarch64")]
-      let found = phoenix_sigs::mobile::emoji_aarch64(image);
-      #[cfg(target_arch = "arm")]
-      let found = phoenix_sigs::mobile::emoji_arm(image);
-      let target = found
+      let found = crate::with_index(image, phoenix_sigs::locate::emoji_check)
          .inspect_err(|err| log::warn!("emoji check: {err}, Nitro-locked emojis stay locked"))
          .ok()?;
-      // ShadowHook picks ARM or Thumb by bit 0, and the arm32 pattern is Thumb.
+      // ShadowHook picks ARM or Thumb by bit 0, and arm32 code is Thumb.
       let target = if cfg!(target_arch = "arm") {
-         target | 1
+         found.func | 1
       } else {
-         target
+         found.func
       };
       let target = std::ptr::NonNull::new(target as *mut std::ffi::c_void)?;
       let detour = std::ptr::NonNull::new(unavailable_reason as *mut std::ffi::c_void)?;
-      // SAFETY: the pattern matches the start of the check, and the detour has
+      // SAFETY: the index found the start of the check, and the detour has
       // its ABI.
       match unsafe { Inline::attach(target, detour) } {
-         Ok(hook) => Some(hook),
+         Ok(hook) => Some((hook, found.intention)),
          Err(err) => {
             log::warn!("emoji check: {err}");
             None
@@ -164,7 +157,7 @@ mod check {
 
    extern "C" fn unavailable_reason(emoji: *const u8, context: *const u8) -> u8 {
       // A call can land here before `CHECK` holds the hook that sent it.
-      let Some(hook) = CHECK.wait() else {
+      let Some((hook, intention_at)) = CHECK.wait() else {
          return USABLE;
       };
       // SAFETY: the trampoline runs the original check, which has this ABI.
@@ -175,7 +168,7 @@ mod check {
          return reason;
       }
       // SAFETY: Phoenix passes a live context, and the intention byte is in it.
-      let intention = unsafe { *context.add(INTENTION) };
+      let intention = unsafe { *context.add(*intention_at) };
       if intention == CHAT { USABLE } else { reason }
    }
 }

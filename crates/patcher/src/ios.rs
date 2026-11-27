@@ -11,7 +11,12 @@ use std::{
 use phoenix_sigs::{
    PLUGIN_BUNDLE,
    file::MachOFile,
+   index::{
+      Index,
+      Isa,
+   },
    ios,
+   locate,
 };
 
 use crate::{
@@ -261,7 +266,8 @@ fn offer_switch(data: &mut [u8]) {
 pub fn open_access_gate(path: &str, data: &mut [u8]) -> Result<[usize; 2], Error> {
    let (gates, offsets) = {
       let file = MachOFile::parse(path, data).map_err(Error::Elf)?;
-      let gates = ios::access_gate(&file.image).map_err(Error::Host)?;
+      let ix = Index::new(&file.image, Isa::Aarch64);
+      let gates = locate::mobile::access_gate(&ix).map_err(Error::Host)?;
       let offset = |vaddr: usize| {
          file.file_offset(vaddr).ok_or_else(|| {
             Error::Host(format!(

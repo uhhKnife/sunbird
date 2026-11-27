@@ -28,7 +28,10 @@ use std::{
 };
 
 use phoenix_hook::image::Image;
-use phoenix_sigs::desktop;
+use phoenix_sigs::{
+   index::Index,
+   locate,
+};
 
 use crate::gpui::{
    self,
@@ -56,16 +59,16 @@ static LAST_PAGE: AtomicUsize = AtomicUsize::new(usize::MAX);
 
 /// Installs the Desktop User Settings sidebar label, visibility patch, native
 /// GPUI builder bindings, and `host::section` render hook.
-pub fn install(image: &Image<'static>) {
+pub fn install(image: &Image<'static>, ix: &Index<'_>) {
    if !crate::X86_CODE {
       #[cfg(target_os = "macos")]
-      install_arm64(image);
+      install_arm64(image, ix);
       return;
    }
-   patch_sidebar_label(image);
-   patch_page_visibility(image);
-   if gpui::locate(image) {
-      hook_section_render(image);
+   patch_sidebar_label(image, ix);
+   patch_page_visibility(image, ix);
+   if gpui::locate(image, ix) {
+      hook_section_render(image, ix);
    }
 }
 
@@ -74,20 +77,20 @@ pub fn install(image: &Image<'static>) {
 /// settings window when they don't decode. Each part is located before
 /// anything is written, so a build that moved one changes nothing.
 #[cfg(target_os = "macos")]
-fn install_arm64(image: &Image<'static>) {
+fn install_arm64(image: &Image<'static>, ix: &Index<'_>) {
    use phoenix_sigs::macos;
 
    const NEW_NAME: &[u8] = b"Sunbird";
-   const NEW_ID: &[u8] = b"DESKTOP_SUNBIRD";
+   const NEW_SUFFIX: &[u8] = b"SUNBIRD";
 
    // Locate GPUI symbols and Discord's allocator up front so early exits below
    // cannot silently disable icons, modals, or other native GPUI features.
-   let native = gpui::locate(image);
+   let native = gpui::locate(image, ix);
 
    let (label, limits, section) = match (
-      macos::settings_label_parts(image),
-      macos::settings_visibility(image),
-      macos::settings_section(image),
+      locate::settings::settings_label(ix),
+      locate::settings::settings_visibility(ix),
+      locate::settings::settings_section(ix),
    ) {
       (Ok(label), Ok(limits), Ok(section)) => (label, limits, section),
       (label, limits, section) => {
@@ -102,10 +105,10 @@ fn install_arm64(image: &Image<'static>) {
    };
    let Some(guards) = limits
       .iter()
-      .map(|&limit| {
+      .map(|guard| {
          image
-            .read_u32(limit)
-            .map(|cmp| (limit, macos::lowered_guard(cmp)))
+            .read_u32(guard.cmp)
+            .map(|cmp| (guard.cmp, macos::lowered_guard(cmp)))
       })
       .collect::<Option<Vec<_>>>()
    else {
@@ -134,7 +137,7 @@ fn install_arm64(image: &Image<'static>) {
          .iter()
          .try_for_each(|&(limit, lowered)| image.write_code(limit, &lowered.to_le_bytes()))
          .and_then(|()| image.write_code(label.name, NEW_NAME))
-         .and_then(|()| image.write_code(label.id, NEW_ID))
+         .and_then(|()| image.write_code(label.suffix, NEW_SUFFIX))
    };
    match written {
       Ok(()) => {
@@ -152,13 +155,13 @@ fn install_arm64(image: &Image<'static>) {
    }
 }
 
-fn patch_sidebar_label(image: &Image<'static>) {
+fn patch_sidebar_label(image: &Image<'static>, ix: &Index<'_>) {
    const NEW_NAME: &[u8] = b"Sunbird";
-   const NEW_ID: &[u8] = b"SUNBIRD";
+   const NEW_SUFFIX: &[u8] = b"SUNBIRD";
    const _: () = assert!(NEW_NAME.len() == b"Phoenix".len());
-   const _: () = assert!(NEW_ID.len() == b"PHOENIX".len());
+   const _: () = assert!(NEW_SUFFIX.len() == b"PHOENIX".len());
 
-   let label = match desktop::settings_label_parts(image) {
+   let label = match locate::settings::settings_label(ix) {
       Ok(label) => label,
       Err(err) => {
          log::warn!("desktop settings: {err}, leaving sidebar label");
@@ -171,15 +174,17 @@ fn patch_sidebar_label(image: &Image<'static>) {
       log::warn!("desktop settings: relabel name failed: {err}");
       return;
    }
-   match unsafe { image.write_code(label.id, NEW_ID) } {
+   // SAFETY: as above. The id ends in the suffix, `DESKTOP_PHOENIX` or
+   // `PHOENIX`, so this gives `DESKTOP_SUNBIRD` or `SUNBIRD`.
+   match unsafe { image.write_code(label.suffix, NEW_SUFFIX) } {
       Ok(()) => log::info!("desktop settings: relabeled page 24 to Sunbird"),
       Err(err) => log::warn!("desktop settings: relabel id failed: {err}"),
    }
 }
 
-fn patch_page_visibility(image: &Image<'static>) {
-   let limit = match desktop::settings_visibility(image) {
-      Ok(limit) => limit,
+fn patch_page_visibility(image: &Image<'static>, ix: &Index<'_>) {
+   let guards = match locate::settings::settings_visibility(ix) {
+      Ok(guards) => guards,
       Err(err) => {
          log::warn!("desktop settings: {err}, leaving it");
          return;
@@ -187,15 +192,17 @@ fn patch_page_visibility(image: &Image<'static>) {
    };
    // Tightening `cmp r8d, 0xf` -> `0x0e` excludes page 24 (`24 - 9 = 15`) from
    // the gated switch so `is_page_visible(24)` returns `true` unconditionally.
-   // SAFETY: single-byte immediate patch in `.text` executed from `DllMain`.
-   match unsafe { image.write_code(limit, &[0x0E]) } {
-      Ok(()) => log::info!("desktop settings: page 24 visibility unlocked"),
-      Err(err) => log::warn!("desktop settings: visibility patch failed: {err}"),
+   for guard in guards {
+      // SAFETY: single-byte immediate patch in `.text` executed from `DllMain`.
+      match unsafe { image.write_code(guard.imm8(), &[0x0E]) } {
+         Ok(()) => log::info!("desktop settings: page 24 visible @ {:#x}", guard.cmp),
+         Err(err) => log::warn!("desktop settings: visibility patch failed: {err}"),
+      }
    }
 }
 
-fn hook_section_render(image: &Image<'static>) {
-   let (fn_start, offset) = match desktop::settings_section(image) {
+fn hook_section_render(image: &Image<'static>, ix: &Index<'_>) {
+   let (fn_start, offset) = match locate::settings::settings_section(ix) {
       Ok(section) => (section.func, section.page_offset),
       Err(err) => {
          log::warn!("desktop settings: {err}, skipping section hook");

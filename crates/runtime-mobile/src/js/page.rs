@@ -1,7 +1,11 @@
 //! Profile tab pages drawn from blocks, and full-screen pages from
 //! `phoenix.ui.openPage`.
 
-use phoenix_runtime::js::Engine;
+use phoenix_runtime::js::{
+   Engine,
+   checked_icon,
+   image_allowed,
+};
 use rquickjs::{
    CatchResultExt,
    Ctx,
@@ -86,6 +90,11 @@ pub fn page_of<'js>(
    value: Option<&Value<'js>>,
 ) -> Outcome {
    let mut handlers = Vec::new();
+   let plugin = ctx
+      .userdata::<Mobile<'js>>()
+      .and_then(|registry| Some(registry.ui.borrow().get(&id)?.plugin.clone()))
+      .unwrap_or_default();
+   let allowed = |uri: &str| image_allowed(ctx, &plugin, uri);
    let blocks = value.and_then(Value::as_array).map_or_else(
       || {
          vec![patches::Block::Text {
@@ -97,7 +106,7 @@ pub fn page_of<'js>(
       |array| {
          array
             .iter::<Value<'js>>()
-            .filter_map(|block| block_of(block.ok()?.as_object()?, &mut handlers))
+            .filter_map(|block| block_of(block.ok()?.as_object()?, &mut handlers, &allowed))
             .collect()
       },
    );
@@ -154,6 +163,7 @@ fn actions_of<'js>(
 fn block_of<'js>(
    object: &Object<'js>,
    handlers: &mut Vec<Function<'js>>,
+   allowed: &dyn Fn(&str) -> bool,
 ) -> Option<patches::Block> {
    let text = |object: &Object<'js>, key: &str| object.get::<_, Option<String>>(key).ok().flatten();
    let flag = |object: &Object<'js>, key: &str| {
@@ -194,12 +204,18 @@ fn block_of<'js>(
                .unwrap_or_default()
          };
          patches::Block::Entry {
-            avatar: text(object, "avatar"),
+            avatar: text(object, "avatar").filter(|uri| allowed(uri)),
             title: text(object, "title")?,
             subtitle: text(object, "subtitle"),
             text: text(object, "text").unwrap_or_default(),
-            badges: strings("badges"),
-            images: strings("images"),
+            badges: strings("badges")
+               .into_iter()
+               .filter(|uri| allowed(uri))
+               .collect(),
+            images: strings("images")
+               .into_iter()
+               .filter(|uri| allowed(uri))
+               .collect(),
             actions,
             side: actions_of(object, "side", &mut handler),
             hold: handler(object, "onLongPress"),
@@ -276,7 +292,7 @@ pub fn add_page<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs
                      handlers.push(on_press);
                      buttons.push(patches::pages::PageButton {
                         label,
-                        icon: btn.get::<_, Option<String>>("icon")?,
+                        icon: checked_icon(&ctx, &owner, btn.get::<_, Option<String>>("icon")?)?,
                         danger: btn.get::<_, Option<bool>>("danger")?.unwrap_or(false),
                         index,
                      });

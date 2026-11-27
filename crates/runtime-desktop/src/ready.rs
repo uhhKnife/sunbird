@@ -47,16 +47,15 @@ pub fn install(image: &Image<'static>) {
 }
 
 fn install_text(image: &Image<'static>, parse: usize) {
-   let (func, prologue) = match (
-      desktop::ready_text(image, parse),
-      desktop::Prologues::of(Abi::of(image)).ready_text,
-   ) {
-      (Ok(func), Some(prologue)) => (func, prologue),
-      (Err(err), _) => {
+   let func = match desktop::ready_text(image, parse) {
+      Ok(func) => func,
+      Err(err) => {
          log::warn!("ready: {err}, READYs under 2 MB pass unhooked");
          return;
       },
-      (_, None) => return,
+   };
+   let Some(prologue) = desktop::Prologues::of(Abi::of(image)).ready_text else {
+      return;
    };
    // SAFETY: runs before Discord's threads, and the detour has the parse's
    // ABI.

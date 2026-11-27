@@ -1,7 +1,3 @@
-// @description Sends messages without notifying anyone, always or when they start with a prefix
-// @version 1.0.0
-// @author Lil Poop
-
 const settings = phoenix.settings.define({
   always: {
     type: "switch",
@@ -17,8 +13,7 @@ const settings = phoenix.settings.define({
   },
 });
 
-/// Discord's `SUPPRESS_NOTIFICATIONS` message flag.
-const SILENT = 1 << 12;
+const SUPPRESS_NOTIFICATIONS = 1 << 12;
 
 // The prefix is taken off in `onSend`, before Phoenix posts the text, and the
 // post that follows carries the flag.
@@ -38,5 +33,5 @@ phoenix.discord.onRequest({ method: "POST", pathPrefix: "/channels/", pathSuffix
   nextSilent = false;
   const body = req.json<{ flags?: number }>();
   if (!body) return;
-  return { body: { ...body, flags: (body.flags ?? 0) | SILENT } };
+  return { body: { ...body, flags: (body.flags ?? 0) | SUPPRESS_NOTIFICATIONS } };
 });

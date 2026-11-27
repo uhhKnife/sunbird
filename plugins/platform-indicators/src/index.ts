@@ -1,7 +1,3 @@
-// @description Shows which devices people are online from: desktop, mobile, web or console
-// @version 1.0.0
-// @author yuax
-
 type Status = "online" | "idle" | "dnd";
 type Platform = "desktop" | "mobile" | "web" | "embedded" | "vr";
 type Presence = { status: Status; platforms: Partial<Record<Platform, Status>> };

@@ -1,8 +1,14 @@
 //! The worker thread that runs plugin callbacks, and the jobs it takes.
 
 use std::sync::{
-   OnceLock,
-   mpsc::Sender,
+   LazyLock,
+   Mutex,
+   PoisonError,
+   mpsc::{
+      self,
+      Receiver,
+      Sender,
+   },
 };
 
 use phoenix_runtime::{
@@ -186,12 +192,31 @@ pub enum Job {
    },
 }
 
-pub static WORKER: OnceLock<Sender<Job>> = OnceLock::new();
+/// Plugins queue jobs while they load, before `start` spawns the worker, so
+/// those jobs wait in the channel until the worker takes the receiver.
+static WORKER: LazyLock<Worker> = LazyLock::new(|| {
+   let (sender, receiver) = mpsc::channel();
+   Worker {
+      sender,
+      receiver: Mutex::new(Some(receiver)),
+   }
+});
+
+struct Worker {
+   sender:   Sender<Job>,
+   receiver: Mutex<Option<Receiver<Job>>>,
+}
+
+pub fn take_jobs() -> Option<Receiver<Job>> {
+   WORKER
+      .receiver
+      .lock()
+      .unwrap_or_else(PoisonError::into_inner)
+      .take()
+}
 
 pub fn queue(job: Job) {
-   if let Some(worker) = WORKER.get()
-      && worker.send(job).is_err()
-   {
+   if WORKER.sender.send(job).is_err() {
       log::warn!("patches: the worker is gone");
    }
 }

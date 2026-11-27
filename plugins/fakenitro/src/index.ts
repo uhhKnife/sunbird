@@ -1,7 +1,3 @@
-// @description Unlocks Nitro stream quality, client themes and app icons, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.7.0
-// @author mantikafasi
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

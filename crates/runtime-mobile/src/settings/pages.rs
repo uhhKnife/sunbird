@@ -36,22 +36,22 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
          .enumerate()
          .map(|(index, plugin)| {
             let subtitle = plugin
-               .error
-               .as_deref()
+               .state
+               .error()
                .map(|error| format!("Failed: {error}"))
                .or_else(|| plugin.header.description.clone());
             switch_row(
                Some(ICON_PLUGIN),
                &plugin.name,
                subtitle.as_deref(),
-               plugin.enabled,
+               plugin.state.is_on(),
                Press::OpenPlugin(index),
                Press::Toggle(index),
             )
          })
          .collect()
    };
-   let enabled = plugins.iter().filter(|plugin| plugin.enabled).count();
+   let enabled = plugins.iter().filter(|plugin| plugin.state.is_on()).count();
    update_section()
       .into_iter()
       .chain([
@@ -172,7 +172,7 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
       .map(|(index, plugin)| {
          let on = plugins
             .iter()
-            .any(|other| other.name == plugin.name && (other.installed || other.enabled));
+            .any(|other| other.name == plugin.name && (other.installed || other.state.is_on()));
          let subtitle = plugin.warning.as_ref().map_or_else(
             || plugin.description.clone(),
             |warning| format!("{} \u{26A0} {warning}", plugin.description),

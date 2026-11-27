@@ -22,6 +22,7 @@ use std::{
       mpsc,
    },
    thread,
+   time::Duration,
 };
 
 use crate::{
@@ -263,6 +264,13 @@ unsafe extern "C" {
       context: *mut c_void,
       work: extern "C" fn(*mut c_void),
    );
+   fn dispatch_time(when: u64, delta: i64) -> u64;
+   fn dispatch_after_f(
+      when: u64,
+      queue: *const c_void,
+      context: *mut c_void,
+      work: extern "C" fn(*mut c_void),
+   );
 }
 
 fn class(name: &CStr) -> Id {
@@ -360,6 +368,30 @@ fn on_main(work: impl FnOnce() + Send + 'static) {
    }
 }
 
+fn on_main_after(delay: Duration, work: impl FnOnce() + Send + 'static) {
+   const DISPATCH_TIME_NOW: u64 = 0;
+   type Work = Box<dyn FnOnce() + Send>;
+   extern "C" fn run(context: *mut c_void) {
+      // SAFETY: `context` is the `Box<Work>` `on_main_after` leaked, read back
+      // once.
+      let work = unsafe { Box::from_raw(context.cast::<Work>()) };
+      work();
+   }
+   let nanos = i64::try_from(delay.as_nanos()).unwrap_or(i64::MAX);
+   let work: Box<Work> = Box::new(Box::new(work));
+   // SAFETY: the main queue lives as long as the process, and `run` takes
+   // back the box once when the timer fires.
+   unsafe {
+      let when = dispatch_time(DISPATCH_TIME_NOW, nanos);
+      dispatch_after_f(
+         when,
+         &raw const _dispatch_main_q,
+         Box::into_raw(work).cast(),
+         run,
+      );
+   }
+}
+
 /// The status item's menu calls this with the clicked item, whose tag is its
 /// index in [`TrayAction::MENU`]. Actions may block, so they run elsewhere.
 extern "C" fn tray_clicked(_this: Id, _selector: Sel, sender: Id) {
@@ -380,22 +412,22 @@ fn spawn(name: &str, work: impl FnOnce() + Send + 'static) {
 }
 
 /// One instance of a new `NSObject` subclass `name`, kept for the life of the
-/// process, whose methods are `(selector, imp)` pairs of type `v@:@`.
+/// process, whose methods are `(selector, imp, types)` tuples.
 ///
 /// # Safety
 ///
-/// On the main thread, and each `imp` is an `extern "C" fn(Id, Sel, Id)`.
-unsafe fn target_object(name: &CStr, methods: &[(&CStr, *const c_void)]) -> Id {
+/// On the main thread, and each `imp` matches its Objective-C `types` encoding.
+unsafe fn target_object(name: &CStr, methods: &[(&CStr, *const c_void, &CStr)]) -> Id {
    let mut target = class(name);
    if target.is_null() {
-      // SAFETY: registers a new subclass with the caller's `v@:@` methods.
+      // SAFETY: registers a new subclass with the caller's methods.
       unsafe {
          target = objc_allocateClassPair(class(c"NSObject"), name.as_ptr(), 0);
          if target.is_null() {
             return ptr::null_mut();
          }
-         for &(selector, imp) in methods {
-            class_addMethod(target, sel(selector), imp, c"v@:@".as_ptr());
+         for &(selector, imp, types) in methods {
+            class_addMethod(target, sel(selector), imp, types.as_ptr());
          }
          objc_registerClassPair(target);
       }
@@ -416,6 +448,7 @@ fn start_status_item() {
       let target = target_object(c"SunbirdTrayTarget", &[(
          c"sunbirdTray:",
          tray_clicked as *const c_void,
+         c"v@:@",
       )]);
       if bar.is_null() || target.is_null() {
          log::info!("tray: AppKit is not available");

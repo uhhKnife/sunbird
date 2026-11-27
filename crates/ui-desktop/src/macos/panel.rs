@@ -22,6 +22,7 @@ use std::{
          Ordering,
       },
    },
+   time::Duration,
 };
 
 use super::{
@@ -31,12 +32,14 @@ use super::{
    ns_string,
    objc_msgSend,
    on_main,
+   on_main_after,
    sel,
    send,
    send_bool,
    send_f64,
    send_id,
    send_isize,
+   send_responds,
    send_tag,
    spawn,
    target_object,
@@ -74,7 +77,18 @@ struct Open {
    window:   usize,
    tags:     Vec<isize>,
    on_close: Option<Action>,
+   closing:  bool,
 }
+
+const OPEN_DURATION: f64 = 0.20;
+const CLOSE_DURATION: f64 = 0.14;
+const REDUCE_MOTION_DURATION: f64 = 0.10;
+const OPEN_SLIDE_PT: f64 = 12.0;
+const CLOSE_SLIDE_PT: f64 = 10.0;
+const OPEN_CURVE: [f32; 4] = [0.16, 1.0, 0.3, 1.0];
+const CLOSE_CURVE: [f32; 4] = [0.4, 0.0, 1.0, 1.0];
+/// `NSWindowAnimationBehaviorNone`.
+const NO_ANIMATION_BEHAVIOR: isize = 2;
 
 static NEXT_PANEL: AtomicU64 = AtomicU64::new(1);
 static NEXT_TAG: AtomicIsize = AtomicIsize::new(1);
@@ -108,6 +122,10 @@ msg_send!(send_priority(priority: f32, orientation: isize) -> ());
 msg_send!(send_size(width: f64, height: f64) -> ());
 msg_send!(send_anchor(anchor: Id, constant: f64) -> Id);
 msg_send!(send_fitting() -> Size);
+msg_send!(send_frame() -> Rect);
+msg_send!(send_set_frame(frame: Rect, display: bool) -> ());
+msg_send!(send_bool_ret() -> bool);
+msg_send!(send_timing(c1x: f32, c1y: f32, c2x: f32, c2y: f32) -> Id);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -137,11 +155,136 @@ pub fn close_panel(id: u64) {
          .get(&id)
          .map(|open| open.window);
       if let Some(window) = window {
-         // SAFETY: a window `build` made and still holds; closing it calls
-         // `window_will_close`, which forgets it.
+         // SAFETY: a window `build` made and still tracks in `OPEN`.
+         unsafe {
+            let _ = start_close(window as Id);
+         }
+      }
+   });
+}
+
+unsafe fn reduce_motion() -> bool {
+   // SAFETY: on the main thread; workspace is checked for nil and selector support.
+   unsafe {
+      let workspace = send(class(c"NSWorkspace"), sel(c"sharedWorkspace"));
+      let check = sel(c"accessibilityDisplayShouldReduceMotion");
+      !workspace.is_null()
+         && send_responds(workspace, sel(c"respondsToSelector:"), check)
+         && send_bool_ret(workspace, check)
+   }
+}
+
+unsafe fn animate_window(
+   window: Id,
+   alpha: f64,
+   frame: Option<Rect>,
+   duration: f64,
+   curve: [f32; 4],
+) {
+   let ctx_cls = class(c"NSAnimationContext");
+   if ctx_cls.is_null() {
+      // SAFETY: on the main thread with a live `NSWindow`.
+      unsafe {
+         send_f64_unit(window, sel(c"setAlphaValue:"), alpha);
+         if let Some(frame) = frame {
+            send_set_frame(window, sel(c"setFrame:display:"), frame, true);
+         }
+      }
+      return;
+   }
+   // SAFETY: on the main thread; every returned object is nil-checked before use.
+   unsafe {
+      send(ctx_cls, sel(c"beginGrouping"));
+      let ctx = send(ctx_cls, sel(c"currentContext"));
+      if !ctx.is_null() {
+         send_f64_unit(ctx, sel(c"setDuration:"), duration);
+         let timing_cls = class(c"CAMediaTimingFunction");
+         if !timing_cls.is_null() {
+            let timing = send_timing(
+               timing_cls,
+               sel(c"functionWithControlPoints::::"),
+               curve[0],
+               curve[1],
+               curve[2],
+               curve[3],
+            );
+            if !timing.is_null() {
+               send_id(ctx, sel(c"setTimingFunction:"), timing);
+            }
+         }
+      }
+      let animator = send(window, sel(c"animator"));
+      let target = if animator.is_null() { window } else { animator };
+      send_f64_unit(target, sel(c"setAlphaValue:"), alpha);
+      if let Some(frame) = frame {
+         send_set_frame(target, sel(c"setFrame:display:"), frame, true);
+      }
+      send(ctx_cls, sel(c"endGrouping"));
+   }
+}
+
+/// Returns `true` if `AppKit` should close immediately, `false` while the
+/// fade-out owns closing.
+unsafe fn start_close(window: Id) -> bool {
+   let mut open = OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+   let Some(id) = open
+      .iter()
+      .find_map(|(&id, entry)| (entry.window == window as usize).then_some(id))
+   else {
+      return true;
+   };
+   let Some(entry) = open.get_mut(&id) else {
+      return true;
+   };
+   if entry.closing {
+      return false;
+   }
+   entry.closing = true;
+   let tags = std::mem::take(&mut entry.tags);
+   let on_close = entry.on_close.take();
+   drop(open);
+
+   if !tags.is_empty() {
+      let mut buttons = BUTTONS.lock().unwrap_or_else(PoisonError::into_inner);
+      for tag in &tags {
+         buttons.remove(tag);
+      }
+   }
+   if let Some(on_close) = on_close {
+      spawn("sunbird-panel", move || on_close());
+   }
+
+   // SAFETY: on the main thread; `window` is still open and tracked in `OPEN`.
+   let reduced = unsafe {
+      send_bool(window, sel(c"setIgnoresMouseEvents:"), true);
+      let reduced = reduce_motion();
+      let target_frame = (!reduced).then(|| {
+         let mut frame = send_frame(window, sel(c"frame"));
+         frame.y -= CLOSE_SLIDE_PT;
+         frame
+      });
+      let duration = if reduced {
+         REDUCE_MOTION_DURATION
+      } else {
+         CLOSE_DURATION
+      };
+      animate_window(window, 0.0, target_frame, duration, CLOSE_CURVE);
+      reduced
+   };
+   let finish_delay = Duration::from_millis(if reduced { 110 } else { 150 });
+   on_main_after(finish_delay, move || {
+      let window = OPEN
+         .lock()
+         .unwrap_or_else(PoisonError::into_inner)
+         .get(&id)
+         .map(|entry| entry.window);
+      if let Some(window) = window {
+         // SAFETY: still tracked in `OPEN` on the main thread; closing calls
+         // `window_will_close`, which forgets and autoreleases it.
          unsafe { send(window as Id, sel(c"close")) };
       }
    });
+   false
 }
 
 /// # Safety
@@ -368,6 +511,7 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
          );
       }
       send_id(window, sel(c"setDelegate:"), target);
+      send_isize(window, sel(c"setAnimationBehavior:"), NO_ANIMATION_BEHAVIOR);
       OPEN
          .lock()
          .unwrap_or_else(PoisonError::into_inner)
@@ -375,10 +519,39 @@ unsafe fn build(id: u64, title: &str, sections: Vec<PanelSection>, on_close: Opt
             window: window as usize,
             tags,
             on_close,
+            closing: false,
          });
       send(window, sel(c"center"));
+      let reduced = reduce_motion();
+      let final_frame = send_frame(window, sel(c"frame"));
+      if !reduced {
+         let mut start_frame = final_frame;
+         start_frame.y -= OPEN_SLIDE_PT;
+         send_set_frame(window, sel(c"setFrame:display:"), start_frame, false);
+      }
+      send_f64_unit(window, sel(c"setAlphaValue:"), 0.0);
       send_id(window, sel(c"makeKeyAndOrderFront:"), ptr::null_mut());
+      animate_window(
+         window,
+         1.0,
+         (!reduced).then_some(final_frame),
+         if reduced {
+            REDUCE_MOTION_DURATION
+         } else {
+            OPEN_DURATION
+         },
+         OPEN_CURVE,
+      );
    }
+}
+
+extern "C" fn window_should_close(_this: Id, _selector: Sel, sender: Id) -> bool {
+   if sender.is_null() {
+      return true;
+   }
+   // SAFETY: AppKit invokes delegate methods on the main thread with the
+   // closing `NSWindow`.
+   unsafe { start_close(sender) }
 }
 
 /// A button's click: runs the handler its tag maps to.
@@ -427,12 +600,20 @@ extern "C" fn window_will_close(_this: Id, _selector: Sel, notification: Id) {
 /// The shared button target and window delegate.
 fn target() -> Id {
    static TARGET: LazyLock<usize> = LazyLock::new(|| {
-      // SAFETY: on the main thread, with `panel_clicked` and
-      // `window_will_close` of type `v@:@`.
+      // SAFETY: on the main thread; each IMP matches its ObjC type encoding.
       unsafe {
          target_object(c"SunbirdPanelTarget", &[
-            (c"sunbirdPanel:", panel_clicked as *const c_void),
-            (c"windowWillClose:", window_will_close as *const c_void),
+            (c"sunbirdPanel:", panel_clicked as *const c_void, c"v@:@"),
+            (
+               c"windowShouldClose:",
+               window_should_close as *const c_void,
+               c"B@:@",
+            ),
+            (
+               c"windowWillClose:",
+               window_will_close as *const c_void,
+               c"v@:@",
+            ),
          ])
       }
       .addr()

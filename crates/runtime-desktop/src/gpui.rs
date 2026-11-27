@@ -30,11 +30,15 @@ use phoenix_runtime::{
       Listed,
    },
 };
-use phoenix_sigs::desktop::{
-   self,
-   GpuiLayout,
-   StyleOffsets,
-   layout,
+use phoenix_sigs::{
+   desktop::{
+      self,
+      GpuiLayout,
+      StyleOffsets,
+      layout,
+   },
+   index::Index,
+   locate,
 };
 
 use crate::modal::{
@@ -298,9 +302,15 @@ struct UiState {
    filter:           PluginFilter,
    expanded_plugins: HashSet<String>,
    open_select:      Option<(String, String)>,
-   cat_desktop_open: bool,
-   cat_partial_open: bool,
-   cat_mobile_open:  bool,
+   open_groups:      HashSet<CatalogGroup>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+enum CatalogGroup {
+   Desktop,
+   Partial,
+   Other,
 }
 
 impl Default for UiState {
@@ -310,9 +320,7 @@ impl Default for UiState {
          filter:           PluginFilter::All,
          expanded_plugins: HashSet::new(),
          open_select:      None,
-         cat_desktop_open: true,
-         cat_partial_open: false,
-         cat_mobile_open:  false,
+         open_groups:      HashSet::from([CatalogGroup::Desktop]),
       }
    }
 }
@@ -333,7 +341,7 @@ enum Action {
       key:    String,
       value:  String,
    },
-   ToggleCatalogGroup(u8),
+   ToggleCatalogGroup(CatalogGroup),
    ToggleStaff,
    ReloadAll,
    OpenDevTools,
@@ -458,10 +466,8 @@ unsafe extern "C" fn button_callback(
          },
          Action::ToggleCatalogGroup(group) => {
             let mut ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
-            match group {
-               0 => ui.cat_desktop_open = !ui.cat_desktop_open,
-               1 => ui.cat_partial_open = !ui.cat_partial_open,
-               _ => ui.cat_mobile_open = !ui.cat_mobile_open,
+            if !ui.open_groups.remove(&group) {
+               ui.open_groups.insert(group);
             }
          },
          Action::ReloadAll => phoenix_runtime::reload_all(),
@@ -528,19 +534,19 @@ unsafe extern "C" fn button_callback(
 
 /// Resolves Discord's native GPUI / Mana widget builders from unique string
 /// anchors. Safe to call from `DllMain` (`prepare()`).
-pub fn locate(image: &Image<'static>) -> bool {
+pub fn locate(image: &Image<'static>, ix: &Index<'_>) -> bool {
    if SYMBOLS.get().is_some() {
       return true;
    }
 
    let found = if crate::X86_CODE {
-      desktop::gpui(image).and_then(|gpui| {
+      locate::gpui::gpui(ix).and_then(|gpui| {
          let layout = desktop::gpui_layouts(image, &gpui)?;
          let raw = gpui.div_into_any;
          Ok((gpui, layout, raw))
       })
    } else {
-      arm64_builders(image)
+      arm64_builders(image, ix)
    };
    let (
       desktop::Gpui {
@@ -608,12 +614,15 @@ pub fn locate(image: &Image<'static>) -> bool {
    true
 }
 
-/// The arm64 builders ([`phoenix_sigs::macos::gpui`]) with every one that
-/// returns through `x8` swapped for an `image::sret_caller` thunk, so they
+/// The arm64 builders ([`phoenix_sigs::locate::gpui::gpui`]) with every one
+/// that returns through `x8` swapped for an `image::sret_caller` thunk, so they
 /// are called the x86 way, result slot first, like the types here say.
 #[cfg(target_os = "macos")]
-fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
-   let gpui = phoenix_sigs::macos::gpui(image)?;
+fn arm64_builders(
+   image: &Image<'_>,
+   ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+   let gpui = locate::gpui::gpui(ix)?;
    let layout = phoenix_sigs::macos::gpui_layouts(image, &gpui)?;
    let raw = gpui.div_into_any;
    let thunk = |addr: usize| {
@@ -638,7 +647,10 @@ fn arm64_builders(image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm64_builders(_image: &Image<'_>) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
+fn arm64_builders(
+   _image: &Image<'_>,
+   _ix: &Index<'_>,
+) -> Result<(desktop::Gpui, GpuiLayout, usize), String> {
    Err("no arm64 builders off macOS".to_owned())
 }
 
@@ -1537,21 +1549,19 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       .unwrap_or_else(PoisonError::into_inner)
       .clear();
 
-   let (tab, filter, expanded_plugins, open_select, cat_desktop, cat_partial, cat_mobile) = {
+   let (tab, filter, expanded_plugins, open_select, open_groups) = {
       let ui = UI_STATE.lock().unwrap_or_else(PoisonError::into_inner);
       (
          ui.tab,
          ui.filter,
          ui.expanded_plugins.clone(),
          ui.open_select.clone(),
-         ui.cat_desktop_open,
-         ui.cat_partial_open,
-         ui.cat_mobile_open,
+         ui.open_groups.clone(),
       )
    };
 
    let plugins = phoenix_runtime::plugins();
-   let enabled_count = plugins.iter().filter(|p| p.enabled).count();
+   let enabled_count = plugins.iter().filter(|p| p.state.is_on()).count();
    let disabled_count = plugins.len().saturating_sub(enabled_count);
 
    let mut root = b.v_stack(16.0);
@@ -1616,7 +1626,7 @@ pub fn render_sunbird_page(sret: *mut RawAnyElement) -> bool {
       },
       Tab::Catalog => {
          let installed: HashSet<String> = plugins.iter().map(|p| p.name.clone()).collect();
-         root = render_catalog_tab(&b, root, &installed, cat_desktop, cat_partial, cat_mobile);
+         root = render_catalog_tab(&b, root, &installed, &open_groups);
       },
       Tab::General => {
          root = render_general_tab(&b, root);
@@ -1712,8 +1722,8 @@ fn render_plugins_tab(
       .filter(|p| {
          match filter {
             PluginFilter::All => true,
-            PluginFilter::Enabled => p.enabled,
-            PluginFilter::Disabled => !p.enabled,
+            PluginFilter::Enabled => p.state.is_on(),
+            PluginFilter::Disabled => !p.state.is_on(),
          }
       })
       .collect();
@@ -1734,7 +1744,7 @@ fn render_plugins_tab(
       let is_open = expanded.contains(&plugin.name);
       let compat = DesktopCompat::of(&plugin.name);
       let badge = b.compat_badge(compat);
-      let mut card = b.card(10.0, 14.0, 8.0, if plugin.enabled { 0.22 } else { 0.14 });
+      let mut card = b.card(10.0, 14.0, 8.0, if plugin.state.is_on() { 0.22 } else { 0.14 });
 
       let mut title = plugin.header.version.as_ref().map_or_else(
          || plugin.name.clone(),
@@ -1764,7 +1774,13 @@ fn render_plugins_tab(
             DesktopCompat::Unverified => desc_parts.push("Unverified on desktop".to_owned()),
          }
       }
-      if let Some(err) = &plugin.error {
+      if plugin.permissions.is_empty() {
+         desc_parts.push("No permissions".to_owned());
+      } else {
+         let grants = plugin.permissions.iter().map(ToString::to_string);
+         desc_parts.push(format!("Reaches {}", grants.collect::<Vec<_>>().join(", ")));
+      }
+      if let Some(err) = plugin.state.error() {
          desc_parts.push(format!("Error: {err}"));
       }
       let desc = desc_parts.join(" · ");
@@ -1775,12 +1791,12 @@ fn render_plugins_tab(
             &format!("sunbird-plugin-{}", plugin.name),
             &title,
             (!desc.is_empty()).then_some(desc.as_str()),
-            plugin.enabled,
+            plugin.state.is_on(),
             Action::TogglePlugin(plugin.name.clone()),
          ),
       );
 
-      let has_settings = plugin.enabled && !plugin.settings.is_empty();
+      let has_settings = plugin.state.is_on() && !plugin.settings.is_empty();
       let mut buttons = b.h_row(8.0, false);
       if has_settings {
          let lbl = if is_open {
@@ -1809,7 +1825,7 @@ fn render_plugins_tab(
          BtnSize::Small,
          Action::EditPluginCode(plugin.name.clone()),
       );
-      if plugin.enabled && plugin.installed {
+      if plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-reload-{}", plugin.name),
@@ -1819,7 +1835,7 @@ fn render_plugins_tab(
             Action::ReloadPlugin(plugin.name.clone()),
          );
       }
-      if !plugin.enabled && plugin.installed {
+      if !plugin.state.is_on() && plugin.installed {
          buttons = b.push_button(
             buttons,
             &format!("sunbird-remove-{}", plugin.name),
@@ -2000,7 +2016,7 @@ fn render_plugins_tab(
 fn render_catalog_group(
    b: &Builder,
    mut root: RawDiv,
-   group_id: u8,
+   group: CatalogGroup,
    title: &str,
    subtitle: &str,
    items: &[&Listed],
@@ -2019,13 +2035,13 @@ fn render_catalog_group(
    section = b.push_div(
       section,
       b.action_row(
-         &format!("sunbird-cat-group-{group_id}"),
+         &format!("sunbird-cat-group-{}", group as u8),
          title,
          subtitle,
          &btn_lbl,
          BtnVariant::Secondary,
          BtnSize::Small,
-         Action::ToggleCatalogGroup(group_id),
+         Action::ToggleCatalogGroup(group),
       ),
    );
    if open {
@@ -2075,9 +2091,7 @@ fn render_catalog_tab(
    b: &Builder,
    mut root: RawDiv,
    installed: &HashSet<String>,
-   desktop_open: bool,
-   partial_open: bool,
-   mobile_open: bool,
+   open_groups: &HashSet<CatalogGroup>,
 ) -> RawDiv {
    root = b.push_div(
       root,
@@ -2155,32 +2169,32 @@ fn render_catalog_tab(
          root = render_catalog_group(
             b,
             root,
-            0,
+            CatalogGroup::Desktop,
             "Desktop Ready",
             "Confirmed working on Desktop Phoenix.",
             &desktop,
             installed,
-            desktop_open,
+            open_groups.contains(&CatalogGroup::Desktop),
          );
          root = render_catalog_group(
             b,
             root,
-            1,
+            CatalogGroup::Partial,
             "Partial Desktop Support",
             "Core hooks work on desktop; some features are still pending or unconfirmed.",
             &partial,
             installed,
-            partial_open,
+            open_groups.contains(&CatalogGroup::Partial),
          );
          root = render_catalog_group(
             b,
             root,
-            2,
+            CatalogGroup::Other,
             "Mobile Only & Unverified",
             "Targets Android Phoenix's UI tree or has not been confirmed on desktop yet.",
             &other,
             installed,
-            mobile_open,
+            open_groups.contains(&CatalogGroup::Other),
          );
       },
    }

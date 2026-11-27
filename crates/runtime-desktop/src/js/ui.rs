@@ -27,6 +27,8 @@ use phoenix_runtime::{
          Settlement,
          in_background,
       },
+      checked_icon,
+      restart_budget,
    },
    store::{
       self,
@@ -617,7 +619,7 @@ fn add_message_action<'js>(
    options: &Object<'js>,
 ) -> rquickjs::Result<Function<'js>> {
    let label = options.get::<_, String>("label")?;
-   let icon = options.get::<_, Option<String>>("icon")?;
+   let icon = checked_icon(ctx, plugin, options.get::<_, Option<String>>("icon")?)?;
    let danger = options.get::<_, Option<bool>>("danger")?.unwrap_or(false);
    let priority = options.get::<_, Option<i32>>("priority")?.unwrap_or(0);
    let visible = options.get::<_, Option<Function<'js>>>("visible")?;
@@ -1826,6 +1828,7 @@ pub fn intercept_send_body(engine: &Engine, channel_id: &str, body: &[u8]) -> Re
 
       let mut value = original.clone();
       for (plugin, function) in interceptors {
+         restart_budget(&ctx);
          match function
             .call::<_, Value<'_>>((value.clone(), argument.clone()))
             .catch(&ctx)

@@ -1,0 +1,31 @@
+export default {
+   description: "Unlocks Nitro stream quality, client themes and app icons, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones",
+   version: "0.7.0",
+   author: "mantikafasi",
+   permissions: {
+      gateway: [
+         "ready",
+         "readySupplemental",
+         "userUpdate",
+         "guildCreate",
+         "channelCreate",
+         "guildEmojisUpdate",
+         "guildStickersUpdate",
+         "messageCreate",
+         "messageUpdate",
+      ],
+      discord: [
+         "GET /users/@me",
+         "GET /users/@me/settings-proto/1",
+         "PATCH /users/@me/settings-proto/1",
+         "POST /channels/*/messages",
+         "GET /channels/*/messages",
+         "PATCH /channels/*/messages/*",
+         "GET /channels/*/pins",
+         "GET /channels/*/messages/search",
+         "GET /guilds/*/messages/search",
+      ],
+      stores: true,
+      messages: true,
+   },
+} satisfies Phoenix.Manifest;

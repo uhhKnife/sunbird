@@ -1,11 +1,7 @@
-// @description Blocks Discord's analytics and telemetry requests
-// @version 1.0.0
-// @author Lil Poop
-
-// `/science` carries the client's analytics events, `/track` the older ones
-// and `/metrics` its performance counters. None of them do anything for the
-// user, and Phoenix carries on when they fail.
-const TELEMETRY = ["/science", "/track", "/metrics"];
+// `/science` carries the client's analytics events and `/metrics` its
+// performance counters. Neither does anything for the user, and Phoenix
+// carries on when they fail.
+const TELEMETRY = ["/science", "/metrics"];
 
 let blocked = 0;
 for (const pathPrefix of TELEMETRY) {

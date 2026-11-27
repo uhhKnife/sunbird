@@ -54,7 +54,7 @@ const PAGE_TITLE: u32 = 0x56A;
 impl Settings {
    pub fn page_index(&self) -> usize {
       self.screen.as_ref().map_or(0, |screen| {
-         (screen.rust_pages.as_ref().map_or(0, Vec::len) + screen.stack.len()).saturating_sub(1)
+         (screen.rust_pages().map_or(0, <[i32]>::len) + screen.stack.len()).saturating_sub(1)
       })
    }
 
@@ -118,10 +118,10 @@ impl Settings {
       let Some(screen) = &self.screen else {
          return Vec::new();
       };
-      let Some(navigator) = screen.navigator else {
+      let Some(navigator) = screen.navigator_id() else {
          return Vec::new();
       };
-      let mut ids = screen.rust_pages.clone().unwrap_or_default();
+      let mut ids = screen.rust_pages().unwrap_or_default().to_vec();
       ids.extend(screen.stack.iter().map(|page| page.root));
       vec![Op::Children { id: navigator, ids }, Op::Update {
          id:    navigator,
@@ -451,7 +451,7 @@ impl Settings {
       let Some(screen) = &self.screen else {
          return Vec::new();
       };
-      if screen.rust_pages.is_none() {
+      if screen.rust_pages().is_none() {
          log::warn!("settings: no navigator pages known yet");
          return Vec::new();
       }
@@ -547,28 +547,26 @@ impl Settings {
    }
 
    fn replace_entry(&mut self) -> Vec<Op> {
-      let Some((list, search, rows, old)) = self.screen.as_ref().map(|screen| {
-         (
+      let Some((list, mut ids, search, old)) = self.screen.as_ref().and_then(|screen| {
+         let rows = screen.rows.as_ref()?;
+         Some((
             screen.list,
-            screen.search,
-            screen.rust_rows.clone(),
-            screen.entry.as_ref().map(|entry| entry.ids.clone()),
-         )
+            rows.rust.clone(),
+            rows.search,
+            rows.entry.ids.clone(),
+         ))
       }) else {
          return Vec::new();
       };
       let (entry, mut ops) = self.entry_ops();
-      let mut ids = rows.unwrap_or_default();
       let at = usize::from(search.is_some() && ids.first() == search.as_ref());
       ids.insert(at, entry.root);
-      if let Some(screen) = &mut self.screen {
-         screen.entry = Some(entry);
+      if let Some(rows) = self.screen.as_mut().and_then(|screen| screen.rows.as_mut()) {
+         rows.entry = entry;
       }
       ops.push(Op::Children { id: list, ids });
-      if let Some(old) = old {
-         ops.push(Op::Delete { ids: old.clone() });
-         self.forget(&old);
-      }
+      self.forget(&old);
+      ops.push(Op::Delete { ids: old });
       ops
    }
 

@@ -10,7 +10,6 @@ use std::{
 use rquickjs::{
    CatchResultExt,
    Context,
-   Function,
    Runtime,
 };
 
@@ -257,7 +256,7 @@ fn parses(source: &str) -> Result<(), String> {
    let runtime = Runtime::new().map_err(|err| err.to_string())?;
    let context = Context::full(&runtime).map_err(|err| err.to_string())?;
    context.with(|ctx| {
-      ctx.eval::<Function<'_>, _>(crate::js::wrap(source))
+      crate::js::compile(&ctx, source)
          .map(drop)
          .catch(&ctx)
          .map_err(|err| err.to_string())

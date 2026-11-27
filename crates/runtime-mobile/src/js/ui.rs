@@ -10,6 +10,8 @@ use phoenix_runtime::{
          Settlement,
          in_background,
       },
+      checked_icon,
+      image_allowed,
    },
    local,
 };
@@ -84,7 +86,7 @@ pub fn ui_evaluate(
          if target == Target::Tab {
             page_of(&ctx, id, place, value)
          } else {
-            outcome_of(target, value)
+            outcome_of(&ctx, &plugin, target, value)
          }
       };
       let failed = || answer(None);
@@ -107,11 +109,12 @@ pub fn ui_evaluate(
       };
       let settle = |place: Place, plugin: String| {
          let settled = place.clone();
+         let owner = plugin.clone();
          let ok = Function::new(ctx.clone(), move |value: Value<'_>| {
             let outcome = if target == Target::Tab {
                page_of(value.ctx(), id, &settled, Some(&value))
             } else {
-               outcome_of(target, Some(&value))
+               outcome_of(value.ctx(), &owner, target, Some(&value))
             };
             patches::evaluated(id, settled.clone(), outcome);
          });
@@ -120,7 +123,7 @@ pub fn ui_evaluate(
             let outcome = if target == Target::Tab {
                page_of(reason.ctx(), id, &place, None)
             } else {
-               outcome_of(target, None)
+               outcome_of(reason.ctx(), &plugin, target, None)
             };
             patches::evaluated(id, place.clone(), outcome);
          });
@@ -215,7 +218,7 @@ pub fn context_object<'js>(ctx: &Ctx<'js>, context: &UiContext) -> rquickjs::Res
 }
 
 /// A `render` or `visible` result as the patches draw it.
-fn outcome_of(target: Target, value: Option<&Value<'_>>) -> Outcome {
+fn outcome_of(ctx: &Ctx<'_>, plugin: &str, target: Target, value: Option<&Value<'_>>) -> Outcome {
    if target == Target::Action {
       return Outcome::Shown(value.is_some_and(|value| {
          value
@@ -263,6 +266,7 @@ fn outcome_of(target: Target, value: Option<&Value<'_>>) -> Outcome {
                .unwrap_or_default()
                .iter()
                .filter_map(|icon| icon.get::<_, Option<String>>("uri").ok().flatten())
+               .filter(|uri| image_allowed(ctx, plugin, uri))
                .collect(),
          });
       }
@@ -290,11 +294,19 @@ pub fn remover<'js>(
          "update",
          Function::new(
             ctx.clone(),
-            move |arg: rquickjs::function::Opt<Value<'_>>| {
+            move |ctx: Ctx<'_>, arg: rquickjs::function::Opt<Value<'_>>| {
                if matches!(target, Target::Header | Target::Composer)
                   && let Some(object) = arg.0.as_ref().and_then(Value::as_object)
                {
-                  let icon = object.get::<_, Option<String>>("icon").ok().flatten();
+                  let plugin = ctx
+                     .userdata::<Mobile<'_>>()
+                     .and_then(|registry| Some(registry.ui.borrow().get(&id)?.plugin.clone()))
+                     .unwrap_or_default();
+                  let icon = object
+                     .get::<_, Option<String>>("icon")
+                     .ok()
+                     .flatten()
+                     .filter(|uri| image_allowed(&ctx, &plugin, uri));
                   let label = object.get::<_, Option<String>>("label").ok().flatten();
                   let tint = match object.get::<_, Value<'_>>("tint") {
                      Ok(value) if value.is_null() => TintChange::Clear,
@@ -333,7 +345,8 @@ pub fn remover<'js>(
 }
 
 /// `phoenix.ui`, the UI patch targets.
-pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
+/// `phoenix.ui`, with the raw view tree only when `tree` grants it.
+pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str, tree: bool) -> rquickjs::Result<Object<'js>> {
    let ui = Object::new(ctx.clone())?;
    for (method, target) in [
       ("addHeaderButton", Target::Header),
@@ -353,11 +366,13 @@ pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'
          })?,
       )?;
    }
-   add_sheets(ctx, &ui)?;
+   add_sheets(ctx, plugin, &ui)?;
    add_page(ctx, plugin, &ui)?;
-   add_view_hooks(ctx, plugin, &ui)?;
-   add_view_queries(ctx, &ui)?;
-   add_mount(ctx, plugin, &ui)?;
+   add_view_hooks(ctx, plugin, &ui, tree)?;
+   if tree {
+      add_view_queries(ctx, &ui)?;
+      add_mount(ctx, plugin, &ui)?;
+   }
    add_notify(ctx, plugin, &ui)?;
    let owner = plugin.to_owned();
    ui.set(
@@ -386,13 +401,14 @@ pub fn ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'
    Ok(ui)
 }
 
-fn add_sheets<'js>(ctx: &Ctx<'js>, ui: &Object<'js>) -> rquickjs::Result<()> {
+fn add_sheets<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::Result<()> {
+   let owner = plugin.to_owned();
    ui.set(
       "choose",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
          let title = options.get::<_, Option<String>>("title")?;
          let message = options.get::<_, Option<String>>("message")?;
-         let items = parse_menu_items(&options)?;
+         let items = parse_menu_items(&ctx, &owner, &options)?;
          if message.is_none() && items.is_empty() {
             return Err(Exception::throw_type(
                &ctx,
@@ -411,9 +427,10 @@ fn add_sheets<'js>(ctx: &Ctx<'js>, ui: &Object<'js>) -> rquickjs::Result<()> {
          })
       })?,
    )?;
+   let owner = plugin.to_owned();
    ui.set(
       "showSheet",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
          let title = options.get::<_, Option<String>>("title")?;
          let text = options.get::<_, String>("text")?;
          let monospace = options
@@ -422,7 +439,7 @@ fn add_sheets<'js>(ctx: &Ctx<'js>, ui: &Object<'js>) -> rquickjs::Result<()> {
          let highlight = options
             .get::<_, Option<bool>>("highlight")?
             .unwrap_or_default();
-         let items = parse_menu_items(&options)?;
+         let items = parse_menu_items(&ctx, &owner, &options)?;
          in_background(&ctx, move || {
             let body = patches::menu::SheetBody {
                text,
@@ -450,7 +467,7 @@ fn add_notify<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::
             .filter(|text| !text.is_empty())
             .ok_or_else(|| Exception::throw_type(&ctx, "notify({ title }) requires a title"))?;
          let body = options.get::<_, Option<String>>("body")?;
-         let icon = options.get::<_, Option<String>>("icon")?;
+         let icon = checked_icon(&ctx, &owner, options.get::<_, Option<String>>("icon")?)?;
          let accent = options.get::<_, Option<f64>>("accent")?.map(to_argb);
          let duration_ms = options
             .get::<_, Option<f64>>("durationMs")?
@@ -475,7 +492,11 @@ fn add_notify<'js>(ctx: &Ctx<'js>, plugin: &str, ui: &Object<'js>) -> rquickjs::
    Ok(())
 }
 
-fn parse_menu_items<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<patches::menu::MenuItem>> {
+fn parse_menu_items<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Vec<patches::menu::MenuItem>> {
    Ok(options
       .get::<_, Option<Vec<Value<'js>>>>("options")?
       .unwrap_or_default()
@@ -491,7 +512,11 @@ fn parse_menu_items<'js>(options: &Object<'js>) -> rquickjs::Result<Vec<patches:
          let option = option.as_object()?;
          Some(patches::menu::MenuItem {
             label:  option.get::<_, Option<String>>("label").ok().flatten()?,
-            icon:   option.get::<_, Option<String>>("icon").ok().flatten(),
+            icon:   option
+               .get::<_, Option<String>>("icon")
+               .ok()
+               .flatten()
+               .filter(|uri| image_allowed(ctx, plugin, uri)),
             danger: option
                .get::<_, Option<bool>>("danger")
                .ok()
@@ -559,7 +584,7 @@ fn add_contribution<'js>(
       plugin: plugin.to_owned(),
       target,
       label: label.unwrap_or_default(),
-      icon: options.get("icon")?,
+      icon: checked_icon(ctx, plugin, options.get("icon")?)?,
       tint: options.get::<_, Option<f64>>("tint")?.map(to_argb),
       danger: options
          .get::<_, Option<bool>>("danger")?

@@ -10,6 +10,7 @@
 use std::{
    collections::HashMap,
    sync::{
+      Arc,
       LazyLock,
       Mutex,
       PoisonError,
@@ -25,7 +26,10 @@ use std::{
    },
 };
 
-use crate::fetch::Response;
+use crate::{
+   fetch::Response,
+   permissions::Permissions,
+};
 
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 pub const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -95,9 +99,16 @@ impl RequestFilter {
 }
 
 struct RequestHook {
-   pub id:     u64,
-   pub plugin: String,
-   pub filter: RequestFilter,
+   id:          u64,
+   plugin:      String,
+   filter:      RequestFilter,
+   permissions: Arc<Permissions>,
+}
+
+impl RequestHook {
+   fn matches(&self, method: &str, path: &str) -> bool {
+      self.filter.matches(method, path) && self.permissions.discord(method, path)
+   }
 }
 
 static REQUEST_HOOKS: LazyLock<Mutex<Vec<RequestHook>>> = LazyLock::new(Mutex::default);
@@ -304,9 +315,19 @@ pub struct Authorization {
    pub response_type: String,
 }
 
-pub fn add_request_hook(id: u64, plugin: String, filter: RequestFilter) {
+pub fn add_request_hook(
+   id: u64,
+   plugin: String,
+   filter: RequestFilter,
+   permissions: Arc<Permissions>,
+) {
    let mut hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
-   hooks.push(RequestHook { id, plugin, filter });
+   hooks.push(RequestHook {
+      id,
+      plugin,
+      filter,
+      permissions,
+   });
    REQUEST_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
 }
 
@@ -322,11 +343,21 @@ pub fn forget_request_hooks(plugin: &str) {
    REQUEST_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
 }
 
-pub fn add_response_hook(id: u64, plugin: String, filter: RequestFilter) {
+pub fn add_response_hook(
+   id: u64,
+   plugin: String,
+   filter: RequestFilter,
+   permissions: Arc<Permissions>,
+) {
    let mut hooks = RESPONSE_HOOKS
       .lock()
       .unwrap_or_else(PoisonError::into_inner);
-   hooks.push(RequestHook { id, plugin, filter });
+   hooks.push(RequestHook {
+      id,
+      plugin,
+      filter,
+      permissions,
+   });
    RESPONSE_HOOK_COUNT.store(hooks.len(), Ordering::Relaxed);
 }
 
@@ -355,7 +386,7 @@ pub fn matching_request_hooks(method: &str, path: &str) -> Vec<u64> {
    let hooks = REQUEST_HOOKS.lock().unwrap_or_else(PoisonError::into_inner);
    hooks
       .iter()
-      .filter(|hook| hook.filter.matches(method, path))
+      .filter(|hook| hook.matches(method, path))
       .map(|hook| hook.id)
       .collect()
 }
@@ -371,7 +402,7 @@ pub fn matching_response_hooks(method: &str, path: &str) -> Vec<u64> {
       .unwrap_or_else(PoisonError::into_inner);
    hooks
       .iter()
-      .filter(|hook| hook.filter.matches(method, path))
+      .filter(|hook| hook.matches(method, path))
       .map(|hook| hook.id)
       .collect()
 }

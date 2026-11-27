@@ -917,7 +917,8 @@ declare namespace Phoenix {
     /// Intercepts outgoing gateway frames for numeric opcode `op` (desktop only).
     /// Receives the frame's `d` payload; return a replacement payload, `false` to
     /// drop the frame, or nothing to pass the (possibly mutated) payload on.
-    /// Identify (2) and Resume (6) carry credentials and cannot be hooked.
+    /// Identify (2) and Resume (6) carry credentials and cannot be hooked. Other opcodes need a
+    /// `// @gateway-send` line, like `// @gateway-send 4`.
     onSend<Op extends keyof GatewaySendPayloads>(
       op: Op,
       handler: (payload: GatewaySendPayloads[Op]) => GatewaySendPayloads[Op] | false | void
@@ -1009,6 +1010,8 @@ declare namespace Phoenix {
   }
 
   interface Api {
+    /// Holds the hook points named on the plugin's `// @gateway` lines, like
+    /// `// @gateway messageCreate messageUpdate`.
     readonly gateway: Gateway;
     /// Observes a hook point after the client handled it.
     on<P>(sig: Sig<P>, listener: (payload: P) => void): void;
@@ -1019,26 +1022,35 @@ declare namespace Phoenix {
     /// Like `dispatch`, for use outside a gateway hook. The payload reaches the client's handler
     /// just before the next gateway event it handles, usually well under a second later.
     enqueue<P>(sig: Sig<P>, payload: Partial<P>): void;
+    /// Present with a `// @messages` line.
     readonly messages: Messages;
     readonly stream: Stream;
     readonly appearance: Appearance;
+    /// The raw view tree methods are present with `permissions.uiTree`. Icon URLs must point at a
+    /// `fetch` host or Discord's CDN.
     readonly ui: Ui;
     readonly commands: Commands;
     readonly log: Log;
     readonly storage: Storage;
     readonly settings: Settings;
     /// Read-only SQL over Phoenix's own cache (`files/store/<account>/cache.sqlite`), at most
-    /// 10000 rows. Arguments bind to `?` as text.
+    /// 10000 rows. Arguments bind to `?` as text. Present with a `// @stores` line.
     readonly stores: Stores;
     /// Runs when the plugin is turned off, reloaded or removed. Hooks and settings go away on their
     /// own, anything else the plugin started is its to undo here.
     onUnload(cleanup: () => void): void;
+    /// Reaches the hosts on the plugin's `// @fetch` lines, like `// @fetch api.example.com
+    /// *.example.org`, and throws for any other.
     fetch(url: string, init?: FetchInit): Promise<FetchResponse>;
     /// Discord's API through the app's own HTTP client, with the app's session headers. Paths are
     /// relative to the API base, like `/users/@me`. Rejects until the app has made a request of its
-    /// own.
+    /// own. Requests, `me`, `authorize` and interceptors reach only the routes on the plugin's
+    /// `// @discord` lines, one a line, like `// @discord GET /channels/*/messages`. `*` is one
+    /// path segment, a final `**` the rest, and `*` as the method any method. `me` is
+    /// `GET /users/@me`, `authorize` is `POST /oauth2/authorize`.
     readonly discord: Discord;
-    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
+    /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`). Present with a
+    /// `// @bridge` line.
     readonly bridge: Bridge;
     /// `.theme.css` themes on Desktop Phoenix.
     readonly themes?: Themes;
@@ -1067,6 +1079,46 @@ declare namespace Phoenix {
     setCss(css: string): boolean;
     clear(): void;
     openThemesDir(): void;
+  }
+
+  /// What `plugins/<name>/manifest.ts` exports as default. `web/tools/bundle-plugins.ts` writes it
+  /// as the `// @` lines that open the bundle, which the runtime and the site read without running
+  /// the plugin. A plugin installed from elsewhere can carry those lines by hand.
+  interface Manifest {
+    description: string;
+    version: string;
+    author: string;
+    /// Stays off until the user turns it on.
+    enabled?: false;
+    /// Shown on the site before the user installs it.
+    warning?: string;
+    /// Ships only in dev builds, never on the site or in its updates.
+    unlisted?: true;
+    /// The oldest Sunbird the plugin runs on, in the loader's dotted form like
+    /// `2026.11.27`. Updates needing a newer loader wait, and such a copy fails
+    /// to load, until Phoenix Unlock updates.
+    minSunbird?: string;
+    permissions?: Permissions;
+  }
+
+  /// What the plugin's `phoenix` object reaches. Anything left out is missing or refused.
+  interface Permissions {
+    /// Hook points for `on`, `hook`, `dispatch` and `enqueue`.
+    gateway?: (keyof GatewayPayloads | (string & {}))[];
+    /// Outgoing opcodes for `phoenix.gateway.onSend`.
+    gatewaySend?: number[];
+    /// Routes for `phoenix.discord` requests and interceptors. `*` is one path segment, a final
+    /// `**` the rest, and `*` as the method any method.
+    discord?: `${"GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "*"} /${string}`[];
+    /// Hosts for `phoenix.fetch`, like `api.example.com` or `*.example.org`. Icon and image URLs
+    /// the plugin draws must point at one of these or at Discord's CDN.
+    fetch?: string[];
+    stores?: true;
+    messages?: true;
+    bridge?: true;
+    /// `phoenix.ui`'s raw view tree (`onEvent`, `dispatch`, `onNode`, `patchProps`, `update`,
+    /// `find`, `findDown`, `node`, `root`, `mount`), which holds whatever the screen shows.
+    uiTree?: true;
   }
 
   interface Bridge {

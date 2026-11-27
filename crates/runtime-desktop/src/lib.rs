@@ -74,6 +74,7 @@ use phoenix_runtime::{
       Request,
       Response,
    },
+   permissions::Permissions,
    remote::{
       self,
       Done,
@@ -87,6 +88,10 @@ use phoenix_sigs::{
    desktop::{
       Prologue,
       Prologues,
+   },
+   index::{
+      Index,
+      Isa,
    },
    registry::GatewayRegistry,
 };
@@ -205,18 +210,18 @@ static PREPARED: Mutex<Option<(Image<'static>, &'static GatewayRegistry)>> = Mut
 pub fn prepare() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
-   open_access_gate(&image);
-   open_notification_gate(&image);
-   settings::install(&image);
+   let ix = Index::new(&image, Isa::HOST);
+   open_access_gate(&image, &ix);
+   settings::install(&image, &ix);
    #[cfg(windows)]
    restart::install(&image);
-   staff::prepare(&image);
+   staff::prepare(&ix);
    modal::install(&image);
    context_menu::install(&image);
    // Before accessories hooks `MessageRow::render`, whose prologue the header
    // locators check.
-   let header = X86_CODE.then(|| headers::locate(&image));
-   accessories::install(&image);
+   let header = X86_CODE.then(|| headers::locate(&image, &ix));
+   accessories::install(&image, &ix);
    members::install(&image);
    if let Some(header) = header {
       headers::install(&image, header);
@@ -231,8 +236,8 @@ pub fn prepare() -> Result<(), Error> {
    composer::install(&image);
    sidebar::install(&image);
    toolbar::install(&image);
-   badges::install(&image);
-   emoji::install(&image);
+   badges::install(&image, &ix);
+   emoji::install(&image, &ix);
    sticker::install(&image);
    stream::install(&image);
    #[cfg(windows)]
@@ -244,12 +249,13 @@ pub fn prepare() -> Result<(), Error> {
       route_direct_calls(&image);
       discord::install(&image);
       gateway_send::install(&image);
-      accessories::install_optimistic_delete(&image);
+      accessories::install_optimistic_delete(&image, &ix);
       ready::install(&image);
    }
    #[cfg(target_os = "macos")]
    message::writer::install(&image);
    // The indexes are tens of MB and nothing reads them after startup.
+   drop(ix);
    phoenix_sigs::desktop::release_call_index();
    phoenix_hook::arm64::release_ref_index();
    *PREPARED.lock().unwrap_or_else(PoisonError::into_inner) = Some((image, registry?));
@@ -260,7 +266,7 @@ pub fn prepare() -> Result<(), Error> {
 pub fn open_gate_only() -> Result<(), Error> {
    phoenix_runtime::set_platform(&Desktop);
    let image = phoenix_runtime::target()?;
-   open_access_gate(&image);
+   open_access_gate(&image, &Index::new(&image, Isa::HOST));
    #[cfg(windows)]
    restart::install(&image);
    Ok(())
@@ -291,18 +297,18 @@ pub fn start(home: PathBuf, bundled: Vec<Plugin>) -> Result<Started, Error> {
 /// its small caller is `signed_in && access(..) != 2`. This makes it return 2.
 /// Discord settles on the gate within its first frames, so the loader calls
 /// this from `DllMain` or the constructor, before Discord's own code.
-fn open_access_gate(image: &Image<'static>) {
+fn open_access_gate(image: &Image<'static>, ix: &Index<'_>) {
    /// `mov al, 2; ret`
    const ALLOWED: [u8; 3] = [0xB0, 0x02, 0xC3];
 
-   let found = if X86_CODE {
-      phoenix_sigs::desktop::access_gate(image).map(|access| (access, &ALLOWED[..]))
+   let allowed = if X86_CODE {
+      &ALLOWED[..]
    } else {
       close_enforced(image);
       keep_pages_over_frame(image);
-      phoenix_sigs::macos::access_gate(image)
-         .map(|access| (access, &phoenix_sigs::macos::NO_GATE[..]))
+      &phoenix_sigs::macos::NO_GATE[..]
    };
+   let found = phoenix_sigs::locate::access_gate(ix).map(|access| (access.start, allowed));
    let (access, allowed) = match found {
       Ok(found) => found,
       Err(err) => {
@@ -316,32 +322,8 @@ fn open_access_gate(image: &Image<'static>) {
       Ok(()) => log::info!("access gate: open"),
       Err(err) => log::error!("access gate: {err}"),
    }
-}
-
-/// Desktop Phoenix's `surfaces` notification provider claims every message
-/// alert and returns it empty for a client it reads as gated, so the real alert
-/// is never built and nothing reaches the OS; [`open_access_gate`]'s patch does
-/// not reach this, since it reads the gate state from the store directly. This
-/// forces its predicate to answer 0 ("not mine"), so the provider declines and
-/// the planner's fallback builds the real alert, as it does on the official
-/// app. `xor eax, eax; nop` replaces the `movzx eax, cl` that would otherwise
-/// carry the "mine" answer into the function's return.
-fn open_notification_gate(image: &Image<'static>) {
-   /// `xor eax, eax; nop` in place of `movzx eax, cl`.
-   const DECLINE: [u8; 3] = [0x31, 0xC0, 0x90];
-
-   let gate = match phoenix_sigs::desktop::notification_gate(image) {
-      Ok(gate) => gate,
-      Err(err) => {
-         log::warn!("notification gate: {err}, leaving it");
-         return;
-      },
-   };
-   // SAFETY: Discord's own code, written from `DllMain` or the constructor
-   // before it runs.
-   match unsafe { image.write_code(gate, &DECLINE) } {
-      Ok(()) => log::info!("notification gate: open"),
-      Err(err) => log::error!("notification gate: {err}"),
+   if X86_CODE {
+      open_notification_gate(image);
    }
 }
 
@@ -404,6 +386,29 @@ fn route_direct_calls(image: &Image<'static>) {
    );
 }
 
+/// Makes the `surfaces` notification provider decline message alerts, which it
+/// claims and returns empty on a gated client, so the planner's fallback builds
+/// the real one. The x86 counterpart of macOS's [`close_enforced`].
+fn open_notification_gate(image: &Image<'static>) {
+   let decline: &[u8] = match phoenix_hook::x86::Abi::of(image) {
+      phoenix_hook::x86::Abi::SysV => &[0x31, 0xC0, 0xC3],
+      phoenix_hook::x86::Abi::Win64 => &[0x31, 0xC0, 0x90],
+   };
+   let gate = match phoenix_sigs::desktop::notification_gate(image) {
+      Ok(gate) => gate,
+      Err(err) => {
+         log::warn!("notification gate: {err}, leaving it");
+         return;
+      },
+   };
+   // SAFETY: Discord's own code, written from `DllMain` or the constructor
+   // before it runs.
+   match unsafe { image.write_code(gate, decline) } {
+      Ok(()) => log::info!("notification gate: open"),
+      Err(err) => log::error!("notification gate: {err}"),
+   }
+}
+
 impl Platform for Desktop {
    fn send(&self, request: &Request) -> Result<Response, FetchError> {
       fetch::send(request)
@@ -437,6 +442,7 @@ impl Platform for Desktop {
       &self,
       ctx: &Ctx<'js>,
       plugin: &str,
+      _permissions: &Permissions,
       api: &Object<'js>,
       messages: &Object<'js>,
    ) -> rquickjs::Result<()> {
@@ -526,8 +532,18 @@ impl Platform for Desktop {
    }
 
    #[cfg(target_os = "macos")]
-   fn update_loader(&self, version: &str, update: &phoenix_runtime::update::Update) {
-      update_macos_loader(version, update);
+   fn update_loader(
+      &self,
+      slot: phoenix_runtime::update::Slot,
+      version: &str,
+      update: &phoenix_runtime::update::Update,
+   ) {
+      let msg = update_macos_loader(&slot, version, update).unwrap_or_else(|msg| {
+         log::error!("loader update: {msg}");
+         format!("Loader update failed: {msg}")
+      });
+      slot.finish(Some(msg.clone()));
+      phoenix_ui_desktop::toast(&msg);
    }
 
    fn route(&self, request: &remote::Request) -> Option<remote::Reply> {
@@ -638,49 +654,30 @@ fn macos_loader_path() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) {
+fn update_macos_loader(
+   slot: &phoenix_runtime::update::Slot,
+   version: &str,
+   update: &phoenix_runtime::update::Update,
+) -> Result<String, String> {
    use phoenix_runtime::update;
 
    const ASSET: &str = "libphoenix-macos-arm64.dylib";
 
-   let finish_err = |msg: String| {
-      log::error!("loader update: {msg}");
-      update::finish(Some(format!("Loader update failed: {msg}")));
-      phoenix_ui_desktop::toast(&format!("Loader update failed: {msg}"));
-   };
+   let dest = macos_loader_path().ok_or("could not locate loaded libphoenix.dylib")?;
+   let dir = dest
+      .parent()
+      .ok_or("loaded dylib has no parent directory")?;
 
-   let Some(dest) = macos_loader_path() else {
-      finish_err("could not locate loaded libphoenix.dylib".to_owned());
-      return;
-   };
-   let Some(dir) = dest.parent() else {
-      finish_err("loaded dylib has no parent directory".to_owned());
-      return;
-   };
-
-   update::set_status(Some(format!("Downloading Sunbird {version}...")));
+   slot.step(format!("Downloading Sunbird {version}..."));
    let url = format!("{}plugins/{ASSET}", update::ASSETS);
-   let bytes = match phoenix_runtime::fetch::get(&url) {
-      Ok(bytes) => bytes,
-      Err(err) => {
-         finish_err(err.to_string());
-         return;
-      },
-   };
+   let bytes = phoenix_runtime::fetch::get(&url).map_err(|err| err.to_string())?;
    if !bytes.starts_with(&[0xCF, 0xFA, 0xED, 0xFE]) {
-      finish_err("downloaded dylib is not a 64-bit Mach-O binary".to_owned());
-      return;
+      return Err("downloaded dylib is not a 64-bit Mach-O binary".to_owned());
    }
-   if let Err(err) = update::verify_loader(ASSET, version, &bytes, update) {
-      finish_err(err);
-      return;
-   }
+   update::verify_loader(ASSET, version, &bytes, update)?;
 
    let tmp = dir.join(format!("libphoenix.dylib.next.{}", std::process::id()));
-   if let Err(err) = std::fs::write(&tmp, &bytes) {
-      finish_err(format!("write temp dylib: {err}"));
-      return;
-   }
+   std::fs::write(&tmp, &bytes).map_err(|err| format!("write temp dylib: {err}"))?;
    let signed = std::process::Command::new("/usr/bin/codesign")
       .args(["--force", "--sign", "-"])
       .arg(&tmp)
@@ -688,18 +685,16 @@ fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) 
       .is_ok_and(|s| s.success());
    if !signed {
       let _ = std::fs::remove_file(&tmp);
-      finish_err("codesign failed".to_owned());
-      return;
+      return Err("codesign failed".to_owned());
    }
    if let Err(err) = std::fs::rename(&tmp, &dest) {
       let _ = std::fs::remove_file(&tmp);
-      finish_err(format!("swap dylib: {err}"));
-      return;
+      return Err(format!("swap dylib: {err}"));
    }
    let _ = std::fs::write(dir.join("version"), format!("{version}\n"));
 
    let failed_plugins = update::stage_plugins(version, update);
-   let msg = if failed_plugins.is_empty() {
+   Ok(if failed_plugins.is_empty() {
       format!("Updated to Sunbird {version}. Restart Sunbird to apply.")
    } else {
       format!(
@@ -708,7 +703,5 @@ fn update_macos_loader(version: &str, update: &phoenix_runtime::update::Update) 
          failed_plugins.len(),
          failed_plugins.join("; ")
       )
-   };
-   update::finish(Some(msg.clone()));
-   phoenix_ui_desktop::toast(&msg);
+   })
 }

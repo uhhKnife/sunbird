@@ -1,7 +1,3 @@
-// @description Searches the web for an image in a message, from the message menu
-// @version 1.1.0
-// @author Lil Poop
-
 const ENGINES = [
   { label: "Google Lens", url: "https://lens.google.com/uploadbyurl?url=" },
   { label: "Yandex", url: "https://yandex.com/images/search?rpt=imageview&url=" },

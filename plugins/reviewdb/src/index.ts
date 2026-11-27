@@ -1,7 +1,3 @@
-// @description Adds a ReviewDB tab to user profiles
-// @version 0.2.1
-// @author mantikafasi
-
 const API = "https://manti.vendicated.dev/api/reviewdb";
 const CLIENT_ID = "915703782174752809";
 // ReviewDB accepts only the client mods it knows.

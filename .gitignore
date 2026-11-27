@@ -52,6 +52,7 @@
 
 !plugins/
 !plugins/*/
+!plugins/*/manifest.ts
 !plugins/*/src/
 !plugins/*/src/**/
 !plugins/*/src/**/*.ts

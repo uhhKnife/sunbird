@@ -1,7 +1,3 @@
-// @description Adds a toggle to automatically spoiler everything you send
-// @version 1.2.1
-// @author cmdr-chara
-
 const KEY = "enabled";
 const LIMIT = 2000;
 const ICON = "res://ic_mana_image_spoiler";

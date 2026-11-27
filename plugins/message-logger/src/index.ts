@@ -1,7 +1,3 @@
-// @description Keeps deleted messages and edit history
-// @version 0.3.0
-// @author amaanq
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

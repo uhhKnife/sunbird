@@ -115,7 +115,7 @@ fn press(pressed: Press) {
       },
       Press::Toggle(index) => {
          if let Some(plugin) = plugin(index) {
-            phoenix_runtime::set_enabled(&plugin.name, !plugin.enabled);
+            phoenix_runtime::set_enabled(&plugin.name, !plugin.state.is_on());
          }
       },
       Press::Reload(index) => {
@@ -203,7 +203,9 @@ fn listed(index: usize) {
             &plugin.name,
          );
       },
-      Some(info) if !info.installed => phoenix_runtime::set_enabled(&info.name, !info.enabled),
+      Some(info) if !info.installed => {
+         phoenix_runtime::set_enabled(&info.name, !info.state.is_on());
+      },
       Some(info) => {
          settings().install_status = Some(match phoenix_runtime::uninstall(&info.name) {
             Ok(outcome) => {

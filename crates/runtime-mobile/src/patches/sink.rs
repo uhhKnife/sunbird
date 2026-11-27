@@ -12,6 +12,7 @@ use std::{
 };
 
 use memchr::memmem;
+use phoenix_runtime::permissions::badge_target;
 use phoenix_ui_mobile::{
    Op,
    Prop,
@@ -115,7 +116,7 @@ fn unwrap_badge_uris(ops: &mut [Op]) -> bool {
          };
          let hex = &uri[pos + MARKER.len()..];
          let hex = hex.split(['.', '?', '#']).next().unwrap_or(hex);
-         if let Some(decoded) = decode_hex_url(hex) {
+         if let Some(decoded) = badge_target(hex) {
             *uri = decoded;
             unwrapped = true;
          }
@@ -141,20 +142,6 @@ fn unwrap_badge_uris(ops: &mut [Op]) -> bool {
       }
    }
    changed
-}
-
-fn decode_hex_url(hex: &str) -> Option<String> {
-   if hex.is_empty() || !hex.len().is_multiple_of(2) {
-      return None;
-   }
-   let mut bytes = Vec::with_capacity(hex.len() / 2);
-   for pair in hex.as_bytes().as_chunks::<2>().0 {
-      let hi = (pair[0] as char).to_digit(16)?;
-      let lo = (pair[1] as char).to_digit(16)?;
-      bytes.push(u8::try_from((hi << 4) | lo).ok()?);
-   }
-   let url = String::from_utf8(bytes).ok()?;
-   url.starts_with("https://").then_some(url)
 }
 
 /// Feeds a batch to the mirror while no patch is active, so one turned on

@@ -9,5 +9,5 @@
     "types": [],
     "moduleDetection": "force"
   },
-  "include": ["*/src", "../crates/runtime/phoenix.d.ts"]
+  "include": ["*/src", "*/manifest.ts", "../crates/runtime/phoenix.d.ts"]
 }

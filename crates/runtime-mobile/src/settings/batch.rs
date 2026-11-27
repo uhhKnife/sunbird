@@ -29,7 +29,9 @@ use crate::{
       Entry,
       ICON_PLUGIN,
       Job,
+      Navigator,
       Press,
+      Rows,
       Screen,
       Settings,
       TITLE,
@@ -97,7 +99,7 @@ pub fn filter_dispatch(frame: &[u8]) -> Action {
          };
          let job = if *event == Prop::NAVIGATE.key()
             && !screen.stack.is_empty()
-            && Some(*node) == screen.navigator
+            && Some(*node) == screen.navigator_id()
          {
             let index = payload
                .field(Prop::INDEX.key())
@@ -202,16 +204,17 @@ impl Settings {
       let mut rest = ops.into_iter();
       while let Some(op) = rest.next() {
          let screen = self.screen.as_ref().expect("checked above");
-         let (list, navigator) = (screen.list, screen.navigator);
+         let (list, navigator) = (screen.list, screen.navigator_id());
          match op {
             Op::Children { id, ids } if id == list => {
                let search = ids.first().copied().filter(|first| stacks.contains(first));
                self.list_changed(ids, search, &mut out);
                changed = true;
             },
-            Op::ChildEdits { id, edits } if id == list && screen.rust_rows.is_some() => {
-               let ids = apply_edits(screen.rust_rows.as_deref().unwrap_or_default(), &edits);
-               let search = screen.search;
+            Op::ChildEdits { id, edits } if id == list && screen.rows.is_some() => {
+               let rows = screen.rows.as_ref().expect("checked by the guard");
+               let ids = apply_edits(&rows.rust, &edits);
+               let search = rows.search;
                self.list_changed(ids, search, &mut out);
                changed = true;
             },
@@ -223,9 +226,9 @@ impl Settings {
                changed |= self.navigator_changed(original, ids, &mut out);
             },
             Op::ChildEdits { id, edits }
-               if Some(id) == navigator && screen.rust_pages.is_some() =>
+               if Some(id) == navigator && screen.rust_pages().is_some() =>
             {
-               let ids = apply_edits(screen.rust_pages.as_deref().unwrap_or_default(), &edits);
+               let ids = apply_edits(screen.rust_pages().unwrap_or_default(), &edits);
                changed |= self.navigator_changed(Op::ChildEdits { id, edits }, ids, &mut out);
             },
             Op::Delete { mut ids }
@@ -236,9 +239,9 @@ impl Settings {
                // here.
                let screen = self.screen.take().expect("checked above");
                let ours = screen
-                  .entry
+                  .rows
                   .into_iter()
-                  .flat_map(|entry| entry.ids)
+                  .flat_map(|rows| rows.entry.ids)
                   .chain(screen.stack.into_iter().flat_map(|page| page.ids))
                   .collect::<Vec<i32>>();
                self.forget(&ours);
@@ -308,41 +311,43 @@ impl Settings {
             .map(|(_, props)| (*props).clone());
          self.screen = Some(Screen {
             list,
-            rust_rows: None,
-            search: None,
-            navigator,
-            rust_pages: None,
+            rows: None,
+            navigator: navigator.map(|id| {
+               Navigator {
+                  id,
+                  rust_pages: None,
+               }
+            }),
             header,
-            entry: None,
             stack: Vec::new(),
          });
       }
    }
 
    fn list_changed(&mut self, ids: Vec<i32>, search: Option<i32>, out: &mut Vec<Op>) {
-      if self
-         .screen
-         .as_ref()
-         .is_some_and(|screen| screen.entry.is_none())
-      {
+      let Some(known) = self.screen.as_mut().map(|screen| screen.rows.take()) else {
+         return;
+      };
+      let mut rows = known.unwrap_or_else(|| {
          let (entry, ops) = self.entry_ops();
          out.extend(ops);
-         if let Some(screen) = &mut self.screen {
-            screen.entry = Some(entry);
+         Rows {
+            rust: Vec::new(),
+            search: None,
+            entry,
          }
+      });
+      if rows.search.is_none() {
+         rows.search = search;
       }
+      let at = usize::from(rows.search.is_some() && ids.first() == rows.search.as_ref());
+      let mut with_entry = ids.clone();
+      with_entry.insert(at, rows.entry.root);
+      rows.rust = ids;
       let Some(screen) = &mut self.screen else {
          return;
       };
-      if screen.search.is_none() {
-         screen.search = search;
-      }
-      let at = usize::from(screen.search.is_some() && ids.first() == screen.search.as_ref());
-      let mut with_entry = ids.clone();
-      if let Some(entry) = &screen.entry {
-         with_entry.insert(at, entry.root);
-      }
-      screen.rust_rows = Some(ids);
+      screen.rows = Some(rows);
       out.push(Op::Children {
          id:  screen.list,
          ids: with_entry,
@@ -356,16 +361,20 @@ impl Settings {
          out.push(original);
          return false;
       };
-      let (Some(navigator), false) = (screen.navigator, screen.stack.is_empty()) else {
-         screen.rust_pages = Some(ids);
+      let Some(navigator) = &mut screen.navigator else {
          out.push(original);
          return false;
       };
+      if screen.stack.is_empty() {
+         navigator.rust_pages = Some(ids);
+         out.push(original);
+         return false;
+      }
       let mut all = ids.clone();
       all.extend(screen.stack.iter().map(|page| page.root));
-      screen.rust_pages = Some(ids);
+      navigator.rust_pages = Some(ids);
       out.push(Op::Children {
-         id:  navigator,
+         id:  navigator.id,
          ids: all,
       });
       true

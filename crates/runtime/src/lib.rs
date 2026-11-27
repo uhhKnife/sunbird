@@ -40,6 +40,7 @@ pub mod highlight;
 pub mod installer;
 pub mod js;
 pub mod local;
+pub mod permissions;
 mod platform;
 pub mod remote;
 pub mod store;
@@ -137,15 +138,44 @@ pub struct Plugin {
    pub source: String,
 }
 
+#[derive(Clone, Debug)]
+pub enum PluginState {
+   Off,
+   On,
+   /// On, and its last load threw.
+   Failed(String),
+}
+
+impl PluginState {
+   const fn from_switch(on: bool) -> Self {
+      if on { Self::On } else { Self::Off }
+   }
+
+   #[must_use]
+   pub const fn is_on(&self) -> bool {
+      !matches!(self, Self::Off)
+   }
+
+   #[must_use]
+   pub fn error(&self) -> Option<&str> {
+      match self {
+         Self::Failed(error) => Some(error),
+         Self::Off | Self::On => None,
+      }
+   }
+}
+
 /// A plugin as the settings page shows it.
 #[derive(Clone, Debug)]
 pub struct PluginInfo {
-   pub name:      String,
-   pub enabled:   bool,
-   pub error:     Option<String>,
-   pub installed: bool,
-   pub header:    Header,
-   pub settings:  Vec<Setting>,
+   pub name:        String,
+   pub state:       PluginState,
+   pub installed:   bool,
+   pub header:      Header,
+   pub settings:    Vec<Setting>,
+   /// Empty when the plugin declares nothing or its lines do not parse, which
+   /// its failed `state` then says.
+   pub permissions: Vec<permissions::Grant>,
 }
 
 /// The `// @key value` lines a bundle starts with.
@@ -157,37 +187,40 @@ pub struct Header {
    /// `// @enabled false`, for plugins that stay off until the user turns
    /// them on.
    pub default_off: bool,
+   /// `// @min-sunbird <version>`, the oldest loader the plugin runs on,
+   /// compared to [`update::VERSION`] as a string.
+   pub min_sunbird: Option<String>,
 }
 
 impl From<&str> for Header {
    fn from(source: &str) -> Self {
       let mut header = Self::default();
-      for line in source
-         .lines()
-         .map(str::trim)
-         .filter(|line| !line.is_empty())
-      {
-         let Some(comment) = line.strip_prefix("//") else {
-            break;
-         };
-         let Some((key, value)) = comment
-            .trim()
-            .strip_prefix('@')
-            .and_then(|tag| tag.split_once(' '))
-         else {
-            continue;
-         };
-         let value = value.trim();
+      for (key, value) in banner(source) {
          match key {
             "description" => header.description = Some(value.to_owned()),
             "version" => header.version = Some(value.to_owned()),
             "author" => header.author = Some(value.to_owned()),
             "enabled" => header.default_off = value == "false",
+            "min-sunbird" => header.min_sunbird = Some(value.to_owned()),
             _ => {},
          }
       }
       header
    }
+}
+
+/// The `// @key value` lines that open a plugin, up to its first line of code.
+fn banner(source: &str) -> impl Iterator<Item = (&str, &str)> {
+   source
+      .lines()
+      .map(str::trim)
+      .filter(|line| !line.is_empty())
+      .map_while(|line| line.strip_prefix("//"))
+      .filter_map(|comment| {
+         let tag = comment.trim().strip_prefix('@')?;
+         let (key, value) = tag.split_once(' ').unwrap_or((tag, ""));
+         Some((key, value.trim()))
+      })
 }
 
 /// A plugin setting as the user currently has it.
@@ -450,6 +483,12 @@ pub fn source(name: &str) -> Option<String> {
    engine()?.source(name)
 }
 
+/// The bundled copy an installed plugin replaced.
+#[must_use]
+pub fn bundled_source(name: &str) -> Option<String> {
+   engine()?.bundled(name)
+}
+
 /// What an uninstall left in the plugin's place.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Uninstalled {
@@ -479,7 +518,7 @@ pub fn reload(name: &str) {
 pub fn reload_all() {
    let names = plugins()
       .into_iter()
-      .filter(|plugin| plugin.enabled)
+      .filter(|plugin| plugin.state.is_on())
       .map(|plugin| plugin.name)
       .collect::<Vec<_>>();
    for name in names {

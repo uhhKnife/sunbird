@@ -1,7 +1,3 @@
-// @description Replaces YouTube titles and thumbnails in embeds using DeArrow
-// @version 0.2.0
-// @author amaanq
-
 const { gateway } = phoenix;
 
 const settings = phoenix.settings.define({

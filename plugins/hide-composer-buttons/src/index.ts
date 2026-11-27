@@ -1,7 +1,3 @@
-// @description Hides extra buttons in the message bar (Gift, Voice Message, etc.)
-// @version 1.0.0
-// @author mantikafasi
-
 const GIFT_ID = "composer.gift";
 const VOICE_ID = "Record Voice Message";
 

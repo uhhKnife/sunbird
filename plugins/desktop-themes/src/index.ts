@@ -1,7 +1,3 @@
-// @description Live .theme.css themes on Desktop Phoenix
-// @version 0.2.0
-// @author sh-ayu
-
 // bg tertiary, secondary, primary, elevated, accent, text, muted text, border.
 const PRESETS: Record<string, string[]> = {
   Midnight: ["#0b0d14", "#0f121c", "#141825", "#191e2e", "#7289da", "#eef1fa", "#9ba5c0", "#252c42"],

@@ -1,5 +1,7 @@
 //! `phoenix.fetch` and `phoenix.discord`.
 
+use std::sync::Arc;
+
 use rquickjs::{
    Ctx,
    Exception,
@@ -20,6 +22,7 @@ use crate::{
       intercept::add_discord_hooks,
       state,
    },
+   permissions::Permissions,
    store,
 };
 
@@ -120,30 +123,53 @@ pub fn start_fetch<'js>(
    in_background(ctx, move || Settlement::Fetch(fetch::send(&request)))
 }
 
+fn send<'js>(
+   ctx: &Ctx<'js>,
+   permissions: &Permissions,
+   path: String,
+   init: Init,
+) -> rquickjs::Result<rquickjs::Promise<'js>> {
+   allow(ctx, permissions, &init.method, &path)?;
+   in_background(ctx, move || {
+      Settlement::Discord(discord::send(
+         &init.method,
+         &path,
+         init.headers,
+         init.body.unwrap_or_default(),
+      ))
+   })
+}
+
+fn allow(
+   ctx: &Ctx<'_>,
+   permissions: &Permissions,
+   method: &str,
+   path: &str,
+) -> rquickjs::Result<()> {
+   if permissions.discord(method, path) {
+      return Ok(());
+   }
+   Err(Exception::throw_message(
+      ctx,
+      &format!("{method} {path}: add the route to the plugin's // @discord lines"),
+   ))
+}
+
 /// `phoenix.discord`, Discord's API on the app's own client and session:
 /// `request(path, init)`, `get` and `delete(path, init)`, `post`, `put` and
 /// `patch(path, body, init)`, and `onRequest(filter, handler)`.
-pub fn discord_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
-   fn send<'js>(
-      ctx: &Ctx<'js>,
-      path: String,
-      init: Init,
-   ) -> rquickjs::Result<rquickjs::Promise<'js>> {
-      in_background(ctx, move || {
-         Settlement::Discord(discord::send(
-            &init.method,
-            &path,
-            init.headers,
-            init.body.unwrap_or_default(),
-         ))
-      })
-   }
-
+pub fn discord_object<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   permissions: &Arc<Permissions>,
+) -> rquickjs::Result<Object<'js>> {
    let object = Object::new(ctx.clone())?;
-   add_discord_hooks(ctx, plugin, &object)?;
+   add_discord_hooks(ctx, plugin, &object, permissions)?;
+   let granted = Arc::clone(permissions);
    object.set(
       "authorize",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         allow(&ctx, &granted, "POST", "/oauth2/authorize")?;
          let client_id = options.get::<_, Option<String>>("clientId")?;
          let redirect_uri = options.get::<_, Option<String>>("redirectUri")?;
          let (Some(client_id), Some(redirect_uri)) = (client_id, redirect_uri) else {
@@ -165,25 +191,29 @@ pub fn discord_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Obj
          in_background(&ctx, move || Settlement::Text(discord::authorize(&request)))
       })?,
    )?;
+   let granted = Arc::clone(permissions);
    object.set(
       "me",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>| {
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>| {
+         allow(&ctx, &granted, "GET", "/users/@me")?;
          let files = state().files_dir();
          in_background(&ctx, move || {
             Settlement::Json(store::database(&files).and_then(|db| store::meta(&db, "me")))
          })
       })?,
    )?;
+   let granted = Arc::clone(permissions);
    object.set(
       "request",
       Function::new(
          ctx.clone(),
-         |ctx: Ctx<'js>, path: String, init: Opt<Object<'js>>| {
-            send(&ctx, path, Init::read(&ctx, init.0)?)
+         move |ctx: Ctx<'js>, path: String, init: Opt<Object<'js>>| {
+            send(&ctx, &granted, path, Init::read(&ctx, init.0)?)
          },
       )?,
    )?;
    for verb in ["GET", "DELETE"] {
+      let granted = Arc::clone(permissions);
       object.set(
          verb.to_ascii_lowercase(),
          Function::new(
@@ -191,12 +221,13 @@ pub fn discord_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Obj
             move |ctx: Ctx<'js>, path: String, init: Opt<Object<'js>>| {
                let mut init = Init::read(&ctx, init.0)?;
                verb.clone_into(&mut init.method);
-               send(&ctx, path, init)
+               send(&ctx, &granted, path, init)
             },
          )?,
       )?;
    }
    for verb in ["POST", "PUT", "PATCH"] {
+      let granted = Arc::clone(permissions);
       object.set(
          verb.to_ascii_lowercase(),
          Function::new(
@@ -207,7 +238,7 @@ pub fn discord_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Obj
                if let Some(body) = body.0 {
                   init.set_body(&ctx, body)?;
                }
-               send(&ctx, path, init)
+               send(&ctx, &granted, path, init)
             },
          )?,
       )?;

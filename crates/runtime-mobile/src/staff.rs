@@ -40,7 +40,10 @@ mod imp {
    };
 
    use phoenix_hook::image::Image;
-   use phoenix_sigs::StaffField as Field;
+   use phoenix_sigs::{
+      StaffField as Field,
+      locate::staff,
+   };
 
    const STAFF: u32 = 1;
 
@@ -49,13 +52,14 @@ mod imp {
    /// Finds the `flag_override` field off the main thread, since the scan
    /// reads most of the host library.
    pub fn start(image: &'static Image<'static>) {
-      std::thread::spawn(|| {
+      std::thread::spawn(move || {
          LOCATED.get_or_init(|| locate(image));
       });
    }
 
-   fn locate(image: &Image<'_>) -> Option<Field> {
-      phoenix_sigs::mobile::staff_aarch64(image)
+   fn locate(image: &'static Image<'static>) -> Option<Field> {
+      crate::with_index(image, staff::staff)
+         .map(|staff| staff.field)
          .inspect_err(|err| log::warn!("staff: {err}, leaving flag_override as is"))
          .ok()
    }
@@ -104,27 +108,33 @@ mod imp {
       Inline,
       image::Image,
    };
+   use phoenix_sigs::locate::staff;
 
    static HOOK: OnceLock<Option<Inline>> = OnceLock::new();
 
    /// Hooks the check from the loader's constructor, before any thread can be
    /// inside it, because the hook rewrites its first 8 or 10 bytes.
-   pub fn start(image: &Image<'_>) {
+   pub fn start(image: &'static Image<'static>) {
       HOOK.get_or_init(|| hook(image));
    }
 
    /// The check is hooked, so the store is left alone.
    pub const unsafe fn apply(_state: *mut c_void) {}
 
-   fn hook(image: &Image<'_>) -> Option<Inline> {
-      let target = phoenix_sigs::mobile::staff_arm(image)
+   fn hook(image: &'static Image<'static>) -> Option<Inline> {
+      let target = crate::with_index(image, staff::staff)
+         .and_then(|staff| {
+            staff
+               .check
+               .ok_or_else(|| "no staff check on armeabi-v7a".to_owned())
+         })
          .inspect_err(|err| log::warn!("staff: {err}"))
          .ok()?;
       // ShadowHook picks ARM or Thumb by bit 0, and the check is Thumb.
       let target = NonNull::new((target | 1) as *mut c_void)?;
       let detour = NonNull::new(is_staff as *mut c_void)?;
-      // SAFETY: the pattern matches the start of the check, and the detour has
-      // its ABI.
+      // SAFETY: the index found the start of the check, and the detour has its
+      // ABI.
       match unsafe { Inline::attach(target, detour) } {
          Ok(hook) => Some(hook),
          Err(err) => {

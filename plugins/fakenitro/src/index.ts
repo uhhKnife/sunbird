@@ -1,5 +1,5 @@
-// @description Unlocks Nitro stream quality and client themes, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones
-// @version 0.6.1
+// @description Unlocks Nitro stream quality, client themes and app icons, sends custom and animated emojis and stickers as links, and renders fake emojis, stickers, and GIFs as real ones
+// @version 0.7.0
 // @author mantikafasi
 
 const { gateway } = phoenix;
@@ -87,11 +87,14 @@ const settings = phoenix.settings.define({
   },
   unlockThemes: {
     type: "switch",
-    title: "Unlock client themes",
+    title: "Unlock client themes and app icons",
     description:
-      "Pick Nitro color themes, kept on this device only. The app then shows other Nitro features as unlocked too, but only themes work",
+      "Pick Nitro color themes and app icons, kept on this device only. The app then shows other Nitro features as unlocked too, but only these work",
     default: true,
-    onChange: () => applyTier(),
+    onChange: () => {
+      applyTier();
+      syncAppearanceUnlock();
+    },
   },
 });
 
@@ -601,6 +604,19 @@ function syncStreamUnlock() {
   }
 }
 syncStreamUnlock();
+
+// App icons ask the premium feature check, which the tier the app is shown
+// does not reach, so the runtime answers for them (Desktop).
+let releaseAppearance: Phoenix.Remover | undefined;
+function syncAppearanceUnlock() {
+  if (settings.unlockThemes && !releaseAppearance) {
+    releaseAppearance = phoenix.appearance?.unlockNitro();
+  } else if (!settings.unlockThemes && releaseAppearance) {
+    releaseAppearance();
+    releaseAppearance = undefined;
+  }
+}
+syncAppearanceUnlock();
 
 // ponytail: the tier and account are re-read for the next send, so the first
 // send after an account switch still uses the last one's.

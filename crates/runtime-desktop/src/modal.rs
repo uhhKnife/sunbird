@@ -1353,6 +1353,7 @@ pub fn install(image: &Image<'static>) {
    };
    let _ = ORIG_OVERLAY_RENDER.set(orig);
    install_settings_layer(image);
+   crate::notices::enable();
    log::info!(
       "desktop modal: hooked Workspace::render_overlays @ {:#x} (push={:#x}, val +{:#x}) {:x?}",
       found.overlay_render,
@@ -1575,52 +1576,76 @@ unsafe extern "C" fn overlay_render_detour(
    };
    // SAFETY: always render Discord's own overlay stack first.
    let out = unsafe { orig(sret, workspace, arg3, window, cx) };
+   push_modal(sret, window, cx);
+   if !sret.is_null() && !settings_drawn_recently() {
+      let _ = std::panic::catch_unwind(|| {
+         if let Some(notices) = crate::notices::build() {
+            push_overlay(sret, notices);
+         }
+      });
+   }
+   out
+}
+
+/// Appends `div` to the overlays Discord rendered into `sret`.
+fn push_overlay(sret: *mut RawVecAny, div: RawDiv) {
+   let Some(msym) = MODAL_SYM.get() else {
+      return;
+   };
+   let mut any = MaybeUninit::<RawAnyElement>::uninit();
+   gpui::write_any(div, any.as_mut_ptr());
+   // SAFETY: `any` was initialized by `div_into_any` and `vec_push_any` is
+   // Discord's own `Vec::<AnyElement>::push`.
+   unsafe {
+      let mut any = any.assume_init();
+      (msym.vec_push_any)(sret, &raw mut any);
+   }
+}
+
+/// Whether Settings drew within [`SETTINGS_RECENT_MS`], drawing the overlays
+/// over itself. Redraws once that passes, in case it closed.
+fn settings_drawn_recently() -> bool {
+   let at = SETTINGS_AT.load(Ordering::Acquire);
+   if at == 0 || epoch_ms().saturating_sub(at) >= SETTINGS_RECENT_MS {
+      return false;
+   }
+   if !RECHECK.swap(true, Ordering::AcqRel) {
+      std::thread::spawn(|| {
+         std::thread::sleep(std::time::Duration::from_millis(SETTINGS_RECENT_MS + 100));
+         RECHECK.store(false, Ordering::Release);
+         force_redraw();
+      });
+   }
+   true
+}
+
+fn push_modal(sret: *mut RawVecAny, window: *mut c_void, cx: *mut c_void) {
    if !MODAL_OPEN.load(Ordering::Acquire) {
       IN_SETTINGS.store(false, Ordering::Release);
-      return out;
+      return;
    }
    // ponytail: closing Settings under an open modal hides the modal until
    // Settings opens again or the modal is replaced; nothing tells this render
    // apart from one where Settings only replays its last frame.
    if IN_SETTINGS.load(Ordering::Acquire) || sret.is_null() || cx.is_null() {
-      return out;
+      return;
    }
    // Settings rendering after this in the same frame would build the modal a
    // second time, so leave it to Settings while it was just on screen, and look
    // again once that has passed in case it closed.
    // ponytail: Settings left idle past this before a modal opens from a timer
    // still gets one frame with the modal built in both places.
-   let at = SETTINGS_AT.load(Ordering::Acquire);
-   if at != 0 && epoch_ms().saturating_sub(at) < SETTINGS_RECENT_MS {
-      if !RECHECK.swap(true, Ordering::AcqRel) {
-         std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(SETTINGS_RECENT_MS + 100));
-            RECHECK.store(false, Ordering::Release);
-            force_redraw();
-         });
-      }
-      return out;
+   if settings_drawn_recently() {
+      return;
    }
 
    let _ = std::panic::catch_unwind(|| {
       // SAFETY: `[cx]` is `*mut App` inside `Context<Workspace>`.
       let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      let Some(msym) = MODAL_SYM.get() else {
-         return;
-      };
-      let Some(scrim) = build_overlay(window, app) else {
-         return;
-      };
-      let mut scrim_any = MaybeUninit::<RawAnyElement>::uninit();
-      gpui::write_any(scrim, scrim_any.as_mut_ptr());
-      // SAFETY: `scrim_any` was initialized by `div_into_any` and
-      // `vec_push_any` is Discord's own `Vec::<AnyElement>::push`.
-      unsafe {
-         let mut scrim_any = scrim_any.assume_init();
-         (msym.vec_push_any)(sret, &raw mut scrim_any);
+      if let Some(scrim) = build_overlay(window, app) {
+         push_overlay(sret, scrim);
       }
    });
-   out
 }
 
 unsafe extern "C" fn settings_layer_detour(
@@ -1635,20 +1660,29 @@ unsafe extern "C" fn settings_layer_detour(
    // SAFETY: Discord's own render first, with its own arguments.
    let out = unsafe { orig(sret, layer, window, cx) };
    SETTINGS_AT.store(epoch_ms().max(1), Ordering::Release);
-   if !MODAL_OPEN.load(Ordering::Acquire) {
+   let modal = MODAL_OPEN.load(Ordering::Acquire);
+   if !modal {
       IN_SETTINGS.store(false, Ordering::Release);
-      return out;
    }
    if sret.is_null() || cx.is_null() {
       return out;
    }
-   IN_SETTINGS.store(true, Ordering::Release);
+   if modal {
+      IN_SETTINGS.store(true, Ordering::Release);
+   }
    let _ = std::panic::catch_unwind(|| {
       // SAFETY: `[cx]` is `*mut App` inside the layer's `Context`.
       let app = unsafe { *(cx.cast::<*mut c_void>()) };
-      let Some(scrim) = build_overlay(window, app) else {
-         return;
+      let scrim = if modal {
+         build_overlay(window, app)
+      } else {
+         None
       };
+      // Settings draws over the workspace's overlays, so banners go on it too.
+      let notices = crate::notices::build();
+      if scrim.is_none() && notices.is_none() {
+         return;
+      }
       let Some(mut over) = gpui::raw_div() else {
          return;
       };
@@ -1665,7 +1699,10 @@ unsafe extern "C" fn settings_layer_detour(
          unsafe { ptr::write(sret, settings) };
          return;
       }
-      gpui::write_any(gpui::push_div(over, scrim), sret);
+      for layer in [scrim, notices].into_iter().flatten() {
+         over = gpui::push_div(over, layer);
+      }
+      gpui::write_any(over, sret);
    });
    out
 }
@@ -1747,13 +1784,16 @@ fn mono_span(text: &str, argb: u32) -> Option<RawDiv> {
    Some(d)
 }
 
-fn plain_text_div(text: &str, argb: u32, font_px: f32) -> Option<RawDiv> {
+/// `text` in `argb`, or without a color of its own when `None`, which takes
+/// the modal's, light or dark with Discord's theme.
+fn plain_text_div(text: &str, argb: Option<u32>, font_px: f32) -> Option<RawDiv> {
    let mut d = gpui::raw_div()?;
-   let hsla = argb_to_hsla(argb);
    gpui::style_div(&mut d, |s| {
       s.length(s.at.font_size, gpui_px(font_px));
       s.length(s.at.line_height, gpui_px(font_px + 5.0));
-      s.hsla(s.at.text_color, hsla);
+      if let Some(argb) = argb {
+         s.hsla(s.at.text_color, argb_to_hsla(argb));
+      }
    });
    let mut any = gpui::str_to_any(text)?;
    if !gpui::push_any(&mut d, &mut any) {
@@ -1857,7 +1897,7 @@ fn build_code_box(
          if let Some(span) = mono_span(line, COL_PLAIN) {
             box_div = gpui::push_div(box_div, span);
          }
-      } else if let Some(div) = plain_text_div(line, COL_PLAIN, 13.0) {
+      } else if let Some(div) = plain_text_div(line, Some(COL_PLAIN), 13.0) {
          box_div = gpui::push_div(box_div, div);
       }
    }
@@ -1873,7 +1913,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(8.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -1900,12 +1940,12 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
             for line in text.lines() {
-               if let Some(d) = plain_text_div(line, COL_PLAIN, 13.5) {
+               if let Some(d) = plain_text_div(line, None, 13.5) {
                   block = gpui::push_div(block, d);
                }
             }
@@ -1920,7 +1960,7 @@ fn build_page_body(msym: &ModalSymbols, spec: &PageModalSpec) -> Option<RawDiv> 
             let mut block = gpui::v_stack(6.0)?;
             if let Some(t) = title
                && !t.is_empty()
-               && let Some(hdr) = plain_text_div(t, COL_MUTED, 12.0)
+               && let Some(hdr) = plain_text_div(t, Some(COL_MUTED), 12.0)
             {
                block = gpui::push_div(block, hdr);
             }
@@ -2010,7 +2050,8 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
          if let Some(ref mut b) = body {
             gpui::style_div(b, |s| s.length(s.at.size[0], W_FULL));
             if let Some((msg, is_err)) = &ed.status
-               && let Some(st) = plain_text_div(msg, if *is_err { COL_ERROR } else { COL_OK }, 13.0)
+               && let Some(st) =
+                  plain_text_div(msg, Some(if *is_err { COL_ERROR } else { COL_OK }), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }
@@ -2049,7 +2090,7 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextArea could not be resolved on this Discord build.",
-               COL_ERROR,
+               Some(COL_ERROR),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
@@ -2139,13 +2180,14 @@ fn build_overlay(window: *mut c_void, app: *mut c_void) -> Option<RawDiv> {
                }
             } else if let Some(msg) = plain_text_div(
                "Native TextInput could not be resolved on this Discord build.",
-               COL_ERROR,
+               Some(COL_ERROR),
                13.5,
             ) {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), msg);
             }
             if let Some((msg, is_err)) = &inst.status
-               && let Some(st) = plain_text_div(msg, if *is_err { COL_ERROR } else { COL_OK }, 13.0)
+               && let Some(st) =
+                  plain_text_div(msg, Some(if *is_err { COL_ERROR } else { COL_OK }), 13.0)
             {
                *b = gpui::push_div(std::mem::replace(b, RawDiv::zeroed()), st);
             }

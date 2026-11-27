@@ -11,14 +11,13 @@ use phoenix_runtime::{
 };
 
 use crate::settings::{
-   COLOR_ERROR,
-   COLOR_STRING,
    Field,
    Job,
    LOG_QUEUED,
    Press,
    TITLE,
    settings,
+   theme::Color,
 };
 
 fn plugin(index: usize) -> Option<PluginInfo> {
@@ -31,7 +30,11 @@ pub fn act(job: &Job) {
    match *job {
       Job::Log => LOG_QUEUED.store(false, Ordering::Relaxed),
       // The editor is multiline: Enter is a newline there, and Save saves.
-      Job::Submit(Field::Code(_)) | Job::NavigateTo(_) | Job::Draft(..) | Job::Refresh => {},
+      Job::Submit(Field::Code(_))
+      | Job::NavigateTo(_)
+      | Job::Draft(..)
+      | Job::Refresh
+      | Job::ThemeChanged => {},
       Job::Submit(field) => submit(field),
       Job::Picked(ref picked) => {
          match picked {
@@ -41,8 +44,10 @@ pub fn act(job: &Job) {
             Ok(None) => {},
             Err(err) => {
                log::error!("file picker: {err}");
-               settings().install_status =
-                  Some((format!("The file picker failed: {err}"), COLOR_ERROR));
+               settings().install_status = Some((
+                  format!("The file picker failed: {err}"),
+                  Color::Error.argb(),
+               ));
             },
          }
       },
@@ -204,10 +209,10 @@ fn listed(index: usize) {
             Ok(outcome) => {
                (
                   format!("{}.", uninstalled(&info.name, outcome)),
-                  COLOR_STRING,
+                  Color::String.argb(),
                )
             },
-            Err(err) => (format!("Uninstall failed: {err}"), COLOR_ERROR),
+            Err(err) => (format!("Uninstall failed: {err}"), Color::Error.argb()),
          });
       },
    }
@@ -227,12 +232,12 @@ fn installed(result: Result<Installed, phoenix_runtime::Error>, from: &str) {
          log::info!("{installed} from {from}");
          (
             format!("{installed}. It is on the {TITLE} page now."),
-            COLOR_STRING,
+            Color::String.argb(),
          )
       },
       Err(err) => {
          log::error!("install failed: {err}");
-         (format!("Install failed: {err}"), COLOR_ERROR)
+         (format!("Install failed: {err}"), Color::Error.argb())
       },
    };
    settings().install_status = Some(status);

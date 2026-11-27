@@ -19,8 +19,15 @@ use std::{
    },
 };
 
-use phoenix_hook::image::Image;
-use phoenix_sigs::desktop;
+use phoenix_hook::{
+   image::Image,
+   x86::Abi,
+};
+use phoenix_sigs::desktop::{
+   self,
+   Prologue,
+   Prologues,
+};
 
 use crate::{
    double_click,
@@ -289,6 +296,11 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
    let (body_fn, msg_id_off, colors_off) = (body.func, body.msg_id_offset, body.row_colors_offset);
    BODY_MSG_ID_OFFSET.store(msg_id_off, Ordering::Release);
    ROW_COLORS_OFFSET.store(colors_off, Ordering::Release);
+   let pick: fn(Prologues) -> Prologue = if Prologues::of(Abi::of(image)).row.at(image, body_fn) {
+      |pro| pro.row
+   } else {
+      |pro| pro.frame
+   };
 
    // SAFETY: runs from `prepare` before Discord threads execute;
    // `build_body_detour` matches `build_message_body`'s verified 6-argument
@@ -296,7 +308,7 @@ fn install_body_tint(image: &Image<'static>, render_row: usize) {
    let Some(orig) = (unsafe {
       crate::hook::<BuildMessageBodyFn>(
          image,
-         |pro| pro.row,
+         pick,
          body_fn,
          build_body_detour as *const () as usize,
          "desktop accessories: message body tint hook failed",

@@ -261,10 +261,26 @@ pub fn open_url(url: &str) -> Result<(), Error> {
    Os::open(url)
 }
 
+type InApp = Box<dyn Fn(&str, Option<&str>) -> bool + Send + Sync>;
+
+static IN_APP: OnceLock<InApp> = OnceLock::new();
+
+/// Sends [`toast`] and [`notify`] to `show`, which draws them inside Discord
+/// and returns false when it cannot, leaving them to the OS.
+pub fn show_in_app(show: impl Fn(&str, Option<&str>) -> bool + Send + Sync + 'static) {
+   let _ = IN_APP.set(Box::new(show));
+}
+
+fn in_app(title: &str, body: Option<&str>) -> bool {
+   IN_APP.get().is_some_and(|show| show(title, body))
+}
+
 /// Shows a short desktop toast / notification message.
 pub fn toast(message: &str) {
    log::info!("[toast] {message}");
-   Os::notify("Sunbird", message);
+   if !in_app(message, None) {
+      Os::notify("Sunbird", message);
+   }
 }
 
 /// Shows a titled desktop notification.
@@ -272,11 +288,15 @@ pub fn notify(title: &str, body: Option<&str>) {
    match body {
       Some(body) if !body.is_empty() => {
          log::info!("[notify] {title}: {body}");
-         Os::notify(title, body);
+         if !in_app(title, Some(body)) {
+            Os::notify(title, body);
+         }
       },
       _ => {
          log::info!("[notify] {title}");
-         Os::notify("Sunbird", title);
+         if !in_app(title, None) {
+            Os::notify("Sunbird", title);
+         }
       },
    }
 }

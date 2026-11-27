@@ -27,6 +27,7 @@ mod js;
 mod members;
 mod message;
 mod modal;
+mod notices;
 mod os;
 mod ready;
 #[cfg(windows)]

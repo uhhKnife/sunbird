@@ -8,7 +8,6 @@ use phoenix_ui_mobile::Prop;
 use phoenix_wire::Value;
 
 use crate::settings::{
-   COLOR_ERROR,
    Field,
    ICON_CONSOLE,
    ICON_PLUGIN,
@@ -24,6 +23,7 @@ use crate::settings::{
       text_field,
       value_row,
    },
+   theme::Color,
    tree::Tree,
 };
 
@@ -69,10 +69,10 @@ pub fn plugin_sections(index: usize, plugin: &PluginInfo) -> Vec<Tree> {
       // `root > row > [icon, label]`, both in the danger color.
       if let Some(row) = uninstall.kids.first_mut() {
          if let Some(icon) = row.kids.get_mut(0) {
-            icon.set(Prop::TINT, Some(Value::I64(COLOR_ERROR)));
+            icon.set(Prop::TINT, Some(Value::I64(Color::Error.argb())));
          }
          if let Some(label) = row.kids.get_mut(1) {
-            label.set(Prop::COLOR, Some(Value::I64(COLOR_ERROR)));
+            label.set(Prop::COLOR, Some(Value::I64(Color::Error.argb())));
          }
       }
       actions.push(uninstall);

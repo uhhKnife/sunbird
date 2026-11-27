@@ -14,6 +14,7 @@ mod pages;
 mod plugin;
 mod render;
 mod rows;
+mod theme;
 mod tree;
 
 use std::{
@@ -77,18 +78,6 @@ const ICON_RELOAD: &str = "res://ic_mana_puzzle_piece_retry";
 const ICON_UNINSTALL: &str = "res://ic_mana_puzzle_piece_minus";
 const ICON_CONSOLE: &str = "res://ic_mana_angle_brackets";
 const ICON_FILE: &str = "res://ic_mana_image_file_up";
-/// Text colors, ARGB, for Discord's dark theme.
-const COLOR_TEXT: i64 = 0xFFF6_F6F7;
-const COLOR_MUTED: i64 = 0xFF94_9BA4;
-const COLOR_WARN: i64 = 0xFFF0_B232;
-const COLOR_ERROR: i64 = 0xFFF2_3F42;
-const COLOR_ACCENT: i64 = 0xFF79_C0FF;
-const COLOR_TAG: i64 = 0xFFD2_A8FF;
-const COLOR_STRING: i64 = 0xFF7E_E787;
-const COLOR_KEYWORD: i64 = 0xFFFF_7B72;
-const COLOR_NUMBER: i64 = 0xFF79_C0FF;
-const COLOR_COMMENT: i64 = 0xFF8B_949E;
-
 /// Plugins are named by their index in [`phoenix_runtime::plugins`] as of the
 /// last render, which every install follows with a fresh one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -142,6 +131,8 @@ enum Job {
    Picked(crate::picker::Picked),
    /// Something the open pages show changed.
    Refresh,
+   /// Phoenix redrawn Settings for another light/dark theme.
+   ThemeChanged,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -270,7 +261,26 @@ pub fn start() {
          let ops = {
             let mut state = settings();
             if let Some(plugins) = plugins {
+               let old = state
+                  .plugins
+                  .iter()
+                  .map(|plugin| plugin.name.clone())
+                  .collect::<Vec<_>>();
                state.plugins = plugins;
+               let names = state
+                  .plugins
+                  .iter()
+                  .map(|plugin| plugin.name.clone())
+                  .collect::<Vec<_>>();
+               state.drafts.retain(|field, _| {
+                  match *field {
+                     Field::Eval | Field::Install => true,
+                     Field::Setting(index, _) | Field::Code(index) => {
+                        old.get(index)
+                           .is_some_and(|name| names.get(index).is_some_and(|new| new == name))
+                     },
+                  }
+               });
             }
             let mut ops = state.run(job);
             if !state.motion.is_empty() {

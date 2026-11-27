@@ -55,6 +55,8 @@ pub struct Desktop<'js> {
    pub actions:            RefCell<Vec<DesktopAction<'js>>>,
    /// Active `phoenix.ui.openPage` button callbacks, keyed by button ID.
    pub page_buttons:       RefCell<HashMap<u64, (u64, String, Function<'js>)>>,
+   /// `phoenix.ui.notify` `onPress` callbacks, keyed by banner ID.
+   pub notices:            RefCell<HashMap<u64, (String, Function<'js>)>>,
    /// `phoenix.messages.onEmojiPick` handlers by id and plugin. Desktop has
    /// no picker presses to give them, only the unlock they turn on.
    pub emoji_pickers:      RefCell<Vec<(u64, String)>>,
@@ -95,8 +97,9 @@ unsafe impl<'js> JsLifetime<'js> for Desktop<'js> {
 }
 
 /// Drops the accessories, member decorations, context menu actions, open page
-/// callbacks, emoji pick handlers, hidden counts, sidebar collapses, header
-/// buttons and shortcuts `name` registered and redraws Discord without them.
+/// callbacks, banners, emoji pick handlers, hidden counts, sidebar collapses,
+/// header buttons and shortcuts `name` registered and redraws Discord without
+/// them.
 pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let Some(registry) = ctx.userdata::<Desktop<'_>>() else {
       return;
@@ -135,6 +138,11 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
       .page_buttons
       .borrow_mut()
       .retain(|_, (_, plugin, _)| plugin != name);
+   registry
+      .notices
+      .borrow_mut()
+      .retain(|_, (plugin, _)| plugin != name);
+   crate::notices::remove_plugin(name);
 
    let mut pickers = registry.emoji_pickers.borrow_mut();
    pickers.retain(|(_, plugin)| plugin != name);

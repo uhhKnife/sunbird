@@ -1,5 +1,7 @@
 //! Builds, rerenders and closes phoenix's pages on the navigator.
 
+use std::collections::HashMap;
+
 use phoenix_ui_mobile::{
    Op,
    Prop,
@@ -235,6 +237,7 @@ impl Settings {
             ops
          },
          Job::Log => self.log_ops(),
+         Job::ThemeChanged => self.theme_changed(),
          Job::Submit(Field::Eval) => {
             let mut ops = self.log_ops();
             ops.extend(self.clear_ops(Field::Eval));
@@ -340,6 +343,7 @@ impl Settings {
             continue;
          }
          let (_, mut sections) = self.render(kind);
+         self.apply_drafts(&mut sections);
          // Same layout: update the changed nodes and spring the flipped switch,
          // so the other rows are not rebuilt (and do not flicker).
          let old = self
@@ -422,6 +426,27 @@ impl Settings {
       }
    }
 
+   /// Restores unsubmitted text when a page with inputs is rebuilt.
+   fn apply_drafts(&self, trees: &mut [Tree]) {
+      fn apply(tree: &mut Tree, drafts: &HashMap<Field, String>) {
+         if let Some(Slot::Input(field)) = tree.slot
+            && let Some(draft) = drafts.get(&field)
+         {
+            tree.set(Prop::VALUE, Some(text(draft)));
+            if matches!(field, Field::Code(_)) {
+               tree.set(prop!("valueSpans"), Some(code_spans(draft)));
+            }
+         }
+         for kid in &mut tree.kids {
+            apply(kid, drafts);
+         }
+      }
+
+      for tree in trees {
+         apply(tree, &self.drafts);
+      }
+   }
+
    fn open_page(&mut self, kind: PageKind) -> Vec<Op> {
       let Some(screen) = &self.screen else {
          return Vec::new();
@@ -431,7 +456,8 @@ impl Settings {
          return Vec::new();
       }
       let header = screen.header.clone();
-      let (title, sections) = self.render(kind);
+      let (title, mut sections) = self.render(kind);
+      self.apply_drafts(&mut sections);
       let title = title.as_str();
 
       let mut page = Tree::from_template(&templates().page);
@@ -489,6 +515,60 @@ impl Settings {
          });
       }
       ops.extend(self.navigator_ops());
+      ops
+   }
+
+   /// Rebuilds the injected row and open pages after Phoenix redraws Settings
+   /// in another theme.
+   fn theme_changed(&mut self) -> Vec<Op> {
+      let mut ops = self.replace_entry();
+      let kinds = self.screen.as_ref().map_or_default(|screen| {
+         screen
+            .stack
+            .iter()
+            .map(|page| page.kind)
+            .collect::<Vec<PageKind>>()
+      });
+      while self
+         .screen
+         .as_ref()
+         .is_some_and(|screen| !screen.stack.is_empty())
+      {
+         ops.extend(self.close_top());
+      }
+      let console_open = kinds.contains(&PageKind::Console);
+      for kind in kinds {
+         ops.extend(self.open_page(kind));
+      }
+      if console_open {
+         ops.extend(self.log_ops());
+      }
+      ops
+   }
+
+   fn replace_entry(&mut self) -> Vec<Op> {
+      let Some((list, search, rows, old)) = self.screen.as_ref().map(|screen| {
+         (
+            screen.list,
+            screen.search,
+            screen.rust_rows.clone(),
+            screen.entry.as_ref().map(|entry| entry.ids.clone()),
+         )
+      }) else {
+         return Vec::new();
+      };
+      let (entry, mut ops) = self.entry_ops();
+      let mut ids = rows.unwrap_or_default();
+      let at = usize::from(search.is_some() && ids.first() == search.as_ref());
+      ids.insert(at, entry.root);
+      if let Some(screen) = &mut self.screen {
+         screen.entry = Some(entry);
+      }
+      ops.push(Op::Children { id: list, ids });
+      if let Some(old) = old {
+         ops.push(Op::Delete { ids: old.clone() });
+         self.forget(&old);
+      }
       ops
    }
 

@@ -75,6 +75,10 @@ use crate::{
       PageModalSpec,
       Prompt,
    },
+   notices::{
+      self,
+      Notice,
+   },
    shortcuts,
    sidebar,
    sticker,
@@ -1402,6 +1406,80 @@ fn drop_page_buttons(ctx: &Ctx<'_>, owner: u64) {
    }
 }
 
+/// `phoenix.ui.toast`, as a banner named after the plugin.
+fn toast(plugin: &str, message: &str) {
+   if notices::show(Notice::plain(plugin, message, None)).is_some() {
+      log::info!("[toast] {plugin}: {message}");
+   } else {
+      phoenix_ui_desktop::toast(message);
+   }
+}
+
+/// `phoenix.ui.notify`, as a banner named after the plugin. Returns a function
+/// that dismisses it.
+fn notify<'js>(
+   ctx: &Ctx<'js>,
+   plugin: &str,
+   options: &Object<'js>,
+) -> rquickjs::Result<Function<'js>> {
+   let title = options
+      .get::<_, Option<String>>("title")?
+      .unwrap_or_default();
+   let body = options.get::<_, Option<String>>("body")?;
+   let accent = options
+      .get::<_, Option<f64>>("accent")?
+      .map_or(notices::ACCENT, to_argb);
+   let duration = match options.get::<_, Option<f64>>("durationMs")? {
+      Some(ms) if ms <= 0.0 => None,
+      Some(ms) => Some(Duration::try_from_secs_f64(ms / 1000.0).unwrap_or(notices::DURATION)),
+      None => Some(notices::DURATION),
+   };
+   let on_press = options.get::<_, Option<Function<'js>>>("onPress")?;
+   let Some(id) = notices::show(Notice {
+      source: plugin.to_owned(),
+      title: title.clone(),
+      body: body.clone(),
+      accent,
+      duration,
+      pressable: on_press.is_some(),
+   }) else {
+      phoenix_ui_desktop::notify(&title, body.as_deref());
+      return noop_handle(ctx);
+   };
+   log::info!("[notify] {plugin}: {title}");
+   if let Some(on_press) = on_press
+      && let Some(registry) = ctx.userdata::<Desktop<'js>>()
+   {
+      let mut presses = registry.notices.borrow_mut();
+      presses.retain(|shown, _| notices::is_shown(*shown));
+      presses.insert(id, (plugin.to_owned(), on_press));
+   }
+   let dismiss = Function::new(ctx.clone(), move || notices::dismiss(id))?;
+   dismiss.set(
+      "close",
+      Function::new(ctx.clone(), move || notices::dismiss(id))?,
+   )?;
+   Ok(dismiss)
+}
+
+/// Runs the `onPress` of banner `id`, whose Open button was pressed.
+pub fn press_notice(id: u64) {
+   let Some(engine) = phoenix_runtime::engine() else {
+      return;
+   };
+   engine.with(|ctx| {
+      let Some((plugin, on_press)) = ctx
+         .userdata::<Desktop<'_>>()
+         .and_then(|registry| registry.notices.borrow_mut().remove(&id))
+      else {
+         return;
+      };
+      if let Err(err) = on_press.call::<_, Value<'_>>(()).catch(&ctx) {
+         log::error!("[{plugin}] notify onPress: {err}");
+      }
+   });
+}
+
 /// Wires desktop `phoenix.ui`, `phoenix.messages.onSend` / `onEmojiPick`, and
 /// `phoenix.commands` onto the plugin's API objects.
 pub fn desktop_patch_api<'js>(
@@ -1471,10 +1549,11 @@ pub fn desktop_patch_api<'js>(
 )]
 pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<Object<'js>> {
    let ui = Object::new(ctx.clone())?;
+   let toast_owner = plugin.to_owned();
    ui.set(
       "toast",
-      Function::new(ctx.clone(), |message: String| {
-         phoenix_ui_desktop::toast(&message);
+      Function::new(ctx.clone(), move |message: String| {
+         toast(&toast_owner, &message);
       })?,
    )?;
    ui.set(
@@ -1484,6 +1563,7 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
             .map_err(|err| Exception::throw_message(&ctx, &err.to_string()))
       })?,
    )?;
+   let notify_owner = plugin.to_owned();
    ui.set(
       "openUrl",
       Function::new(ctx.clone(), |ctx: Ctx<'js>, url: String| {
@@ -1493,13 +1573,8 @@ pub fn desktop_ui_object<'js>(ctx: &Ctx<'js>, plugin: &str) -> rquickjs::Result<
    )?;
    ui.set(
       "notify",
-      Function::new(ctx.clone(), |ctx: Ctx<'js>, options: Object<'js>| {
-         let title = options
-            .get::<_, Option<String>>("title")?
-            .unwrap_or_default();
-         let body = options.get::<_, Option<String>>("body")?;
-         phoenix_ui_desktop::notify(&title, body.as_deref());
-         noop_handle(&ctx)
+      Function::new(ctx.clone(), move |ctx: Ctx<'js>, options: Object<'js>| {
+         notify(&ctx, &notify_owner, &options)
       })?,
    )?;
 

@@ -14,6 +14,7 @@ use crate::settings::{
    ICON_PLUGIN,
    Press,
    Slot,
+   theme::template_props,
    tree::{
       Animate,
       Tree,
@@ -182,10 +183,12 @@ pub fn switch_row(
 /// Gives a switch part built from the "on" template the props for `on` and a
 /// worklet to spring between both states.
 fn animate(node: &mut Tree, worklet: &'static Worklet, off: &Props, on: bool) {
+   let mut off = off.clone();
+   template_props(&mut off);
    let other = if on {
-      off.clone()
+      off
    } else {
-      std::mem::replace(&mut node.props, off.clone())
+      std::mem::replace(&mut node.props, off)
    };
    node.animate = Some(Animate {
       worklet,

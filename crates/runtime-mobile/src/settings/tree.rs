@@ -15,6 +15,7 @@ use phoenix_wire::Value;
 use crate::settings::{
    Press,
    Slot,
+   theme::template_props,
 };
 
 pub struct Tree {
@@ -39,14 +40,16 @@ pub struct Animate {
 
 impl Tree {
    pub fn from_template(node: &Node) -> Self {
+      let mut props = node.props.clone();
+      template_props(&mut props);
       Self {
-         id:      0,
-         kind:    node.kind.clone(),
-         props:   node.props.clone(),
-         kids:    node.kids.iter().map(Self::from_template).collect(),
-         src:     node.src,
-         press:   None,
-         slot:    None,
+         id: 0,
+         kind: node.kind.clone(),
+         props,
+         kids: node.kids.iter().map(Self::from_template).collect(),
+         src: node.src,
+         press: None,
+         slot: None,
          animate: None,
       }
    }

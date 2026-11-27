@@ -1409,13 +1409,15 @@ declare namespace Phoenix {
   interface NotifyOptions {
     title: string;
     body?: string;
-    /// A `res://` drawable URI (defaults to `res://ic_mana_puzzle_piece_plus`).
+    /// A `res://` drawable URI (defaults to `res://ic_mana_puzzle_piece_plus`). Not drawn on
+    /// desktop.
     icon?: Icon;
-    /// 32-bit ARGB color for the leading icon badge (defaults to Discord Blurple).
+    /// 32-bit ARGB color for the leading icon badge, a dot on desktop (defaults to Discord
+    /// Blurple).
     accent?: number;
     /// Auto-dismiss after this many milliseconds (defaults to 5000; pass 0 to stay until dismissed).
     durationMs?: number;
-    /// Runs when the notification banner is tapped.
+    /// Runs when the notification banner is tapped, or on desktop when its Open button is pressed.
     onPress?(): void;
   }
 
@@ -1555,8 +1557,9 @@ declare namespace Phoenix {
     /// Mounts a raw Phoenix UI subtree onto `parentId` (or `"root"` for the root view). Returns a
     /// function that unmounts and deletes all created nodes.
     mount(parentId: number | "root", node: MountNode, options?: MountOptions): Remover;
-    /// Shows a native Discord in-app notification banner at the top of the screen. Returns a
-    /// function that dismisses it early.
+    /// Shows a native Discord in-app notification banner at the top of the screen, or in the
+    /// bottom right corner on desktop, under the plugin's name. Desktop shows the three newest at
+    /// once and the others after one is closed. Returns a function that dismisses it early.
     notify(options: NotifyOptions): () => void;
     /// Suppresses haptic feedback across the app (host `Haptics` calls and view haptic props on
     /// mobile; no-op on desktop). Absent on runtimes from before it. Call the returned function
@@ -1567,7 +1570,8 @@ declare namespace Phoenix {
     /// Opens an `https://`, `http://` or `discord://` link in the default browser, and throws for
     /// anything else. Desktop only for now.
     openUrl?(url: string): void;
-    /// A short message at the bottom of the screen, or in a banner at the top on iOS.
+    /// A short message at the bottom of the screen, in a banner at the top on iOS, or in a banner
+    /// in the bottom right corner on desktop.
     toast(text: string): void;
   }
 

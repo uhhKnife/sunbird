@@ -10,12 +10,6 @@ use phoenix_wire::Value;
 use crate::{
    highlight,
    settings::{
-      COLOR_ACCENT,
-      COLOR_ERROR,
-      COLOR_MUTED,
-      COLOR_TAG,
-      COLOR_TEXT,
-      COLOR_WARN,
       Field,
       ICON_CONSOLE,
       Slot,
@@ -26,6 +20,7 @@ use crate::{
          section,
          text_field,
       },
+      theme::Color,
       tree::{
          Tree,
          span,
@@ -41,7 +36,10 @@ const LOG_LINES: usize = 150;
 pub fn log_lines() -> Vec<Tree> {
    let lines = phoenix_runtime::console::lines();
    if lines.is_empty() {
-      return vec![log_line(&[("Nothing logged yet".to_owned(), COLOR_MUTED)])];
+      return vec![log_line(&[(
+         "Nothing logged yet".to_owned(),
+         Color::Muted.argb(),
+      )])];
    }
    lines
       .iter()
@@ -51,19 +49,19 @@ pub fn log_lines() -> Vec<Tree> {
 }
 
 fn line_spans(line: &phoenix_runtime::console::Line) -> Vec<(String, i64)> {
-   let mut spans = vec![(format!("{} ", line.time), COLOR_MUTED)];
+   let mut spans = vec![(format!("{} ", line.time), Color::Muted.argb())];
    let body = match line.level {
-      log::Level::Error => COLOR_ERROR,
-      log::Level::Warn => COLOR_WARN,
-      log::Level::Debug | log::Level::Trace => COLOR_MUTED,
-      log::Level::Info => COLOR_TEXT,
+      log::Level::Error => Color::Error.argb(),
+      log::Level::Warn => Color::Warn.argb(),
+      log::Level::Debug | log::Level::Trace => Color::Muted.argb(),
+      log::Level::Info => Color::Text.argb(),
    };
    let mut rest = line.text.as_str();
    // What the console ran, echoed as "> code": highlighted like the editor.
    if line.level == log::Level::Info
       && let Some(code) = rest.strip_prefix("> ")
    {
-      spans.push(("> ".to_owned(), COLOR_ACCENT));
+      spans.push(("> ".to_owned(), Color::Accent.argb()));
       spans.extend(
          highlight::js(code)
             .into_iter()
@@ -74,7 +72,7 @@ fn line_spans(line: &phoenix_runtime::console::Line) -> Vec<(String, i64)> {
    if rest.starts_with('[')
       && let Some(end) = rest.find("] ")
    {
-      spans.push((rest[..=end].to_owned(), COLOR_TAG));
+      spans.push((rest[..=end].to_owned(), Color::Tag.argb()));
       rest = &rest[end + 1..];
    }
    spans.push((rest.trim_end().to_owned(), body));
@@ -100,7 +98,7 @@ pub fn log_line(pieces: &[(String, i64)]) -> Tree {
             .collect(),
       )),
    );
-   node.set(Prop::COLOR, Some(Value::I64(COLOR_TEXT)));
+   node.set(Prop::COLOR, Some(Value::I64(Color::Text.argb())));
    node.set(Prop::FONT_SIZE, Some(Value::F64(12.0)));
    node.set(Prop::LINE_HEIGHT, Some(Value::F64(16.0)));
    node.set(prop!("fontWeight"), Some(Value::I32(400)));

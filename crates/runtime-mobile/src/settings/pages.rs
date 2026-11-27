@@ -8,10 +8,6 @@ use phoenix_ui_mobile::Prop;
 use phoenix_wire::Value;
 
 use crate::settings::{
-   COLOR_ACCENT,
-   COLOR_ERROR,
-   COLOR_STRING,
-   COLOR_WARN,
    Field,
    ICON_CONSOLE,
    ICON_FILE,
@@ -27,6 +23,7 @@ use crate::settings::{
       text_field,
       value_row,
    },
+   theme::Color,
    tree::Tree,
 };
 
@@ -71,7 +68,11 @@ pub fn main_sections(plugins: &[PluginInfo]) -> Vec<Tree> {
             // iOS hooks nothing inline: it swaps the bridge's vtable slots.
             value_row(
                "Hook library",
-               if cfg!(target_os = "ios") { "vtable slot swap" } else { "ShadowHook" },
+               if cfg!(target_os = "ios") {
+                  "vtable slot swap"
+               } else {
+                  "ShadowHook"
+               },
             ),
             value_row("Enabled", &format!("{enabled} of {}", plugins.len())),
          ]),
@@ -110,9 +111,9 @@ fn update_section() -> Option<Tree> {
          );
          if let Some(label) = row.kids.first_mut().and_then(|row| row.kids.get_mut(1)) {
             let color = if update_busy {
-               COLOR_ACCENT
+               Color::Accent.argb()
             } else {
-               COLOR_STRING
+               Color::String.argb()
             };
             label.set(Prop::COLOR, Some(Value::I64(color)));
          }
@@ -121,7 +122,7 @@ fn update_section() -> Option<Tree> {
       if let Some(status) = &update_status
          && (!update_busy || update_found.is_none())
       {
-         let mut line = log_line(&[(status.clone(), COLOR_WARN)]);
+         let mut line = log_line(&[(status.clone(), Color::Warn.argb())]);
          line.set(Prop::FONT_FAMILY, None);
          line.set(Prop::FONT_SIZE, Some(Value::F64(13.0)));
          line.set(Prop::LINE_HEIGHT, Some(Value::F64(18.0)));
@@ -156,7 +157,10 @@ fn listed_rows(plugins: &[PluginInfo]) -> Vec<Tree> {
          )];
       },
       Catalog::Failed(err) => {
-         let mut line = log_line(&[(format!("The plugin list did not load: {err}"), COLOR_ERROR)]);
+         let mut line = log_line(&[(
+            format!("The plugin list did not load: {err}"),
+            Color::Error.argb(),
+         )]);
          line.set(Prop::FONT_FAMILY, None);
          return vec![line];
       },

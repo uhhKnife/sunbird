@@ -2,6 +2,7 @@
 //! accessories, and `phoenix.native` for the console.
 
 pub mod native;
+pub mod themes;
 pub mod ui;
 
 use std::{
@@ -201,4 +202,6 @@ pub fn unload(ctx: &Ctx<'_>, name: &str) {
    let mut appearance_unlocks = registry.appearance_unlocks.borrow_mut();
    appearance_unlocks.retain(|(_, plugin)| plugin != name);
    stream::unlock_appearance(!appearance_unlocks.is_empty());
+
+   themes::unload(name);
 }

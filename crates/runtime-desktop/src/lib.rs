@@ -20,6 +20,7 @@ mod emoji;
 mod fetch;
 mod gateway_send;
 mod gpui;
+mod gpui_theme;
 mod headers;
 mod icons;
 mod js;
@@ -36,6 +37,7 @@ mod sidebar;
 mod staff;
 mod sticker;
 mod stream;
+mod theme_css;
 mod toolbar;
 
 use std::{
@@ -232,6 +234,8 @@ pub fn prepare() -> Result<(), Error> {
    emoji::install(&image);
    sticker::install(&image);
    stream::install(&image);
+   #[cfg(windows)]
+   gpui_theme::install(&image);
    <os::Os as os::DesktopOs>::install(&image);
    let registry = phoenix_runtime::hook(&image);
    if registry.is_ok() {

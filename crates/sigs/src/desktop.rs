@@ -3073,6 +3073,102 @@ pub fn asset_load(image: &Image<'_>) -> Found<usize> {
    one("asset loader", &loaders)
 }
 
+/// GPUI's renderer `draw(&mut self, scene: &Scene)`.
+///
+/// Also where `Scene` keeps the primitive lists a theme recolors before they
+/// are drawn, each a `Vec` (`cap`, `ptr`, `len`) at the offset given.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneDraw {
+   pub draw:     usize,
+   pub quads:    usize,
+   pub mono:     usize,
+   pub subpixel: usize,
+}
+
+/// [`SceneDraw`], from the renderer's error for a frame it cannot draw.
+///
+/// `"scene too large: {} paths, {} shadows, {} quads, ..."`. A closure formats
+/// it, reading each list's `len` off the scene, its second argument, in the
+/// order the template names them. `draw` is the closure's one caller.
+pub fn scene_draw(image: &Image<'_>) -> Found<SceneDraw> {
+   const ANCHOR: &[u8] = b"scene too large:";
+   if Abi::of(image) != Abi::Win64 {
+      return Err("scene draw locator requires Win64".to_owned());
+   }
+   let text = one("scene template", &image.find_bytes(ANCHOR))?;
+   // The template starts with a length byte, so the load can point before
+   // the text.
+   let loads = [text - 1, text]
+      .iter()
+      .flat_map(|&at| lea_refs(image, at))
+      .collect::<Vec<_>>();
+   let load = one("scene template load", &loads)?;
+   let (formatter, _) = image
+      .function_bounds(load)
+      .ok_or("scene formatter has no function bounds")?;
+
+   let tail = image
+      .read(text + ANCHOR.len(), 0x100)
+      .ok_or("scene template is unmapped")?;
+   let tail = &tail[..tail.iter().position(|&b| b == 0).unwrap_or(tail.len())];
+   let names = tail
+      .split(|b| !b.is_ascii_lowercase())
+      .filter(|name| !name.is_empty())
+      .collect::<Vec<_>>();
+
+   // `mov r64, [scene + disp32]`, the scene in the second argument register.
+   let (scene, scene_ext) = reg(Abi::of(image).arg(1));
+   let code = image
+      .read(formatter, load - formatter)
+      .ok_or("scene formatter is unmapped")?;
+   let lens = (0..code.len().saturating_sub(7))
+      .filter(|&at| {
+         code[at] & 0xFB == 0x48
+            && code[at] & 1 == scene_ext
+            && code[at + 1] == 0x8B
+            && code[at + 2] & 0xC7 == 0x80 | scene
+      })
+      .map(|at| {
+         u32::from_le_bytes([code[at + 3], code[at + 4], code[at + 5], code[at + 6]]) as usize
+      })
+      .collect::<Vec<_>>();
+   if lens.len() != names.len() {
+      return Err(format!(
+         "scene formatter reads {} lengths for {} names",
+         lens.len(),
+         names.len()
+      ));
+   }
+   let vec_of = |name: &[u8]| {
+      names
+         .iter()
+         .position(|&n| n == name)
+         .and_then(|i| lens[i].checked_sub(0x10))
+         .ok_or_else(|| format!("scene template has no {}", String::from_utf8_lossy(name)))
+   };
+
+   let sites = call_sites(image, |callee| callee == formatter);
+   let (site, _) = one("scene formatter call", &sites)?;
+   let (draw, end) = image
+      .function_bounds(site)
+      .ok_or("renderer draw has no function bounds")?;
+   let found = SceneDraw {
+      draw,
+      quads: vec_of(b"quads")?,
+      mono: vec_of(b"mono")?,
+      subpixel: vec_of(b"subpixel")?,
+   };
+   // `draw` walks the quads through their `ptr`, right before `len`.
+   let ptr = u32::try_from(found.quads + 8).map_err(|_| "quads offset overflows")?;
+   let body = image
+      .read(draw, end - draw)
+      .ok_or("renderer draw is unmapped")?;
+   if !body.windows(4).any(|w| w == ptr.to_le_bytes()) {
+      return Err(format!("renderer draw never reads the quads at {ptr:#x}"));
+   }
+   Ok(found)
+}
+
 /// The `jne rel32` that leaves the composer's Nitro gift button out.
 ///
 /// The composer fills an `Option` for the button: its block, after the

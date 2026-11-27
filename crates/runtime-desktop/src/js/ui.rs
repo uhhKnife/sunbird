@@ -1461,6 +1461,7 @@ pub fn desktop_patch_api<'js>(
       })?,
    )?;
    api.set("appearance", appearance)?;
+   api.set("themes", crate::js::themes::object(ctx, plugin)?)?;
    api.set("ui", desktop_ui_object(ctx, plugin)?)
 }
 

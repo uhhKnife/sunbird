@@ -1040,6 +1040,33 @@ declare namespace Phoenix {
     readonly discord: Discord;
     /// Raw access to Phoenix's Android host modules (`GuestHost.invoke`).
     readonly bridge: Bridge;
+    /// `.theme.css` themes on Desktop Phoenix.
+    readonly themes?: Themes;
+  }
+
+  interface InstalledTheme {
+    id: string;
+    name: string;
+    description?: string;
+    authors: string[];
+    active: boolean;
+  }
+
+  /// A theme sets `--bg-primary`, `--bg-secondary`, `--bg-tertiary`, `--bg-elevated`,
+  /// `--accent-color`, `--text-normal`, `--text-muted`, `--ui-border-color`, `--radius-scale` and
+  /// `--override-nitro` in a `.theme.css` file. Unloading the plugin that applied one brings back
+  /// Discord's colors.
+  interface Themes {
+    /// Whether this Discord build's renderer could be themed.
+    supported(): boolean;
+    /// The `*.theme.css` files in the themes folder, by file name.
+    list(): InstalledTheme[];
+    /// Applies a theme from `list()`.
+    apply(id: string): void;
+    /// Applies stylesheet text, such as a bundled preset. Returns whether it themes anything.
+    setCss(css: string): boolean;
+    clear(): void;
+    openThemesDir(): void;
   }
 
   interface Bridge {

@@ -481,7 +481,9 @@ impl<'img> Index<'img> {
 }
 
 /// `work` over `functions` split across the cores, in order. Targets with one
-/// thread, wasm among them, run it inline.
+/// thread, wasm among them, run it inline, and so does Windows: the runtime
+/// builds its index from `DllMain`, and a thread started under the loader lock
+/// waits for that lock before it runs, so joining it hangs Discord at launch.
 #[expect(
    clippy::needless_collect,
    reason = "every chunk spawns before the first join"
@@ -491,7 +493,7 @@ fn across<T: Send>(
    work: impl Fn(&[(usize, usize)]) -> T + Sync,
 ) -> Vec<T> {
    let threads = std::thread::available_parallelism().map_or(1, usize::from);
-   if threads <= 1 {
+   if threads <= 1 || cfg!(windows) {
       return vec![work(functions)];
    }
    let chunk = functions.len().div_ceil(threads).max(1);

@@ -589,7 +589,13 @@ fn finish_item(
       (syms.with_id)(&raw mut next, &raw mut item, id_str.as_ptr(), id_str.len());
       let mut item = next;
 
-      if let Some(icon_id) = map_icon(action.icon.as_deref()) {
+      // Discord's own submenu rows carry no icon, so a child without one gets
+      // none rather than the puzzle piece top-level rows fall back to.
+      let icon = match (&action.icon, action.parent) {
+         (None, Some(_)) => None,
+         (icon, _) => map_icon(icon.as_deref()),
+      };
+      if let Some(icon_id) = icon {
          let mut next = RawMenuItem::zeroed();
          (syms.with_icon)(&raw mut next, &raw mut item, icon_id);
          item = next;
